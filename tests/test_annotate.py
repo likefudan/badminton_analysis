@@ -239,3 +239,16 @@ def test_server_serves_frames_and_saves_labels(tiny_video):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_bad_request_changes_nothing(tiny_video, tmp_path):
+    from badminton import annotate as an
+
+    store = an.LabelStore(tmp_path / "t.labels.csv")
+    n = 10
+    app = an.AnnotationApp(tiny_video, store, np.zeros((n, 3)), None, None, [(0, n - 1)], 30.0, (64, 48))
+    with pytest.raises(ValueError):
+        app.apply([{"frame": 1, "visibility": 1, "x": 5, "y": 5}, {"frame": 2, "visibility": 1, "x": 999, "y": 5}])
+    assert store.labels == {}
+    app.apply([{"frame": 1, "visibility": 1, "x": 5, "y": 5}])
+    assert store.labels[1].status == "human"

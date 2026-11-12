@@ -451,8 +451,15 @@ class AnnotationApp:
         self.frames = FrameSource(video)
         self.times: list[float] = []  # seconds between consecutive label actions in this session
         self.last_action: float | None = None
+        # the server answers requests on several threads: labels must not change while
+        # /api/state walks them or while another request is being applied
+        self.lock = threading.RLock()
 
     def state(self) -> dict:
+        with self.lock:
+            return self._state()
+
+    def _state(self) -> dict:
         r3 = lambda a: [[int(v), round(float(x), 1), round(float(y), 1)] for v, x, y in a]  # noqa: E731
         cands = None
         if self.candidates is not None:
@@ -486,24 +493,35 @@ class AnnotationApp:
                 "minutes_left": round(estimate_minutes(int(todo.sum()), self.uncertainty[todo], pace), 1)}
 
     def apply(self, items: list) -> dict:
-        """items: [{"frame": n, "visibility": 0/1, "x":, "y":, "status":}] or {"frame": n, "delete": true}."""
+        """items: [{"frame": n, "visibility": 0/1, "x":, "y":, "status":}] or {"frame": n, "delete": true}.
+        All items are checked before any is applied: a bad request changes nothing."""
         w, h = self.size
+        ops = []
         for it in items:
             f = int(it["frame"])
             if not 0 <= f < len(self.path):
                 raise ValueError(f"frame {f} out of range")
             if it.get("delete"):
-                self.store.remove(f)
+                ops.append((f, None))
                 continue
             status = it.get("status", "human")
             if status not in ("human", "bulk", "skip"):  # the page never writes machine labels
                 raise ValueError(f"status {status!r} not allowed")
             x, y = float(it.get("x", 0)), float(it.get("y", 0))
-            if not (0 <= x <= w and 0 <= y <= h):
+            if not (np.isfinite(x) and np.isfinite(y) and 0 <= x <= w and 0 <= y <= h):
                 raise ValueError(f"point ({x}, {y}) outside the frame")
-            self.store.set(f, int(it.get("visibility", 0)), x, y, status)
+            ops.append((f, (int(it.get("visibility", 0)), x, y, status)))
+        with self.lock:
+            return self._apply(ops, len(items))
+
+    def _apply(self, ops: list, n_items: int) -> dict:
+        for f, lab in ops:
+            if lab is None:
+                self.store.remove(f)
+            else:
+                self.store.set(f, *lab)
         now = time.monotonic()
-        if len(items) == 1 and self.last_action is not None and now - self.last_action < 30:
+        if n_items == 1 and self.last_action is not None and now - self.last_action < 30:
             self.times.append(now - self.last_action)  # pauses and bulk actions do not count
         self.last_action = now
         self.store.save()
