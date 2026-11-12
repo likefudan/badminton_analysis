@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# videos and outputs stay local
+*.mov
+*.MOV
+*.mp4
+*.npz
+*.court.json
+*.court.png
+data/
+outputs/
