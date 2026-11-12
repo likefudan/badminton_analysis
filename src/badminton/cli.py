@@ -60,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--json", help="把结果另存成 JSON")
 
     for name, helptext in (("label", "第 2 步：给跟踪到的球员起名字（每局一次）"),
-                           ("movement", "第 2 步：跑动卡片（距离、速度、冲刺、站位热力图）和统计 JSON")):
+                           ("movement", "第 2 步：跑动卡片和统计 JSON；双打同时出第 3 步的站位报告"),
+                           ("positioning", "第 3 步：双打站位报告（前后/左右站位、轮转、搭档间距、空当）")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("video")
         s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
@@ -76,10 +77,24 @@ def main(argv: list[str] | None = None) -> int:
             s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
             s.add_argument("--shuttle", help="可选：TrackNetV3 的 _ball.csv，只用来对照回合切分")
 
+    s = sub.add_parser("analyze", help="一键处理：标定（已有就沿用）→ 骨架 → 跑动卡片 → 双打站位报告")
+    s.add_argument("video")
+    s.add_argument("--court", help="court.json，默认 <视频名>.court.json；没有就先打开窗口点标记点")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认 <视频名>_analysis/")
+    s.add_argument("--singles", action="store_true")
+    s.add_argument("--names", help='球员名字："1=小王,2=小李,3=老张,4=老刘"（编号见 players.png）')
+    s.add_argument("--force", action="store_true", help="骨架数据已存在也重新跑")
+    s.add_argument("--no-skeleton-video", action="store_true", help="不输出骨架视频（快一些）")
+    s.add_argument("--stride", type=int, default=2)
+    s.add_argument("--duration", type=float, help="只处理前多少秒（试跑）")
+    s.add_argument("--cuts")
+    _model_args(s)
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
-            "label": cmd_label, "movement": cmd_movement}[a.cmd](a)
+            "label": cmd_label, "movement": cmd_movement,
+            "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -386,6 +401,101 @@ def cmd_movement(a) -> int:
     out_json = out_dir / f"{video.stem}.movement.json"
     out_json.write_text(json.dumps(json_ready(result), ensure_ascii=False, indent=1))
     print(f"统计已写入 {out_json}")
+    _positioning(tracking, result["_in_play"], video, out_dir)
+    return 0
+
+
+def _positioning(tracking, in_play, video: Path, out_dir: Path) -> list:
+    from .positioning import analyse_pairs, json_ready, render_pair_card, summary_lines
+
+    reports = analyse_pairs(tracking, in_play)
+    if not reports:
+        return []
+    print("双打站位：")
+    for n, rep in enumerate(reports, 1):
+        for line in summary_lines(rep):
+            print("  " + line)
+        png = out_dir / f"{video.stem}.positioning.{rep['side']}.png"
+        render_pair_card(rep, png)
+        print(f"  -> {png}")
+    out_json = out_dir / f"{video.stem}.positioning.json"
+    out_json.write_text(json.dumps([json_ready(r) for r in reports], ensure_ascii=False, indent=1))
+    print(f"站位统计已写入 {out_json}")
+    return reports
+
+
+def cmd_positioning(a) -> int:
+    from .movement import analyse
+
+    tracking, _, _ = _tracking(a)
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reports = _positioning(tracking, analyse(tracking)["_in_play"], video, out_dir)
+    if not reports:
+        print("没有哪一边正好有两名球员，站位报告只用于双打")
+        return 1
+    return 0
+
+
+def cmd_analyze(a) -> int:
+    """Chain the steps through the same CLI entry points, reusing what exists."""
+    video = Path(a.video)
+    out_dir = Path(a.out_dir or video.parent / f"{video.stem}_analysis")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    court = Path(a.court or video.with_suffix(".court.json"))
+    if not court.exists():
+        if not sys.stdin.isatty():
+            raise SystemExit(f"没有 {court}：先运行 badminton calibrate {video}（在窗口里点球场标记点）")
+        print("== 1/4 标定球场 ==")
+        if main(["calibrate", str(video), "-o", str(court)]) != 0:
+            return 1
+    else:
+        print(f"== 1/4 沿用球场标定 {court} ==")
+    data = out_dir / f"{video.stem}.skeleton.npz"
+    if data.exists() and not a.force:
+        print(f"== 2/4 沿用骨架数据 {data}（--force 重新跑）==")
+    else:
+        print("== 2/4 骨架 ==")
+        args = ["skeleton", str(video), "--court", str(court), "-o", str(data.with_suffix(".mp4")),
+                "--stride", str(a.stride), "--mode", a.mode, "--device", a.device]
+        if a.singles:
+            args.append("--singles")
+        if a.duration:
+            args += ["--duration", str(a.duration)]
+        if a.det_model:
+            args += ["--det-model", a.det_model]
+        if a.pose_model:
+            args += ["--pose-model", a.pose_model]
+        if main(args) != 0:
+            return 1
+        if a.no_skeleton_video:
+            data.with_suffix(".mp4").unlink(missing_ok=True)
+    players = out_dir / f"{video.stem}.players.json"
+    common = [str(video), "--court", str(court), "--data", str(data), "--players", str(players)]
+    if a.singles:
+        common.append("--singles")
+    if a.cuts:
+        common += ["--cuts", a.cuts]
+    if players.exists() and not a.names:
+        print(f"== 3/4 沿用球员名字 {players} ==")
+    else:
+        print("== 3/4 球员编号 ==")
+        if main(["label", *common] + (["--names", a.names] if a.names else [])) != 0:
+            return 1
+    print("== 4/4 跑动卡片和站位报告 ==")
+    if main(["movement", *common, "-o", str(out_dir)]) != 0:
+        return 1
+    report = {"video": str(video), "court": str(court)}
+    for key, name in (("movement", "movement"), ("positioning", "positioning")):
+        f = out_dir / f"{video.stem}.{name}.json"
+        if f.exists():
+            report[key] = json.loads(f.read_text())
+    out = out_dir / f"{video.stem}.report.json"
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=1))
+    print(f"\n全部结果在 {out_dir}/；汇总给 AI 点评用的数据：{out}")
+    if not players.exists():
+        print(f'看 {players.with_suffix(".png")} 里的编号，用 --names "1=...,2=..." 再运行一次就能带上名字（骨架不会重跑）')
     return 0
 
 
