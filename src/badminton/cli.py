@@ -85,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-inpaint", action="store_true", help="不用 InpaintNet 补短暂丢失")
     s.add_argument("--max-frames", type=int, help="只处理前 N 帧（试跑）")
     s.add_argument("--overlay", action="store_true", help="同时输出画了轨迹的视频 <视频名>.shuttle.mp4")
+    s.add_argument("--court", help="球场标定：给了就用改进的选点（去掉静止干扰点、场地上方空间、按轨迹连续性挑点）")
+    s.add_argument("--raw-output", help="另存 TrackNetV3 原版逐帧选点的结果（用来对比）")
     s.add_argument("--frame-step", type=int, default=1,
                    help="每 N 帧送一帧给模型；60fps 视频建议 2（TrackNetV3 是用 30fps 训练的），跳过的帧用插值补")
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
@@ -445,9 +447,19 @@ def cmd_shuttle(a) -> int:
     if a.frame_step == 1 and info.fps and info.fps > 45:
         print(f"提示：视频是 {info.fps:.0f} fps，TrackNetV3 是用 30 fps 训练的，可以试试 --frame-step 2")
     out = Path(a.output or video.with_suffix(".shuttle.csv"))
+    debug = {} if a.court else None
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
-                             frame_step=a.frame_step)
+                             frame_step=a.frame_step, debug=debug)
+    if a.raw_output:
+        write_csv(rows, a.raw_output)
+    if a.court:
+        from .court import CourtCalibration
+        from .shuttle_path import rows_from_candidates
+
+        if a.frame_step != 1:
+            raise SystemExit("--court 目前只支持 --frame-step 1")
+        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), CourtCalibration.load(a.court))
     write_csv(rows, out)
     seen = sum(r[1] for r in rows)
     print(f"已写入 {out}：{len(rows)} 帧，{seen} 帧有球（{100 * seen / max(1, len(rows)):.1f}%）")
