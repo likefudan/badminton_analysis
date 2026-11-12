@@ -124,11 +124,34 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--cuts")
     _model_args(s)
 
+    s = sub.add_parser("annotate", help="标注羽毛球位置（浏览器里逐帧确认或点击），为微调 TrackNetV3 准备数据")
+    s.add_argument("video")
+    s.add_argument("--court", help="球场标定，默认 <视频名>.court.json（有的话）；第一次运行要跑一遍 TrackNetV3 时用")
+    s.add_argument("--shuttle", help="已有的预测 CSV（badminton shuttle 的输出）；不给就自己跑一遍并缓存到 <视频名>.annotate.npz")
+    s.add_argument("--raw", help="和 --shuttle 一起用：TrackNetV3 原版逐帧选点的 CSV（--raw-output），两者不一致的帧优先看")
+    s.add_argument("--rallies", help="回合列表：badminton movement 生成的 .movement.json，默认 <视频名>.movement.json；没有就按球出现的时段切")
+    s.add_argument("--labels", help="标注文件，默认 <视频名>.labels.csv（旁边还有同名 .json 记录谁、什么时候标的）")
+    s.add_argument("--annotator", help="标注人的名字，默认是系统用户名")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--prefill", type=int, default=0, metavar="N",
+                   help="把模型最没把握的 N 个回合先用模型预测填上（标成「机器预标注」，没人看过，默认不会被导出）")
+    s.add_argument("--no-serve", action="store_true", help="只准备文件（预测缓存、--prefill），不启动网页")
+    s.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要）")
+
+    s = sub.add_parser("annotate-export", help="把标注好的回合导出成 TrackNetV3 训练用的目录（帧、csv、背景图，按回合分 train/val）")
+    s.add_argument("videos", nargs="+", help="标注过的视频（旁边要有 <视频名>.labels.csv）")
+    s.add_argument("-o", "--out-dir", default="data/tracknet_finetune", help="导出目录，默认 data/tracknet_finetune")
+    s.add_argument("--val-frac", type=float, default=0.2, help="多大比例的回合留作验证集（默认 0.2，至少 1 个回合）")
+    s.add_argument("--include-unreviewed", action="store_true", help="没人看过的机器预标注也导出（只用来试流程，不要拿来训练）")
+    s.add_argument("--full-size", action="store_true", help="帧按视频原始分辨率保存（默认缩到模型输入的 512x288，和推理时完全一样）")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
-            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
+            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
+            "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -684,6 +707,105 @@ def cmd_shuttle(a) -> int:
         ov = out.with_suffix(".mp4")
         draw_shuttle_video(video, rows, ov)
         print(f"轨迹视频 {ov}")
+    return 0
+
+
+def cmd_annotate(a) -> int:
+    import numpy as np
+
+    from . import annotate as an
+    from .pipeline import print_progress
+    from .video import probe
+
+    video = Path(a.video)
+    info = probe(video)
+    cache = video.with_suffix(".annotate.npz")
+    if a.shuttle:
+        path = an.read_prediction_csv(a.shuttle, info.frames or None)
+        raw = an.read_prediction_csv(a.raw, len(path)) if a.raw else None
+        candidates = None
+        print("用现成的预测 CSV：没有候选点和热力图分数，「没把握程度」只看两份结果是否一致和轨迹跳变")
+    elif cache.exists():
+        path, raw, candidates = an.load_predictions(cache)
+        print(f"读入缓存的预测 {cache}")
+    else:
+        court = a.court or (video.with_suffix(".court.json") if video.with_suffix(".court.json").exists() else None)
+        print("先跑一遍 TrackNetV3（只需一次，结果缓存下来）" + ("" if court else "；没有球场标定，选点不限制在场地上方"))
+        path, raw, candidates = an.predict(video, court, a.tracknet_dir, print_progress)
+        an.save_predictions(cache, path, raw, candidates)
+        print(f"预测已缓存到 {cache}")
+    fps = info.fps or 30.0
+    n = len(path)
+    rallies_file = a.rallies or (video.with_suffix(".movement.json") if video.with_suffix(".movement.json").exists() else None)
+    if rallies_file:
+        rallies = an.load_rallies(rallies_file, fps, n)
+    else:
+        rallies = an.rallies_from_predictions(path, fps) or [(0, n - 1)]
+        print(f"没有回合列表（--rallies），按球出现的时段切成 {len(rallies)} 段")
+    labels_csv = Path(a.labels) if a.labels else video.with_suffix(".labels.csv")
+    store = an.LabelStore(labels_csv, {"file": video.name, "frames": n, "fps": fps, "size": [info.width, info.height]},
+                          a.annotator, rallies)
+    app = an.AnnotationApp(video, store, path, raw, candidates, rallies, fps, (info.width, info.height))
+    if a.prefill:
+        for i in app.order[:a.prefill]:
+            k = an.prefill(store, rallies[i], path)
+            print(f"回合 {i + 1}（第 {rallies[i][0]}–{rallies[i][1]} 帧）：预填 {k} 帧机器预标注（没人看过）")
+    store.save()
+    p = app.progress()
+    print(f"{len(rallies)} 个回合共 {p['rally_frames']} 帧，已标 {p['done']} 帧，还剩 {p['left']} 帧，估计 {p['minutes_left']:.0f} 分钟")
+    print(f"标注保存在 {labels_csv}（和 {store.meta_path.name}）")
+    if a.no_serve:
+        return 0
+    try:
+        server = an.make_server(app, a.port)
+    except OSError as e:
+        raise SystemExit(f"端口 {a.port} 用不了（{e}）：换一个 --port") from None
+    url = f"http://localhost:{a.port}"
+    print(f"在浏览器里打开 {url} 开始标注；标完按 Ctrl+C 结束（每一步都已自动保存）")
+    if not a.no_browser:
+        import webbrowser
+
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.server_close()
+        store.save()
+    c = store.counts()
+    print(f"已保存：确认 {c['human']} 帧，批量接受 {c['bulk']} 帧，拿不准 {c['skip']} 帧，机器预标注 {c['machine']} 帧")
+    return 0
+
+
+def cmd_annotate_export(a) -> int:
+    from .annotate_export import export_dataset
+    from .pipeline import print_progress
+
+    items = []
+    for v in a.videos:
+        video = Path(v)
+        labels = video.with_suffix(".labels.csv")
+        if not labels.exists():
+            raise SystemExit(f"找不到 {labels}：先运行 badminton annotate {video}")
+        meta = labels.with_suffix(".json")
+        rallies = json.loads(meta.read_text()).get("rallies") if meta.exists() else None
+        items.append((video, labels, rallies))
+    try:
+        manifest = export_dataset(items, a.out_dir, a.val_frac, a.include_unreviewed, a.full_size, print_progress)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    print()
+    for m in manifest["matches"]:
+        for split in ("train", "val"):
+            segs = [s for s in m["segments"] if s["split"] == split]
+            print(f"  {split}/match{m['match']}（{Path(m['video']).name}）：{len(segs)} 段，{sum(s['frames'] for s in segs)} 帧，"
+                  f"其中 {sum(s['visible'] for s in segs)} 帧有球")
+        if not any(s["split"] == "val" for s in m["segments"]):
+            print("  注意：只有一个回合有标注，验证集是空的；TrackNetV3 的 train.py 需要验证集，请至少标两个回合")
+    if a.include_unreviewed:
+        print("注意：里面有没人看过的机器预标注，只能用来试流程，不要拿来训练")
+    print(f"已导出到 {a.out_dir}（清单 manifest.json）；微调步骤见 docs/tracknet_finetune.md")
     return 0
 
 

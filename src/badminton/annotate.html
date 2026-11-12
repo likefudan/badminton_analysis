@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>标注羽毛球</title>
+<style>
+  :root { --bg:#16181c; --panel:#1f2228; --line:#343842; --text:#e6e8ec; --dim:#9aa1ad;
+          --pred:#ffd23f; --human:#3ddc84; --bulk:#4fb3ff; --machine:#b98cff; --skip:#ff8a4c; --none:#565c68; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--text);
+               font:13px/1.45 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+  #app { display:grid; grid-template-columns:1fr 290px; grid-template-rows:1fr auto; height:100%; }
+  #stage { position:relative; overflow:hidden; background:#000; cursor:crosshair; }
+  #view { position:absolute; left:0; top:0; }
+  #lens { position:absolute; width:240px; height:240px; border:2px solid var(--pred); border-radius:6px;
+          pointer-events:none; display:none; box-shadow:0 4px 18px rgba(0,0,0,.6); }
+  #hud { position:absolute; left:10px; top:8px; padding:4px 9px; border-radius:5px; background:rgba(0,0,0,.6);
+         font-variant-numeric:tabular-nums; pointer-events:none; }
+  #hud b { font-weight:600; }
+  #side { grid-row:1 / span 2; grid-column:2; background:var(--panel); border-left:1px solid var(--line);
+          padding:12px; overflow-y:auto; }
+  #side h2 { font-size:12px; font-weight:600; color:var(--dim); margin:14px 0 6px; letter-spacing:.04em; }
+  #side h2:first-child { margin-top:0; }
+  .big { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; margin:6px 0; }
+  .bar i { display:block; height:100%; background:var(--human); }
+  .dim { color:var(--dim); }
+  table { border-collapse:collapse; width:100%; }
+  td { padding:2px 0; vertical-align:top; }
+  td.k { white-space:nowrap; padding-right:8px; }
+  kbd { display:inline-block; min-width:20px; padding:0 5px; border:1px solid var(--line); border-radius:4px;
+        background:#2a2e36; font:12px ui-monospace, Menlo, monospace; text-align:center; }
+  .rally { display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:5px; cursor:pointer; }
+  .rally:hover { background:#2a2e36; }
+  .rally.cur { background:#2f3440; outline:1px solid var(--line); }
+  .rally .n { width:22px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .rally .m { flex:1; }
+  .rally .bar { margin:3px 0 0; height:4px; }
+  .sw { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }
+  #bottom { grid-column:1; background:var(--panel); border-top:1px solid var(--line); padding:6px 10px 8px; }
+  #strip { display:block; width:100%; height:34px; cursor:pointer; border-radius:3px; }
+  #scrub { width:100%; margin:6px 0 0; }
+  #save { float:right; }
+  #save.err { color:#ff6b6b; }
+  button { background:#2a2e36; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:4px 9px;
+           font:inherit; cursor:pointer; }
+  button:hover { background:#343944; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <canvas id="lens" width="240" height="240"></canvas>
+    <div id="hud"></div>
+  </div>
+  <div id="bottom">
+    <canvas id="strip" height="34"></canvas>
+    <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+  </div>
+  <div id="side">
+    <h2>进度</h2>
+    <div><span class="big" id="done">0</span> <span class="dim" id="total"></span></div>
+    <div class="bar"><i id="pbar" style="width:0"></i></div>
+    <div id="eta" class="dim"></div>
+    <div id="counts" class="dim" style="margin-top:4px"></div>
+    <div style="margin-top:6px"><span id="save" class="dim"></span><span id="file" class="dim"></span></div>
+
+    <h2>回合（模型最没把握的排前面）</h2>
+    <div id="rallies"></div>
+
+    <h2>按键</h2>
+    <table>
+      <tr><td class="k">点击</td><td>球在这里（看得见）</td></tr>
+      <tr><td class="k"><kbd>空格</kbd> <kbd>V</kbd></td><td>接受模型的预测</td></tr>
+      <tr><td class="k"><kbd>N</kbd></td><td>这一帧没有球</td></tr>
+      <tr><td class="k"><kbd>O</kbd></td><td>被挡住 / 拿不准（不用于训练）</td></tr>
+      <tr><td class="k"><kbd>1</kbd>–<kbd>5</kbd></td><td>选第几个候选点（画面上有编号）</td></tr>
+      <tr><td class="k"><kbd>←</kbd> <kbd>→</kbd> <kbd>J</kbd> <kbd>K</kbd></td><td>上一帧 / 下一帧（加 Shift 跳 10 帧）</td></tr>
+      <tr><td class="k"><kbd>U</kbd></td><td>本回合下一个没把握的未标帧</td></tr>
+      <tr><td class="k"><kbd>[</kbd> <kbd>]</kbd></td><td>上一个 / 下一个回合</td></tr>
+      <tr><td class="k"><kbd>Shift</kbd>+<kbd>A</kbd></td><td>本回合里模型有把握、还没看的帧一次全部接受</td></tr>
+      <tr><td class="k"><kbd>⌫</kbd></td><td>删掉这一帧的标注</td></tr>
+      <tr><td class="k"><kbd>Z</kbd></td><td>放大镜 开 / 关</td></tr>
+    </table>
+
+    <h2>图例</h2>
+    <div><span class="sw" style="background:var(--pred)"></span>模型预测（前后帧的预测画得淡）</div>
+    <div><span class="sw" style="background:var(--human)"></span>已确认　<span class="sw" style="background:var(--bulk)"></span>批量接受</div>
+    <div><span class="sw" style="background:var(--machine)"></span>机器预标注（没人看过）</div>
+    <div><span class="sw" style="background:var(--skip)"></span>拿不准　<span class="sw" style="background:var(--none)"></span>未标</div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COLORS = {human: css("--human"), bulk: css("--bulk"), machine: css("--machine"), skip: css("--skip"),
+                none: css("--none"), pred: css("--pred")};
+const TRAIL = 4, ZOOM = 4, PRELOAD = 5;
+let S = null;            // server state
+let frame = 0, rally = 0; // current frame; index into S.rallies
+let fit = {s: 1, ox: 0, oy: 0};
+let mouse = null, lensOn = true;
+const images = new Map();
+
+function image(n) {
+  if (n < 0 || n >= S.frames) return null;
+  let im = images.get(n);
+  if (!im) {
+    im = new Image();
+    im.onload = () => { if (n === frame) draw(); };
+    im.src = `/frame/${n}.jpg`;
+    images.set(n, im);
+    if (images.size > 80) images.delete(images.keys().next().value);
+  }
+  return im;
+}
+
+function label(n) { return S.labels[n]; }
+function status(n) { const l = label(n); return l ? l[3] : "none"; }
+function reviewed(n) { const s = status(n); return s === "human" || s === "bulk" || s === "skip"; }
+function rallyOf(n) { return S.rallies.findIndex(r => n >= r.start && n <= r.end); }
+
+function layout() {
+  const st = $("stage"), c = $("view"), dpr = window.devicePixelRatio || 1;
+  const w = st.clientWidth, h = st.clientHeight;
+  c.width = w * dpr; c.height = h * dpr; c.style.width = w + "px"; c.style.height = h + "px";
+  const s = Math.min(w / S.size[0], h / S.size[1]);
+  fit = {s, ox: (w - S.size[0] * s) / 2, oy: (h - S.size[1] * s) / 2};
+  const sc = $("strip");
+  sc.width = sc.clientWidth * dpr; sc.height = 34 * dpr;
+  draw(); drawStrip();
+}
+
+function toScreen(x, y) { return [fit.ox + x * fit.s, fit.oy + y * fit.s]; }
+function toVideo(px, py) { return [(px - fit.ox) / fit.s, (py - fit.oy) / fit.s]; }
+
+function marks(ctx, tf, scale) {
+  // tf: video px -> canvas px; scale: line width factor
+  const ring = (x, y, r, color, alpha, width, dash) => {
+    const [cx, cy] = tf(x, y);
+    ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = width * scale;
+    ctx.setLineDash(dash || []); ctx.beginPath(); ctx.arc(cx, cy, r * scale, 0, 6.2832); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  };
+  // neighbours' predictions, faint, joined by a line
+  ctx.strokeStyle = COLORS.pred; ctx.lineWidth = 1 * scale; ctx.globalAlpha = 0.35; ctx.beginPath();
+  let pen = false;
+  for (let d = -TRAIL; d <= TRAIL; d++) {
+    const p = S.pred[frame + d];
+    if (!p || !p[0]) { pen = false; continue; }
+    const [cx, cy] = tf(p[1], p[2]);
+    if (pen) ctx.lineTo(cx, cy); else ctx.moveTo(cx, cy);
+    pen = true;
+  }
+  ctx.stroke(); ctx.globalAlpha = 1;
+  for (let d = -TRAIL; d <= TRAIL; d++) {
+    if (!d) continue;
+    const p = S.pred[frame + d];
+    if (p && p[0]) ring(p[1], p[2], 5, d < 0 ? "#9fd0ff" : "#ffb0b0", 0.75 - 0.13 * Math.abs(d), 1.5);
+  }
+  // other candidates of this frame, numbered
+  const cands = S.candidates ? S.candidates[frame] || [] : [];
+  ctx.font = `${11 * scale}px ui-monospace, Menlo, monospace`;
+  cands.slice(0, 5).forEach((c, i) => {
+    ring(c[0], c[1], 9, "#ffffff", 0.7, 1, [3 * scale, 3 * scale]);
+    const [cx, cy] = tf(c[0], c[1]);
+    ctx.fillStyle = "#fff"; ctx.globalAlpha = 0.85; ctx.fillText(String(i + 1), cx + 11 * scale, cy - 8 * scale); ctx.globalAlpha = 1;
+  });
+  const r = S.raw && S.raw[frame];
+  const p = S.pred[frame];
+  if (r && r[0] && !(p[0] && Math.hypot(p[1] - r[1], p[2] - r[2]) < 15)) ring(r[1], r[2], 12, "#ff5fa2", 0.9, 1.5, [2 * scale, 4 * scale]);
+  if (p[0]) ring(p[1], p[2], 14, COLORS.pred, 1, 2);
+  const l = label(frame);
+  if (l && l[0]) {
+    const [cx, cy] = tf(l[1], l[2]);
+    ctx.strokeStyle = COLORS[l[3]]; ctx.lineWidth = 2 * scale; ctx.beginPath();
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      ctx.moveTo(cx + dx * 5 * scale, cy + dy * 5 * scale); ctx.lineTo(cx + dx * 20 * scale, cy + dy * 20 * scale);
+    }
+    ctx.stroke();
+  }
+}
+
+function draw() {
+  if (!S) return;
+  const c = $("view"), ctx = c.getContext("2d"), dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, c.width, c.height);
+  const im = image(frame);
+  if (im && im.complete && im.naturalWidth) ctx.drawImage(im, fit.ox, fit.oy, S.size[0] * fit.s, S.size[1] * fit.s);
+  marks(ctx, toScreen, 1);
+  const st = status(frame), l = label(frame), p = S.pred[frame];
+  const what = {human: "已确认", bulk: "批量接受", machine: "机器预标注（没人看过）", skip: "拿不准", none: "未标"}[st];
+  const where = l ? (st === "skip" ? "" : l[0] ? `球 (${Math.round(l[1])}, ${Math.round(l[2])})` : "没有球") : "";
+  const ri = rallyOf(frame);
+  $("hud").innerHTML = `第 <b>${frame}</b> 帧　${(frame / S.fps).toFixed(2)} 秒　` +
+    (ri >= 0 ? `回合 ${ri + 1}` : "回合之外") + `　<span style="color:${COLORS[st]}">${what}</span> ${where}　` +
+    `预测：${p[0] ? "有球" : "没有球"}　没把握程度 ${S.uncertainty[frame].toFixed(2)}`;
+  drawLens();
+  for (let d = 1; d <= PRELOAD; d++) image(frame + d);
+  image(frame - 1);
+}
+
+function drawLens() {
+  const lens = $("lens");
+  if (!mouse || !lensOn) { lens.style.display = "none"; return; }
+  const st = $("stage"), size = 240;
+  let lx = mouse.x + 28, ly = mouse.y - size - 28;
+  if (lx + size > st.clientWidth) lx = mouse.x - size - 28;
+  if (ly < 0) ly = mouse.y + 28;
+  lens.style.left = lx + "px"; lens.style.top = ly + "px"; lens.style.display = "block";
+  const ctx = lens.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, size, size);
+  const [vx, vy] = toVideo(mouse.x, mouse.y);
+  const span = size / (ZOOM * Math.max(fit.s, 0.5));  // video px across the lens
+  const im = image(frame);
+  ctx.imageSmoothingEnabled = false;
+  if (im && im.complete && im.naturalWidth) ctx.drawImage(im, vx - span / 2, vy - span / 2, span, span, 0, 0, size, size);
+  const k = size / span;
+  marks(ctx, (x, y) => [(x - vx + span / 2) * k, (y - vy + span / 2) * k], 1.6);
+  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.moveTo(size / 2, size / 2 - 22); ctx.lineTo(size / 2, size / 2 - 5); ctx.moveTo(size / 2, size / 2 + 5); ctx.lineTo(size / 2, size / 2 + 22);
+  ctx.moveTo(size / 2 - 22, size / 2); ctx.lineTo(size / 2 - 5, size / 2); ctx.moveTo(size / 2 + 5, size / 2); ctx.lineTo(size / 2 + 22, size / 2);
+  ctx.stroke();
+}
+
+function drawStrip() {
+  const c = $("strip"), ctx = c.getContext("2d"), W = c.width, H = c.height, n = S.frames;
+  ctx.fillStyle = "#111318"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#262a33";
+  for (const r of S.rallies) ctx.fillRect(r.start / n * W, 0, Math.max(1, (r.end - r.start + 1) / n * W), H);
+  // top: uncertainty; bottom: label status
+  for (let x = 0; x < W; x++) {
+    const a = Math.floor(x / W * n), b = Math.max(a + 1, Math.floor((x + 1) / W * n));
+    let u = 0; const cnt = {};
+    for (let f = a; f < b; f++) { u = Math.max(u, S.uncertainty[f]); const s = status(f); cnt[s] = (cnt[s] || 0) + 1; }
+    if (rallyOf(a) >= 0 && u > 0.02) { ctx.fillStyle = `rgba(255,210,63,${0.15 + 0.85 * u})`; ctx.fillRect(x, H * 0.5 * (1 - u), 1, H * 0.5 * u); }
+    let best = "none";
+    for (const s of ["skip", "machine", "bulk", "human"]) if (cnt[s] && (best === "none" || cnt[s] >= cnt[best])) best = s;
+    if (best !== "none") { ctx.fillStyle = COLORS[best]; ctx.fillRect(x, H * 0.58, 1, H * 0.42); }
+  }
+  ctx.fillStyle = "#fff"; ctx.fillRect(frame / n * W - 1, 0, 2, H);
+}
+
+function showProgress(p) {
+  S.progress = p;
+  $("done").textContent = p.done;
+  $("total").textContent = `/ ${p.rally_frames} 帧（回合内）`;
+  $("pbar").style.width = (100 * p.done / Math.max(1, p.rally_frames)) + "%";
+  const pace = p.seconds_per_frame ? `，现在每帧 ${p.seconds_per_frame.toFixed(1)} 秒` : "（按经验估计）";
+  $("eta").textContent = `还剩 ${p.left} 帧，大约 ${p.minutes_left} 分钟${pace}`;
+  const c = p.counts;
+  $("counts").textContent = `已确认 ${c.human}　批量 ${c.bulk}　机器预标注 ${c.machine}　拿不准 ${c.skip}`;
+  const box = $("rallies"); box.innerHTML = "";
+  S.order.forEach((ri, k) => {
+    const r = S.rallies[ri]; let d = 0;
+    for (let f = r.start; f <= r.end; f++) if (reviewed(f)) d++;
+    const n = r.end - r.start + 1, el = document.createElement("div");
+    el.className = "rally" + (ri === rally ? " cur" : "");
+    el.innerHTML = `<span class="n">${k + 1}</span><span class="m">回合 ${ri + 1}　${(r.start / S.fps).toFixed(0)}–${(r.end / S.fps).toFixed(0)} 秒` +
+      `<span class="dim">　没把握 ${r.uncertainty.toFixed(2)}</span><div class="bar"><i style="width:${100 * d / n}%"></i></div></span>` +
+      `<span class="dim">${d}/${n}</span>`;
+    el.onclick = () => gotoRally(ri);
+    box.appendChild(el);
+  });
+}
+
+function go(n) {
+  frame = Math.max(0, Math.min(S.frames - 1, n));
+  const ri = rallyOf(frame);
+  if (ri >= 0 && ri !== rally) { rally = ri; showProgress(S.progress); }
+  $("scrub").value = frame;
+  draw(); drawStrip();
+}
+
+function gotoRally(ri) {
+  rally = ri;
+  const r = S.rallies[ri];
+  let f = r.start;
+  while (f <= r.end && reviewed(f)) f++;   // first frame still to do
+  showProgress(S.progress);
+  go(f <= r.end ? f : r.start);
+}
+
+function stepRally(d) {
+  const k = S.order.indexOf(rally);
+  const next = S.order[Math.max(0, Math.min(S.order.length - 1, k + d))];
+  if (next !== undefined) gotoRally(next);
+}
+
+function nextUncertain() {
+  const r = S.rallies[rally]; if (!r) return;
+  for (let k = 1; k <= r.end - r.start + 1; k++) {
+    const f = r.start + ((frame - r.start + k) % (r.end - r.start + 1) + (r.end - r.start + 1)) % (r.end - r.start + 1);
+    if (!reviewed(f) && S.uncertainty[f] > S.doubtful) return go(f);
+  }
+}
+
+// --- saving: one request at a time, in order
+let queue = Promise.resolve(), pending = 0;
+function send(items) {
+  pending++; $("save").textContent = "保存中…"; $("save").className = "dim";
+  queue = queue.then(() => fetch("/api/label", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                body: JSON.stringify({items})}))
+    .then(r => r.ok ? r.json() : r.json().then(e => { throw new Error(e.error || r.status); }))
+    .then(res => { pending--; if (!pending) { $("save").textContent = "已保存"; } showProgress(res.progress); })
+    .catch(e => { pending--; $("save").textContent = "没保存上：" + e.message + "（服务还开着吗？）"; $("save").className = "err"; });
+}
+
+function setLabel(vis, x, y, st, advance = true) {
+  const item = {frame, visibility: vis, x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, status: st};
+  S.labels[frame] = [st === "skip" ? 0 : vis, vis ? item.x : 0, vis ? item.y : 0, st];
+  send([item]);
+  if (advance) go(frame + 1); else { draw(); drawStrip(); }
+}
+
+function accept() {
+  const l = label(frame), p = (l && l[3] !== "skip") ? l : S.pred[frame];  // a pre-filled label is what gets confirmed
+  setLabel(p[0], p[1], p[2], "human");
+}
+
+function bulkAccept() {
+  const r = S.rallies[rally]; if (!r) return;
+  const items = [];
+  for (let f = r.start; f <= r.end; f++) {
+    if (reviewed(f) || S.uncertainty[f] > S.confident) continue;
+    const l = label(f), p = l || S.pred[f];
+    items.push({frame: f, visibility: p[0], x: p[1], y: p[2], status: "bulk"});
+  }
+  if (!items.length) return;
+  if (!confirm(`回合 ${rally + 1}：把 ${items.length} 帧模型有把握（没把握程度 ≤ ${S.confident}）的预测直接接受？\n这些帧会标成「批量接受」，之后仍然可以逐帧改。`)) return;
+  for (const it of items) S.labels[it.frame] = [it.visibility, it.x, it.y, "bulk"];
+  send(items); draw(); drawStrip();
+}
+
+function removeLabel() {
+  if (!label(frame)) return;
+  delete S.labels[frame];
+  send([{frame, delete: true}]); draw(); drawStrip();
+}
+
+$("stage").addEventListener("mousemove", e => {
+  const b = $("stage").getBoundingClientRect();
+  mouse = {x: e.clientX - b.left, y: e.clientY - b.top}; drawLens();
+});
+$("stage").addEventListener("mouseleave", () => { mouse = null; drawLens(); });
+$("stage").addEventListener("click", e => {
+  const b = $("stage").getBoundingClientRect();
+  const [x, y] = toVideo(e.clientX - b.left, e.clientY - b.top);
+  if (x < 0 || y < 0 || x > S.size[0] || y > S.size[1]) return;
+  setLabel(1, x, y, "human");
+});
+$("scrub").addEventListener("input", e => go(+e.target.value));
+$("strip").addEventListener("click", e => {
+  const b = $("strip").getBoundingClientRect();
+  go(Math.floor((e.clientX - b.left) / b.width * S.frames));
+});
+window.addEventListener("resize", layout);
+window.addEventListener("keydown", e => {
+  if (!S || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase(), big = e.shiftKey ? 10 : 1;
+  let used = true;
+  if (k === " " || k === "v") accept();
+  else if (k === "n") setLabel(0, 0, 0, "human");
+  else if (k === "o") setLabel(0, 0, 0, "skip");
+  else if (k === "arrowright" || k === "k") go(frame + big);
+  else if (k === "arrowleft" || k === "j") go(frame - big);
+  else if (k === "u") nextUncertain();
+  else if (k === "]") stepRally(1);
+  else if (k === "[") stepRally(-1);
+  else if (k === "a" && e.shiftKey) bulkAccept();
+  else if (k === "backspace" || k === "delete") removeLabel();
+  else if (k === "z") { lensOn = !lensOn; drawLens(); }
+  else if (k >= "1" && k <= "5") {
+    const c = S.candidates && (S.candidates[frame] || [])[+k - 1];
+    if (c) setLabel(1, c[0], c[1], "human");
+  } else used = false;
+  if (used) { e.preventDefault(); document.activeElement.blur(); }
+});
+window.addEventListener("beforeunload", e => { if (pending) { e.preventDefault(); e.returnValue = ""; } });
+
+fetch("/api/state").then(r => r.json()).then(s => {
+  S = s;
+  document.title = "标注羽毛球 · " + S.video;
+  $("scrub").max = S.frames - 1;
+  $("file").textContent = "自动保存到 " + S.label_file.split("/").pop();
+  layout();
+  showProgress(S.progress);
+  // start at the first rally (in priority order) that still has frames to do
+  const todo = S.order.find(ri => { const r = S.rallies[ri]; for (let f = r.start; f <= r.end; f++) if (!reviewed(f)) return true; return false; });
+  if (todo !== undefined) gotoRally(todo); else go(0);
+});
+</script>
+</body>
+</html>
