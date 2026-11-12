@@ -357,9 +357,11 @@ def _parked_outside(raw, seen, t) -> np.ndarray:
     k = 0
     while k < len(idx):
         m = k
+        total = raw[idx[k]].copy()  # running sum: the stretch's centre without re-averaging it every step
         while m + 1 < len(idx) and t[idx[m + 1]] - t[idx[m]] <= MAX_GAP_S and \
-                np.linalg.norm(raw[idx[m + 1]] - raw[idx[k:m + 1]].mean(0)) <= PARKED_RADIUS_M:
+                np.linalg.norm(raw[idx[m + 1]] - total / (m - k + 1)) <= PARKED_RADIUS_M:
             m += 1
+            total += raw[idx[m]]
         if t[idx[m]] - t[idx[k]] >= PARKED_S:
             out[idx[k]:idx[m] + 1] = outside[idx[k]:idx[m] + 1]
         k = m + 1

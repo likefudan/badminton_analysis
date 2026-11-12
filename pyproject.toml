@@ -25,12 +25,18 @@ dev = ["pytest>=8"]
 # Native fp16 Core ML models on a Mac (device "coremlnative"). torch and
 # onnx2torch are only needed once, to convert the ONNX models.
 coreml = ["coremltools>=8", "torch>=2.2", "onnx2torch>=1.5"]
+# AI post-match review through the Anthropic API (step 4). Without it, or without
+# ANTHROPIC_API_KEY, `badminton review` writes a prompt file to paste into any chat model.
+review = ["anthropic>=0.40"]
 
 [project.scripts]
 badminton = "badminton.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+badminton = ["*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

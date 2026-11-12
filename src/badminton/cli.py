@@ -25,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-o", "--output", default=None, help="默认是视频同名的 .court.json")
     s.add_argument("--time", type=float, default=1.0, help="用第几秒的画面来点（秒）")
     s.add_argument("--points", help="不开窗口，直接给点：name=x,y;name=x,y;...")
+    s.add_argument("--auto", action="store_true", help="自动标定：检测白色球场线并拟合标准球场，不用手点")
+    s.add_argument("--hint", help="自动标定时指定要哪片场地：场地内任意一点的像素坐标 x,y（画面里有多片场地时用）")
+    s.add_argument("--frames", type=int, default=5, help="自动标定取几帧做中值（去掉走动的人），默认 5；1 = 只用一帧")
+    s.add_argument("--every", type=float, help="自动标定后每隔这么多秒再对一次线，报告机位漂移")
 
     s = sub.add_parser("skeleton", help="第 1 步：输出叠加骨架的视频和每帧的姿态数据")
     s.add_argument("video")
@@ -132,12 +136,51 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-cut", action="store_true", help="不剪精简视频和最长回合集锦")
     _model_args(s)
 
+    s = sub.add_parser("annotate", help="标注羽毛球位置（浏览器里逐帧确认或点击），为微调 TrackNetV3 准备数据")
+    s.add_argument("video")
+    s.add_argument("--court", help="球场标定，默认 <视频名>.court.json（有的话）；第一次运行要跑一遍 TrackNetV3 时用")
+    s.add_argument("--shuttle", help="已有的预测 CSV（badminton shuttle 的输出）；不给就自己跑一遍并缓存到 <视频名>.annotate.npz")
+    s.add_argument("--raw", help="和 --shuttle 一起用：TrackNetV3 原版逐帧选点的 CSV（--raw-output），两者不一致的帧优先看")
+    s.add_argument("--rallies", help="回合列表：badminton movement 生成的 .movement.json，默认 <视频名>.movement.json；没有就按球出现的时段切")
+    s.add_argument("--labels", help="标注文件，默认 <视频名>.labels.csv（旁边还有同名 .json 记录谁、什么时候标的）")
+    s.add_argument("--annotator", help="标注人的名字，默认是系统用户名")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--prefill", type=int, default=0, metavar="N",
+                   help="把模型最没把握的 N 个回合先用模型预测填上（标成「机器预标注」，没人看过，默认不会被导出）")
+    s.add_argument("--no-serve", action="store_true", help="只准备文件（预测缓存、--prefill），不启动网页")
+    s.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要）")
+
+    s = sub.add_parser("annotate-export", help="把标注好的回合导出成 TrackNetV3 训练用的目录（帧、csv、背景图，按回合分 train/val）")
+    s.add_argument("videos", nargs="+", help="标注过的视频（旁边要有 <视频名>.labels.csv）")
+    s.add_argument("-o", "--out-dir", default="data/tracknet_finetune", help="导出目录，默认 data/tracknet_finetune")
+    s.add_argument("--val-frac", type=float, default=0.2, help="多大比例的回合留作验证集（默认 0.2，至少 1 个回合）")
+    s.add_argument("--include-unreviewed", action="store_true", help="没人看过的机器预标注也导出（只用来试流程，不要拿来训练）")
+    s.add_argument("--full-size", action="store_true", help="帧按视频原始分辨率保存（默认缩到模型输入的 512x288，和推理时完全一样）")
+
+    s = sub.add_parser("review", help="第 4 步：AI 赛后点评（大模型只读程序算出的数字，不看视频）")
+    s.add_argument("inputs", nargs="+", metavar="ANALYSIS_JSON", help="movement.json，可再加 positioning.json")
+    s.add_argument("--ask", help="追问一个问题（沿用同一份数据和已有的点评）")
+    s.add_argument("--previous", help="上一次的 review.summary.json，用来比较")
+    s.add_argument("--model", default=None, help="Anthropic 模型，默认 claude-sonnet-5-5")
+    s.add_argument("--court", help="court.json：算出相机高度和每人的位置误差，写进数据质量说明")
+    s.add_argument("--shuttle", help="羽毛球轨迹 CSV：每个回合里球被检测到的比例（需要 --video 或 --fps）")
+    s.add_argument("--video", help="分析用的视频，只用来读帧率")
+    s.add_argument("--fps", type=float, help="羽毛球 CSV 的帧率")
+    s.add_argument("--shuttle-offset", type=float, default=0.0, help="羽毛球 CSV 第 0 帧在统计时间轴上的秒数")
+    s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%%），写进数据质量说明")
+    s.add_argument("--response", help="把聊天模型的回答（文本文件）导入，生成 Markdown 和 HTML 报告")
+    s.add_argument("--api", action="store_true",
+                   help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和第一个输入同目录")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
-            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "positioning": cmd_positioning, "analyze": cmd_analyze,
-            "cut": cmd_cut}[a.cmd](a)
+            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
+            "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze,
+            "review": cmd_review, "cut": cmd_cut}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -179,6 +222,8 @@ def cmd_calibrate(a) -> int:
     idx = int(a.time * (info.fps or 30))
     if info.frames:
         idx = min(idx, info.frames - 1)
+    if a.auto:
+        return _calibrate_auto(a, info, idx)
     frame = read_frame(a.video, idx)
     points = parse_points(a.points) if a.points else click_points(frame)
     if not points:
@@ -198,6 +243,81 @@ def cmd_calibrate(a) -> int:
         print(f"  {suspect[0]} 可能点偏了：去掉它后其余点的误差降到 {suspect[1]:.1f} 像素，建议重点")
     if len(points) < 6:
         print("提示：只点了 4–5 个点，远端精度会差一些，建议再加发球线交点")
+    return 0
+
+
+def _calibrate_auto(a, info, idx: int) -> int:
+    """calibrate --auto: fit the court to the white lines, no clicking."""
+    import cv2
+    import numpy as np
+
+    from .autocal import AutoCalibrationError, auto_calibrate, intersection_distance_px, median_frame, track
+    from .render import draw_court, draw_markers
+    from .video import read_frame
+
+    if a.every is not None and a.every <= 0:
+        print("--every 必须大于 0 秒")
+        return 2
+    fps = info.fps or 30
+    last = info.frames - 1 if info.frames else None
+    # a few frames half a second apart: the median keeps the floor and drops the players
+    wanted = [idx + int(round(k * 0.5 * fps)) for k in range(max(1, a.frames))]
+    frames = [read_frame(a.video, i) for i in wanted if last is None or i <= last]
+    frame = median_frame(frames)
+    hint = tuple(float(v) for v in a.hint.split(",")) if a.hint else None
+    out = Path(a.output or Path(a.video).with_suffix(".court.json"))
+    try:
+        res = auto_calibrate(frame, hint)
+    except AutoCalibrationError as e:
+        print(f"自动标定失败：{e}")
+        bad = getattr(e, "result", None)
+        if bad is not None:  # show what was found, but do not save it as the calibration
+            preview = frames[0].copy()
+            draw_court(preview, bad.calib, (0, 0, 255), 2)
+            rejected = out.with_suffix(".rejected.png")
+            cv2.imwrite(str(rejected), preview)
+            print(f"  找到的最好结果画在 {rejected}（红线），没有保存标定")
+        print("请换一个球场线清楚、少有人挡的时刻（--time），或用 --hint x,y 指定场地，"
+              "或者改用手动标定：badminton calibrate 视频（不加 --auto）")
+        return 2
+    calib = res.calib
+    calib.save(out)
+    preview = frames[0].copy()
+    draw_court(preview, calib, (0, 255, 0), 2)
+    draw_markers(preview, calib)
+    cv2.imwrite(str(out.with_suffix(".png")), preview)
+    print(f"已保存 {out}（预览图 {out.with_suffix('.png')}，请看一眼绿线是否压在白线上）")
+    print(f"置信度 {res.confidence:.0%}（投影的球场线落在白线上的比例），"
+          f"对上 {res.lines_found}/{res.lines_visible} 条线，离白线平均 {res.mean_distance_px:.1f} 像素")
+    cam_side = calib.to_image(np.array([(0.0, 0.0)]))[0]
+    print(f"近端左角在画面 ({cam_side[0]:.0f}, {cam_side[1]:.0f})；如果选错了场地，用 --hint x,y 指定")
+    if a.every:
+        if not info.frames:
+            print("不知道视频总帧数，无法检查漂移")
+            return 0
+        print(f"机位漂移（每 {a.every:g} 秒对一次线，和第 {a.time:g} 秒比，画面内交点的像素偏移）：")
+        worst = 0.0
+        t = a.time + a.every
+        while int(t * fps) <= last:
+            cur = track(read_frame(a.video, int(t * fps)), calib)
+            if cur is None:
+                print(f"  {t:7.1f}s  找不到球场（机位大幅变化或线被挡住）")
+            else:
+                mean, mx = intersection_distance_px(calib, cur.calib, in_frame=True)
+                if not np.isfinite(mx):
+                    print(f"  {t:7.1f}s  原来的球场线交点都不在画面里了（机位大幅变化）")
+                    worst = mx
+                    t += a.every
+                    continue
+                worst = max(worst, mx)
+                print(f"  {t:7.1f}s  平均 {mean:5.1f}  最大 {mx:5.1f}  置信度 {cur.confidence:.0%}")
+            t += a.every
+        if not np.isfinite(worst):
+            print("机位变化太大：建议先运行 badminton stabilize 再标定")
+        elif worst > 5:
+            print(f"最大漂移 {worst:.1f} 像素：建议先运行 badminton stabilize 再标定")
+        else:
+            print(f"最大漂移 {worst:.1f} 像素：机位稳定")
     return 0
 
 
@@ -652,6 +772,203 @@ def cmd_shuttle(a) -> int:
         ov = out.with_suffix(".mp4")
         draw_shuttle_video(video, rows, ov)
         print(f"轨迹视频 {ov}")
+    return 0
+
+
+def cmd_annotate(a) -> int:
+    import numpy as np
+
+    from . import annotate as an
+    from .pipeline import print_progress
+    from .video import probe
+
+    video = Path(a.video)
+    info = probe(video)
+    cache = video.with_suffix(".annotate.npz")
+    if a.shuttle:
+        path = an.read_prediction_csv(a.shuttle, info.frames or None)
+        raw = an.read_prediction_csv(a.raw, len(path)) if a.raw else None
+        candidates = None
+        print("用现成的预测 CSV：没有候选点和热力图分数，「没把握程度」只看两份结果是否一致和轨迹跳变")
+    elif cache.exists():
+        path, raw, candidates = an.load_predictions(cache)
+        print(f"读入缓存的预测 {cache}")
+    else:
+        court = a.court or (video.with_suffix(".court.json") if video.with_suffix(".court.json").exists() else None)
+        print("先跑一遍 TrackNetV3（只需一次，结果缓存下来）" + ("" if court else "；没有球场标定，选点不限制在场地上方"))
+        path, raw, candidates = an.predict(video, court, a.tracknet_dir, print_progress)
+        an.save_predictions(cache, path, raw, candidates)
+        print(f"预测已缓存到 {cache}")
+    fps = info.fps or 30.0
+    n = len(path)
+    rallies_file = a.rallies or (video.with_suffix(".movement.json") if video.with_suffix(".movement.json").exists() else None)
+    if rallies_file:
+        rallies = an.load_rallies(rallies_file, fps, n)
+    else:
+        rallies = an.rallies_from_predictions(path, fps) or [(0, n - 1)]
+        print(f"没有回合列表（--rallies），按球出现的时段切成 {len(rallies)} 段")
+    labels_csv = Path(a.labels) if a.labels else video.with_suffix(".labels.csv")
+    store = an.LabelStore(labels_csv, {"file": video.name, "frames": n, "fps": fps, "size": [info.width, info.height]},
+                          a.annotator, rallies)
+    app = an.AnnotationApp(video, store, path, raw, candidates, rallies, fps, (info.width, info.height))
+    if a.prefill:
+        for i in app.order[:a.prefill]:
+            k = an.prefill(store, rallies[i], path)
+            print(f"回合 {i + 1}（第 {rallies[i][0]}–{rallies[i][1]} 帧）：预填 {k} 帧机器预标注（没人看过）")
+    store.save()
+    p = app.progress()
+    print(f"{len(rallies)} 个回合共 {p['rally_frames']} 帧，已标 {p['done']} 帧，还剩 {p['left']} 帧，估计 {p['minutes_left']:.0f} 分钟")
+    print(f"标注保存在 {labels_csv}（和 {store.meta_path.name}）")
+    if a.no_serve:
+        return 0
+    try:
+        server = an.make_server(app, a.port)
+    except OSError as e:
+        raise SystemExit(f"端口 {a.port} 用不了（{e}）：换一个 --port") from None
+    url = f"http://localhost:{a.port}"
+    print(f"在浏览器里打开 {url} 开始标注；标完按 Ctrl+C 结束（每一步都已自动保存）")
+    if not a.no_browser:
+        import webbrowser
+
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.server_close()
+        store.save()
+    c = store.counts()
+    print(f"已保存：确认 {c['human']} 帧，批量接受 {c['bulk']} 帧，拿不准 {c['skip']} 帧，机器预标注 {c['machine']} 帧")
+    return 0
+
+
+def cmd_annotate_export(a) -> int:
+    from .annotate_export import export_dataset
+    from .pipeline import print_progress
+
+    items = []
+    for v in a.videos:
+        video = Path(v)
+        labels = video.with_suffix(".labels.csv")
+        if not labels.exists():
+            raise SystemExit(f"找不到 {labels}：先运行 badminton annotate {video}")
+        meta = labels.with_suffix(".json")
+        rallies = json.loads(meta.read_text()).get("rallies") if meta.exists() else None
+        items.append((video, labels, rallies))
+    try:
+        manifest = export_dataset(items, a.out_dir, a.val_frac, a.include_unreviewed, a.full_size, print_progress)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    print()
+    for m in manifest["matches"]:
+        for split in ("train", "val"):
+            segs = [s for s in m["segments"] if s["split"] == split]
+            print(f"  {split}/match{m['match']}（{Path(m['video']).name}）：{len(segs)} 段，{sum(s['frames'] for s in segs)} 帧，"
+                  f"其中 {sum(s['visible'] for s in segs)} 帧有球")
+        if not any(s["split"] == "val" for s in m["segments"]):
+            print("  注意：只有一个回合有标注，验证集是空的；TrackNetV3 的 train.py 需要验证集，请至少标两个回合")
+    if a.include_unreviewed:
+        print("注意：里面有没人看过的机器预标注，只能用来试流程，不要拿来训练")
+    print(f"已导出到 {a.out_dir}（清单 manifest.json）；微调步骤见 docs/tracknet_finetune.md")
+    return 0
+
+
+def cmd_review(a) -> int:
+    from . import review as rv
+
+    paths = [Path(x) for x in a.inputs]
+    loaded = [(x, json.loads(x.read_text())) for x in paths]
+    main = next(((x, d) for x, d in loaded if rv.is_movement(d)), None)
+    if main is None:
+        print("输入里没有跑动统计（badminton movement 生成的 .movement.json）")
+        return 1
+    path, movement = main
+    stem = rv.stem_of(path)
+    extras = {x.name[len(rv.stem_of(x)):].strip(".").removesuffix(".json") or x.stem: d
+              for x, d in loaded if x is not path}
+    calib = None
+    if a.court:
+        from .court import CourtCalibration
+
+        calib = CourtCalibration.load(a.court)
+    shuttle = None
+    if a.shuttle:
+        fps = a.fps
+        if not fps and a.video:
+            from .video import probe
+
+            fps = probe(a.video).fps
+        if not fps:
+            print("--shuttle 需要帧率：加 --video <分析用的视频> 或 --fps 30")
+            return 1
+        shuttle = rv.shuttle_stats(a.shuttle, fps, movement.get("rallies", []), a.shuttle_offset)
+    summary = rv.build_summary(movement, source=stem, extras=extras, calib=calib, shuttle=shuttle,
+                               shuttle_accuracy_pct=a.shuttle_accuracy)
+    previous = json.loads(Path(a.previous).read_text()) if a.previous else None
+    out_dir = Path(a.out_dir) if a.out_dir else path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = lambda suffix: out_dir / f"{stem}.review.{suffix}"  # noqa: E731
+    out("summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1))
+    model = a.model or rv.DEFAULT_MODEL
+    # the API is only called when asked for (--api): a key in the environment alone is not consent
+    use_api = bool(a.api) and not a.response
+    if use_api and not rv.have_api_key():
+        print("--api 需要先设置 ANTHROPIC_API_KEY（并安装 pip install -e \".[review]\"）")
+        return 1
+
+    def paste_instructions(prompt_path: Path, then: str) -> None:
+        print(f"提示词已写入 {prompt_path}（只有数字和文字，不含视频和图片）")
+        print("没有调用任何模型，也没有联网。两种办法：")
+        print("  1. 加 --api 通过 Anthropic API 直接生成（需要 ANTHROPIC_API_KEY，" +
+              ("已设置" if rv.have_api_key() else "现在没有设置") + "；只发送这个文件里的文字）；")
+        print(f"  2. 把这个文件的全部内容贴进任意聊天模型，{then}")
+
+    if a.ask:
+        report_path = out("md")
+        report = report_path.read_text() if report_path.exists() else None
+        system, messages = rv.build_messages(summary, previous, report, a.ask)
+        prompt_path = out("ask.prompt.txt")
+        prompt_path.write_text(rv.prompt_file_text(system, messages))
+        if not use_api:
+            paste_instructions(prompt_path, "直接看它的回答。")
+            return 0
+        print(f"把 {prompt_path} 里的文字（{len(rv.prompt_file_text(system, messages))} 字）发送给 {model} ……")
+        try:
+            answer = rv.call_anthropic(system, messages, model)
+        except rv.ReviewError as e:
+            print(f"{e}\n提示词在 {prompt_path}，可以贴进任意聊天模型。")
+            return 1
+        with open(out("qa.md"), "a") as f:
+            f.write(f"## 问：{a.ask.strip()}\n\n{answer}\n\n")
+        print(answer)
+        print(f"\n（{model} 回答；已追加到 {out('qa.md')}）")
+        return 0
+
+    system, messages = rv.build_messages(summary, previous)
+    prompt_path = out("prompt.txt")
+    prompt_path.write_text(rv.prompt_file_text(system, messages))
+    if a.response:
+        body, origin = Path(a.response).read_text(), f"点评文字从 {Path(a.response).name} 导入（聊天模型按提示词文件生成）"
+    elif use_api:
+        print(f"把 {prompt_path} 里的文字（{len(prompt_path.read_text())} 字）发送给 {model} ……")
+        try:
+            body = rv.call_anthropic(system, messages, model)
+        except rv.ReviewError as e:
+            print(f"{e}\n提示词在 {prompt_path}，可以贴进任意聊天模型，再用 --response 导入回答。")
+            return 1
+        origin = f"由 {model} 通过 Anthropic API 生成"
+    else:
+        paste_instructions(prompt_path, f"把回答存成文本文件，再运行：badminton review {path} --response 回答.md")
+        return 0
+    missing = rv.missing_sections(body)
+    md = rv.report_markdown(summary, body, origin)
+    out("md").write_text(md)
+    out("html").write_text(rv.report_html(md, rv.find_cards(path, summary), f"赛后点评：{stem}"))
+    print(md)
+    if missing:
+        print(f"注意：回答里缺少这些小节：{'、'.join(missing)}")
+    print(f"报告：{out('md')}、{out('html')}；摘要：{out('summary.json')}")
     return 0
 
 
