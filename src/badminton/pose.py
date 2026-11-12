@@ -138,8 +138,13 @@ class PoseEstimator:
         device: str = "auto",
         det_model: str | None = None,
         pose_model: str | None = None,
-        det_score_thr: float = 0.5,
+        det_score_thr: float = 0.3,
+        cut_nms: bool | None = None,
     ) -> None:
+        """`det_score_thr`: rtmlib applies a fixed 0.3 to the NMS models' output
+        (its own score_thr is ignored there), so 0.3 is what the full graph gives.
+        `cut_nms`: run the detector without its NMS tail (see detector.py);
+        default on for Core ML, where the tail is slow and fails on empty frames."""
         from rtmlib import YOLOX, RTMPose
 
         if mode not in MODES:
@@ -150,6 +155,16 @@ class PoseEstimator:
         # chosen provider (and its options) right after.
         self.det = YOLOX(det_model or det_url, model_input_size=det_size, score_thr=det_score_thr, device="cpu")
         self.pose = RTMPose(pose_model or pose_url, model_input_size=pose_size, device="cpu")
+        if cut_nms is None:
+            cut_nms = self.device == "coreml"
+        self.det_nms = "graph"
+        if cut_nms:
+            from .detector import NoNmsDetector, cut_before_nms
+
+            path = cut_before_nms(self.det.onnx_model)
+            if path is not None:
+                self.det = NoNmsDetector(self.det, path, None, det_score_thr)
+                self.det_nms = "numpy"
         self.providers = {}
         for name, tool in (("det", self.det), ("pose", self.pose)):
             # rtmlib feeds the pose model one person at a time; pinning the
