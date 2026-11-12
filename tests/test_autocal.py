@@ -167,3 +167,21 @@ def test_cli_auto_saves_calibration_and_refuses_an_empty_floor(camera, tmp_path,
     assert main(["calibrate", str(empty), "--auto", "--time", "0"]) != 0
     assert not (tmp_path / "empty.court.json").exists()
     assert "手动标定" in capsys.readouterr().out
+
+
+def test_intersection_distance_without_crossings_in_frame(camera):
+    calib = truth(camera)
+    far = CourtCalibration({n: (x + 10000, y) for n, (x, y) in calib.image_points.items()}, calib.frame_size)
+    assert autocal.intersection_distance_px(far, calib, in_frame=True) == (float("inf"), float("inf"))
+
+
+def test_cli_rejects_non_positive_every(tmp_path, capsys):
+    from badminton.cli import main
+
+    video = tmp_path / "v.mp4"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (320, 240))
+    for _ in range(5):
+        w.write(np.zeros((240, 320, 3), np.uint8))
+    w.release()
+    assert main(["calibrate", str(video), "--auto", "--every", "0"]) == 2
+    assert "--every" in capsys.readouterr().out

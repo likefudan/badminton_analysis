@@ -697,7 +697,7 @@ def intersection_distance_px(a: CourtCalibration, b: CourtCalibration, in_frame:
     """Mean and max pixel distance between two calibrations at the court line crossings.
 
     All 30 crossings of the painted lines are compared; with `in_frame` only
-    those that `a` puts inside the picture.
+    those that `a` puts inside the picture (inf, inf when there are none).
     """
     grid = np.array([(x, y) for x in LONG_X for y in CROSS_Y])
     pa, pb = a.to_image(grid), b.to_image(grid)
@@ -705,6 +705,8 @@ def intersection_distance_px(a: CourtCalibration, b: CourtCalibration, in_frame:
         w, h = a.frame_size
         keep = (pa[:, 0] >= 0) & (pa[:, 0] < w) & (pa[:, 1] >= 0) & (pa[:, 1] < h)
         pa, pb = pa[keep], pb[keep]
+    if len(pa) == 0:
+        return float("inf"), float("inf")
     d = np.linalg.norm(pa - pb, axis=1)
     return float(d.mean()), float(d.max())
 

@@ -203,6 +203,9 @@ def _calibrate_auto(a, info, idx: int) -> int:
     from .render import draw_court, draw_markers
     from .video import read_frame
 
+    if a.every is not None and a.every <= 0:
+        print("--every 必须大于 0 秒")
+        return 2
     fps = info.fps or 30
     last = info.frames - 1 if info.frames else None
     # a few frames half a second apart: the median keeps the floor and drops the players
@@ -249,10 +252,17 @@ def _calibrate_auto(a, info, idx: int) -> int:
                 print(f"  {t:7.1f}s  找不到球场（机位大幅变化或线被挡住）")
             else:
                 mean, mx = intersection_distance_px(calib, cur.calib, in_frame=True)
+                if not np.isfinite(mx):
+                    print(f"  {t:7.1f}s  原来的球场线交点都不在画面里了（机位大幅变化）")
+                    worst = mx
+                    t += a.every
+                    continue
                 worst = max(worst, mx)
                 print(f"  {t:7.1f}s  平均 {mean:5.1f}  最大 {mx:5.1f}  置信度 {cur.confidence:.0%}")
             t += a.every
-        if worst > 5:
+        if not np.isfinite(worst):
+            print("机位变化太大：建议先运行 badminton stabilize 再标定")
+        elif worst > 5:
             print(f"最大漂移 {worst:.1f} 像素：建议先运行 badminton stabilize 再标定")
         else:
             print(f"最大漂移 {worst:.1f} 像素：机位稳定")
