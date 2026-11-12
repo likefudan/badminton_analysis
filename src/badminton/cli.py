@@ -77,6 +77,19 @@ def main(argv: list[str] | None = None) -> int:
             s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
             s.add_argument("--shuttle", help="可选：TrackNetV3 的 _ball.csv，只用来对照回合切分")
 
+    s = sub.add_parser("shuttle", help="羽毛球轨迹（TrackNetV3，原生 Core ML），输出每帧球的位置 CSV")
+    s.add_argument("video")
+    s.add_argument("-o", "--output", help="输出 CSV，默认 <视频名>.shuttle.csv")
+    s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要），也可用环境变量 TRACKNETV3_DIR")
+    s.add_argument("--compute-units", default="ALL", choices=["ALL", "CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"])
+    s.add_argument("--no-inpaint", action="store_true", help="不用 InpaintNet 补短暂丢失")
+    s.add_argument("--max-frames", type=int, help="只处理前 N 帧（试跑）")
+    s.add_argument("--overlay", action="store_true", help="同时输出画了轨迹的视频 <视频名>.shuttle.mp4")
+    s.add_argument("--frame-step", type=int, default=1,
+                   help="每 N 帧送一帧给模型；60fps 视频建议 2（TrackNetV3 是用 30fps 训练的），跳过的帧用插值补")
+    s.add_argument("--resize", default="pil", choices=["pil", "area"],
+                   help="缩小画面的方法：pil 和 TrackNetV3 原版一样（默认）；area 稍快但位置稍有偏差")
+
     s = sub.add_parser("analyze", help="一键处理：标定（已有就沿用）→ 骨架 → 跑动卡片 → 双打站位报告")
     s.add_argument("video")
     s.add_argument("--court", help="court.json，默认 <视频名>.court.json；没有就先打开窗口点标记点")
@@ -93,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
-            "label": cmd_label, "movement": cmd_movement,
+            "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
 
 
@@ -499,6 +512,35 @@ def cmd_analyze(a) -> int:
     print(f"\n全部结果在 {out_dir}/；汇总给 AI 点评用的数据：{out}")
     if not players.exists():
         print(f'看 {players.with_suffix(".png")} 里的编号，用 --names "1=...,2=..." 再运行一次就能带上名字（骨架不会重跑）')
+    return 0
+
+
+def cmd_shuttle(a) -> int:
+    from .pipeline import print_progress
+    from .shuttle import track_shuttle, write_csv
+
+    from .video import probe
+
+    video = Path(a.video)
+    info = probe(video)
+    if info.is_hdr:
+        print("注意：这是 HDR 视频，颜色会发灰，球更难找。建议先运行 badminton sdr 转成 SDR")
+    if a.frame_step == 1 and info.fps and info.fps > 45:
+        print(f"提示：视频是 {info.fps:.0f} fps，TrackNetV3 是用 30 fps 训练的，可以试试 --frame-step 2")
+    out = Path(a.output or video.with_suffix(".shuttle.csv"))
+    rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
+                             max_frames=a.max_frames, progress=print_progress, resize=a.resize,
+                             frame_step=a.frame_step)
+    write_csv(rows, out)
+    seen = sum(r[1] for r in rows)
+    print(f"已写入 {out}：{len(rows)} 帧，{seen} 帧有球（{100 * seen / max(1, len(rows)):.1f}%）")
+    print(tm.summary())
+    if a.overlay:
+        from .render import draw_shuttle_video
+
+        ov = out.with_suffix(".mp4")
+        draw_shuttle_video(video, rows, ov)
+        print(f"轨迹视频 {ov}")
     return 0
 
 
