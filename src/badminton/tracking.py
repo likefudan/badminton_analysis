@@ -39,6 +39,7 @@ from .court import CourtCalibration
 MAX_SPEED = 8.0  # m/s: faster than any badminton player moves on court
 REACQUIRE_S = 3.0  # after this long without the player, take whoever step 1 found
 SAME_PERSON_HIST = 0.25  # torso colour distance below which a far jump is still the same person
+BRIDGE_MAX_SPEED = 5.0  # m/s: a gap needing a faster run than this is not filled (likely two people)
 MAX_GAP_S = 0.8  # bridge missing / airborne stretches up to this long (a jump smash with take-off and landing ~0.7 s)
 AIRBORNE_RATIO = 1.06  # body-height/floor-scale ratio above the player's upright level by this factor
 _SHOULDERS, _HIPS, _ANKLES = (5, 6), (11, 12), (15, 16)
@@ -410,7 +411,8 @@ def _speed_outliers(raw, ground, t, cuts) -> np.ndarray:
 
 
 def _bridge(raw, good, t, cuts) -> np.ndarray:
-    """Keep good positions, interpolate gaps up to MAX_GAP_S (not across a cut),
+    """Keep good positions, interpolate gaps up to MAX_GAP_S (not across a cut, and
+    not when closing the gap would need a run faster than BRIDGE_MAX_SPEED),
     NaN elsewhere. The frame of a cut is left NaN so later smoothing and
     distance never join the two sides."""
     xy = np.full_like(raw, np.nan)
@@ -418,7 +420,8 @@ def _bridge(raw, good, t, cuts) -> np.ndarray:
     xy[idx] = raw[idx]
     seg = np.cumsum(cuts)
     for a, b in zip(idx[:-1], idx[1:]):
-        if b - a > 1 and t[b] - t[a] <= MAX_GAP_S and seg[a] == seg[b]:
+        if b - a > 1 and t[b] - t[a] <= MAX_GAP_S and seg[a] == seg[b] \
+                and np.linalg.norm(raw[b] - raw[a]) <= BRIDGE_MAX_SPEED * (t[b] - t[a]):
             w = ((t[a + 1:b] - t[a]) / (t[b] - t[a]))[:, None]
             xy[a + 1:b] = (1 - w) * raw[a] + w * raw[b]
     xy[np.asarray(cuts, bool)] = np.nan
