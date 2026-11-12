@@ -453,7 +453,10 @@ def cmd_analyze(a) -> int:
     else:
         print(f"== 1/4 沿用球场标定 {court} ==")
     data = out_dir / f"{video.stem}.skeleton.npz"
-    if data.exists() and not a.force:
+    stale = data.exists() and court.stat().st_mtime > data.stat().st_mtime
+    if stale:
+        print(f"球场标定 {court} 比骨架数据新，骨架重新跑（球场坐标要用新标定）")
+    if data.exists() and not a.force and not stale:
         print(f"== 2/4 沿用骨架数据 {data}（--force 重新跑）==")
     else:
         print("== 2/4 骨架 ==")
