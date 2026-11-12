@@ -41,7 +41,7 @@ def test_longest_keeps_match_order_and_numbers():
 
 def test_ffmpeg_command_without_audio_or_labels():
     cmd = ffmpeg_command("in.mp4", "out.mp4", [Clip(1.0, 3.0, [(1, 2.0, 1.0)]), Clip(5.0, 6.0, [(2, 1.0, 5.0)])],
-                         {}, has_audio=False, margin=10)
+                         {}, audio=None, margin=10)
     fc = cmd[cmd.index("-filter_complex") + 1]
     assert "concat=n=2:v=1:a=0[v]" in fc and "overlay" not in fc and "[a]" not in cmd
     assert cmd.count("-ss") == 2
@@ -68,3 +68,28 @@ def test_cut_real_video(tmp_path, audio):
     assert res["longest"]["numbers"] == [2]
     a = dur(res["rallies"]["path"], "a:0")
     assert (a == pytest.approx(14, abs=0.2)) if audio else (a is None)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_long_match_is_cut_in_batches_with_odd_file_names(tmp_path, monkeypatch):
+    """Many rallies (batched runs, joined without re-encoding), a file name ffmpeg
+    could misread, and a second audio stream: video and sound stay the same length."""
+    import badminton.cut as cut
+
+    monkeypatch.setattr(cut, "CLIPS_PER_RUN", 2)
+    src = tmp_path / "it's -a:b match.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=30",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=30", "-f", "lavfi", "-i", "sine=frequency=880:duration=30",
+                    "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(src)],
+                   check=True)
+    rallies = [{"start_s": 3.0 + 5 * k, "end_s": 4.0 + 5 * k} for k in range(5)]  # 5 clips of 1+1+1 = 3 s
+    res = cut.cut_match(src, rallies, tmp_path / "out dir", pre_s=1.0, post_s=1.0, merge_gap_s=0.5, top=0)
+    out = res["rallies"]["path"]
+
+    def dur(stream):
+        return float(subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries", "stream=duration",
+                                     "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip())
+
+    assert len(res["rallies"]["clips"]) == 5
+    assert dur("v:0") == pytest.approx(15, abs=0.2)
+    assert dur("a:0") == pytest.approx(dur("v:0"), abs=0.1)

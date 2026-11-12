@@ -691,6 +691,10 @@ def cmd_cut(a) -> int:
     if not rallies:
         print(f"{src} 里没有切出回合，没有可剪的内容")
         return 1
+    from .video import probe
+
+    if probe(video).is_hdr:
+        print("注意：这是 HDR 视频，直接剪出来颜色会发灰；建议先 badminton sdr 转成 SDR，再剪转好的那个（时间轴不变）")
     try:
         res = cut_match(video, rallies, out_dir, a.pre, a.post, a.merge_gap, a.top, not a.no_label, a.encoder)
     except RuntimeError as e:

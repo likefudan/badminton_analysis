@@ -17,6 +17,7 @@ from pathlib import Path
 PRE_S = 2.0        # lead-in before each rally: covers the late rally start
 POST_S = 1.0       # tail after each rally: the shuttle landing and the reaction
 MERGE_GAP_S = 1.0  # padded clips closer than this are joined instead of jump-cut
+CLIPS_PER_RUN = 12  # every clip is an ffmpeg input of its own: long matches are cut in batches
 
 
 @dataclass
@@ -104,11 +105,13 @@ def has_cjk_font() -> bool:
     return bool({f.name for f in font_manager.fontManager.ttflist} & set(_CJK_FONTS))
 
 
-def ffmpeg_command(video: Path, out: Path, clips: list[Clip], labels: dict[int, Path], has_audio: bool,
+def ffmpeg_command(video: Path, out: Path, clips: list[Clip], labels: dict[int, Path], audio: int | None,
                    margin: int, encoder: str = "libx264") -> list[str]:
     """One ffmpeg run: every clip is its own seeked input (frame-accurate since
-    we re-encode), labels are overlaid, then everything is concatenated."""
-    cmd = ["ffmpeg", "-y", "-v", "error"]
+    we re-encode), labels are overlaid, then everything is concatenated.
+    `audio`: index of the audio stream to keep (None: no sound)."""
+    has_audio = audio is not None
+    cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin"]
     for c in clips:
         cmd += ["-ss", f"{c.start_s:.3f}", "-t", f"{c.duration_s:.3f}", "-i", str(video)]
     label_input: dict[int, int] = {}
@@ -129,7 +132,7 @@ def ffmpeg_command(video: Path, out: Path, clips: list[Clip], labels: dict[int, 
             cur = nxt
         parts.append(f"[{cur}]null[v{i}]")
         if has_audio:
-            parts.append(f"[{i}:a:0]asetpts=PTS-STARTPTS,aresample=async=1[a{i}]")
+            parts.append(f"[{i}:a:{audio}]asetpts=PTS-STARTPTS,aresample=async=1[a{i}]")
     streams = "".join(f"[v{i}]" + (f"[a{i}]" if has_audio else "") for i in range(len(clips)))
     parts.append(f"{streams}concat=n={len(clips)}:v=1:a={1 if has_audio else 0}[v]" + ("[a]" if has_audio else ""))
     cmd += ["-filter_complex", ";".join(parts), "-map", "[v]"]
@@ -141,26 +144,50 @@ def ffmpeg_command(video: Path, out: Path, clips: list[Clip], labels: dict[int, 
     return cmd
 
 
+def _concat_list_line(path: Path) -> str:
+    # concat demuxer syntax: single quotes, a quote inside is written '\\''
+    return "file '" + str(path).replace("'", "'\\''") + "'\n"
+
+
 def cut_video(video: Path, out: Path, clips: list[Clip], total_rallies: int, label: bool = True,
               encoder: str = "libx264") -> None:
-    from .video import probe
+    """Cut and join. Paths are made absolute so ffmpeg never reads a file name as
+    an option or a protocol ("a:b.mp4"); no shell is involved. A long match has
+    hundreds of rallies, so the clips go through ffmpeg CLIPS_PER_RUN at a time
+    (each run opens every clip as an input) and the parts are joined without
+    re-encoding."""
+    from .video import first_decodable_audio, probe
 
     if not shutil.which("ffmpeg"):
         raise RuntimeError("剪辑需要 ffmpeg（brew install ffmpeg）")
     if not clips:
         raise ValueError("没有可剪的回合")
+    video, out = Path(video).resolve(), Path(out).resolve()
     info = probe(video)
+    audio = first_decodable_audio(video) if info.has_audio else None
     with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
         labels: dict[int, Path] = {}
         if label:
             zh = has_cjk_font()
             for c in clips:
                 for n, length, _ in c.rallies:
-                    labels[n] = render_label(label_text(n, length, total_rallies, zh), Path(tmp) / f"{n}.png", info.height)
-        cmd = ffmpeg_command(video, out, clips, labels, info.has_audio, margin=round(info.height * 0.03), encoder=encoder)
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg 剪辑失败：{r.stderr.strip()[-800:]}")
+                    labels[n] = render_label(label_text(n, length, total_rallies, zh), tmp / f"{n}.png", info.height)
+        batches = [clips[i:i + CLIPS_PER_RUN] for i in range(0, len(clips), CLIPS_PER_RUN)]
+        parts = [out] if len(batches) == 1 else [tmp / f"part{k:04d}.mp4" for k in range(len(batches))]
+        for batch, part in zip(batches, parts):
+            used = {n: labels[n] for c in batch for n, _, _ in c.rallies if n in labels}
+            cmd = ffmpeg_command(video, part, batch, used, audio, margin=round(info.height * 0.03), encoder=encoder)
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg 剪辑失败：{r.stderr.strip()[-800:]}")
+        if len(parts) > 1:
+            lst = tmp / "parts.txt"
+            lst.write_text("".join(_concat_list_line(p) for p in parts))
+            r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-nostdin", "-f", "concat", "-safe", "0", "-i", str(lst),
+                                "-c", "copy", "-movflags", "+faststart", str(out)], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg 拼接失败：{r.stderr.strip()[-800:]}")
 
 
 def cut_match(video: Path, rallies: list[dict], out_dir: Path, pre_s: float = PRE_S, post_s: float = POST_S,

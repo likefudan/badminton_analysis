@@ -73,6 +73,12 @@ def _has_filter(name: str) -> bool:
 UNDECODABLE_AUDIO = {"apple_apac"}  # iPhone spatial audio; ffmpeg cannot decode it
 
 
+def first_decodable_audio(src) -> int | None:
+    """Index (among the audio streams) of the first one ffmpeg can decode, or None."""
+    m = _audio_map(src)
+    return int(m[1].split(":")[-1]) if m else None
+
+
 def _audio_map(src) -> list[str]:
     """-map for the first audio stream ffmpeg can decode (newer iPhones put spatial
     audio, apple_apac, first and plain AAC second); none if there is no such stream."""
