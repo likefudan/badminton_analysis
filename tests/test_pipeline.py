@@ -118,6 +118,6 @@ def test_cli_calibrate_with_points(clip, camera, tmp_path):
 
 def test_device_selection():
     assert resolve_device("cpu") == "cpu"
-    assert resolve_device("auto") in {"cpu", "cuda", "coreml"}
+    assert resolve_device("auto") in {"cpu", "cuda", "coreml", "coremlnative"}
     coreml = provider_config("coreml")
     assert coreml[0][0] == "CoreMLExecutionProvider" and coreml[-1] == "CPUExecutionProvider"

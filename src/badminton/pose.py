@@ -49,7 +49,10 @@ def available_providers() -> list[str]:
 
 
 def resolve_device(device: str) -> str:
-    """'auto' -> 'cuda' | 'coreml' | 'cpu' depending on what ONNX Runtime offers.
+    """'auto' -> 'cuda' | 'coremlnative' | 'coreml' | 'cpu' depending on what is installed.
+
+    'coremlnative' (native fp16 Core ML models, extra `[coreml]`) is preferred on
+    a Mac when coremltools and the converter are installed.
 
     Core ML can be tuned with 'coreml:<compute units>[:<model format>]', e.g.
     'coreml:CPUAndNeuralEngine' or 'coreml:CPUAndGPU:NeuralNetwork'.
@@ -60,7 +63,9 @@ def resolve_device(device: str) -> str:
     if "CUDAExecutionProvider" in providers:
         return "cuda"
     if "CoreMLExecutionProvider" in providers:
-        return "coreml"
+        from . import coreml_native
+
+        return "coremlnative" if coreml_native.can_convert() else "coreml"
     return "cpu"
 
 
@@ -155,8 +160,9 @@ class PoseEstimator:
         # chosen provider (and its options) right after.
         self.det = YOLOX(det_model or det_url, model_input_size=det_size, score_thr=det_score_thr, device="cpu")
         self.pose = RTMPose(pose_model or pose_url, model_input_size=pose_size, device="cpu")
+        native = self.device == "coremlnative"
         if cut_nms is None:
-            cut_nms = self.device == "coreml"
+            cut_nms = self.device.startswith("coreml")
         self.det_nms = "graph"
         if cut_nms:
             from .detector import NoNmsDetector, cut_before_nms
@@ -165,11 +171,19 @@ class PoseEstimator:
             if path is not None:
                 self.det = NoNmsDetector(self.det, path, None, det_score_thr)
                 self.det_nms = "numpy"
+            elif native:
+                raise RuntimeError("coremlnative 需要切掉 NMS 的检测模型，但切图失败")
+        if native:
+            from .coreml_native import NativeDetector, NativePose
+
+            self.det = NativeDetector(self.det.yolox, self.det.onnx_model, det_score_thr)
+            self.pose = NativePose(self.pose)
         self.providers = {}
         for name, tool in (("det", self.det), ("pose", self.pose)):
-            # rtmlib feeds the pose model one person at a time; pinning the
-            # dynamic batch dimension to 1 lets Core ML compile the whole graph.
-            tool.session = _make_session(tool.onnx_model, self.device, fixed_dims={"batch": 1})
+            if not native:
+                # rtmlib feeds the pose model one person at a time; pinning the
+                # dynamic batch dimension to 1 lets Core ML compile the whole graph.
+                tool.session = _make_session(tool.onnx_model, self.device, fixed_dims={"batch": 1})
             self.providers[name] = tool.session.get_providers()
         self.timing = Timing()
 

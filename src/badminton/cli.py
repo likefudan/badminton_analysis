@@ -199,7 +199,7 @@ def _model_inputs(est, video: str, frame_idx: int, calib) -> dict:
 def cmd_profile(a) -> int:
     from .court import CourtCalibration
     from .pose import PoseEstimator
-    from .profiling import bench_model, default_device_matrix, pipeline
+    from .profiling import bench_model, bench_native, default_device_matrix, pipeline
     from .video import probe
 
     calib = CourtCalibration.load(a.court) if a.court else None
@@ -235,6 +235,11 @@ def cmd_profile(a) -> int:
             part = str(r.partitions) if r.partitions is not None else "-"
             ms = f"{r.ms_per_run:8.2f}" if not r.error else "    失败"
             print(f"{label:<10}{dev:<42}{ms}{cov:>18}{part:>6}" + (f"  {r.error[:80]}" if r.error else ""))
+            report["models"].append({"model": label, **r.__dict__})
+        if hasattr(tool, "model"):  # native Core ML: time MLModel.predict on the same input
+            r = bench_native(tool.model, inputs[label], a.runs)
+            dev = f"coremlnative（{r.device}）"
+            print(f"{label:<10}{dev:<42}{r.ms_per_run:8.2f}{'整图':>18}{'1':>6}")
             report["models"].append({"model": label, **r.__dict__})
     if a.json:
         Path(a.json).write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str))

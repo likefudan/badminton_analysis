@@ -20,6 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Native fp16 Core ML models on a Mac (device "coremlnative"). torch and
+# onnx2torch are only needed once, to convert the ONNX models.
+coreml = ["coremltools>=8", "torch>=2.2", "onnx2torch>=1.5"]
 
 [project.scripts]
 badminton = "badminton.cli:main"

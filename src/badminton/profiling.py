@@ -138,6 +138,23 @@ def bench_model(path: str, device: str, runs: int = 100, fixed_batch: bool = Tru
     )
 
 
+def bench_native(model, x: np.ndarray, runs: int = 100) -> ModelBench:
+    """Time a native Core ML model (coremltools MLModel). A pose model converted
+    with a fixed batch gets `x` repeated up to that batch, as in real use."""
+    spec_shape = model.get_spec().description.input[0].type.multiArrayType.shape
+    if spec_shape and spec_shape[0] > len(x):
+        x = np.repeat(x, int(spec_shape[0]) // len(x), axis=0)
+    feed = {"input": np.ascontiguousarray(x, dtype=np.float32)}
+    for _ in range(5):
+        model.predict(feed)
+    t = time.perf_counter()
+    for _ in range(runs):
+        model.predict(feed)
+    ms = 1000 * (time.perf_counter() - t) / runs
+    units = str(getattr(model, "compute_unit", "")).split(".")[-1]
+    return ModelBench("coreml", f"{units}, batch {len(x)}", 0.0, ms, ["CoreML native"])
+
+
 def default_device_matrix() -> list[str]:
     from .pose import available_providers
 
