@@ -28,7 +28,7 @@
 | 1. 骨架视频 | 叠加了骨架和球场线的比赛视频，可以慢放看动作 | 完成，已在 Mac（M5）上用转播视频实测 |
 | 2. 跑动卡片 | 每人的跑动距离、最高速度、热力图 | 完成，已用转播单打实测 |
 | 3. 双打站位报告 + 一键处理 | 前后站 / 左右站比例、轮转、搭档间距、空当；拖进视频就出结果 | 代码完成，用合成双打数据测过；等真实双打录像 |
-| 4. AI 赛后点评 | 文字点评和练习建议，可以和以前比较、可以追问 | 未开始 |
+| 4. AI 赛后点评 | 文字点评和练习建议，可以和以前比较、可以追问 | 代码完成；用第一段球友录像（单打）生成了摘要和提示词，还没有用 API 实际跑过 |
 | 5. 自动剪掉死球时间 | 只保留回合的精简视频和「最长回合」集锦 | 未开始 |
 | 6. 每一拍的统计 | 拍数、谁打的、击球点和落点、回位时间 | 未开始 |
 | 7. 击球类型 | 杀、吊、高远、挑、网前、平抽的次数，剪出「我的全部杀球」 | 未开始 |
@@ -335,6 +335,62 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 
 目前只有合成的双打数据测过（测试里有一段脚本：先前后站位、中途前后换位，再左右站位、中途左右换位）。真实的双打录像到了以后，再检查阈值是否合适。
 
+## 第 4 步：AI 赛后点评
+
+把前面算出的统计交给通用大模型，写成球友看得懂的点评。大模型只读数字，不看视频和图片。
+
+```bash
+# 默认不联网：只写出 match.review.summary.json（摘要）和 match.review.prompt.txt（完整提示词）
+badminton review match.movement.json
+#   双打可以再加上站位报告：badminton review match.movement.json match.positioning.json
+
+# 把提示词贴进任意聊天模型，回答存成文本文件，再导入：生成 match.review.md 和 match.review.html（并排嵌入跑动卡片）
+badminton review match.movement.json --response 回答.md
+
+# 或者通过 Anthropic API 直接出点评：必须加 --api，光设置了 key 不会调用
+pip install -e ".[review]"
+export ANTHROPIC_API_KEY=...
+badminton review match.movement.json --api
+
+# 追问（沿用同一份数据和已有的点评），回答追加到 match.review.qa.md；不加 --api 就只写 match.review.ask.prompt.txt
+badminton review match.movement.json --ask "我下次最该先练哪一项？" --api
+
+# 和上一次比较：给上一次的摘要
+badminton review match.movement.json --previous last_week.review.summary.json
+```
+
+**发送了什么。** 只有加了 `--api`（并且设置了 `ANTHROPIC_API_KEY`）才会联网，发送的内容就是 `match.review.prompt.txt`（追问时是 `match.review.ask.prompt.txt`）里的文字，发送前会打印出文件名和字数，可以先打开看。里面有：
+
+- 程序算出的数字：时长、回合起止时间、跑动距离、速度、冲刺、站位比例、误差估计、羽毛球检测比例；
+- 球员的名字（`--names` / `label` 里起的名字，不想发真名就起个代号）和输入文件名（例如 `match`）；
+- `--previous` 给的上一次摘要、`--ask` 的问题、追问时之前的点评；
+- 再加上固定的说明和写作要求。
+
+不发送视频、画面、图片、骨架数据、文件夹路径（附加的 JSON 里的路径只保留文件名）。跑动卡片图片只嵌进本地的 HTML 报告。
+
+导入的回答（`--response` 或 API 返回的文字）在 HTML 里全部按纯文本转义，只认标题、列表、引用、粗体和代码这几种 Markdown 格式，回答里的 HTML 或脚本不会被执行。
+
+几个常用参数：
+
+- `--court match.court.json`：算出相机高度和每人平均站位处的位置误差，写进「数据质量」。
+- `--shuttle match.shuttle.csv --video match.mp4`：每个回合里羽毛球被检测到的比例（视频只用来读帧率，也可以直接给 `--fps`）。
+- `--shuttle-accuracy 73`：人工核对过的羽毛球位置正确率，程序算不出来，只能手动给。
+- `--model`：和 `--api` 一起用，默认 `claude-sonnet-5-5`。
+
+摘要里有什么（都是程序算的，结果固定，同样的输入每次一样）：
+
+- **比赛**：视频时长、回合内时间和比例、回合数、回合平均和中位长度、最长回合。
+- **球员**：跑动距离、每分钟跑动、平均和最高速度、冲刺次数和每分钟冲刺、前中后场和左右比例、腾空帧数、回合内被跟踪到的时间比例、位置误差。热力图的原始格子不放进去。
+- **回合**：每个回合一行，编号、起止时间、长度、之前停了多久、每人的距离和速度、球被检测到的比例。
+- **对比**：每项指标谁高、高多少。
+- **数据质量**：按数字自动生成，例如某人被跟踪到的时间不到 90%、远端前后误差多少米、相机低于 2.5 米、回合不足 10 个、羽毛球轨迹分不出回合和死球。
+
+提示词要求模型按固定的五节写：比赛概况、球员跑动画像、三条观察（带数字，引用回合编号和时间）、三个练习建议（带理由）、数据不确定的地方；并且不许写数据里没有的击球、比分和胜负。
+
+用第一段球友录像试过（单打，159 秒，7 个回合）。程序算出：相机高度约 1.43 米；近端位置误差前后 0.09 米，远端 0.57 米；远端球员回合内只有 85% 的时间被跟踪到。这台机器没有 API key，所以只生成了摘要和提示词，另外按提示词手写了点评再用 `--response` 导入（第二段录像 jay_cdl 也是这样做的），还没有用 API 实际跑过。
+
+已知的不足：摘要目前只有跑动和站位，没有每一拍的数据，所以点评说不了技术动作和战术细节；第 6、7 步完成后摘要会加上拍数和击球类型。
+
 ## 代码结构
 
 | 文件 | 内容 |
@@ -363,6 +419,7 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 | `src/badminton/annotate_export.py` | 把标注导出成 TrackNetV3 的训练目录 |
 | `scripts/check_tracknet_dataset.py` | 用 TrackNetV3 自己的 Dataset 类检查导出的目录（在它的虚拟环境里运行） |
 | `scripts/tracknet_finetune.py` | 从发布的权重开始微调：准备好之后原样运行 TrackNetV3 的 `train.py` |
+| `src/badminton/review.py` | 第 4 步：统计摘要、数据质量说明、提示词、Anthropic API 调用、Markdown / HTML 报告 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。
