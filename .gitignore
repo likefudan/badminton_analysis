@@ -16,3 +16,7 @@ dist/
 data/
 outputs/
 .DS_Store
+*.players.json
+*.players.png
+*.movement.json
+*.movement.*.png
