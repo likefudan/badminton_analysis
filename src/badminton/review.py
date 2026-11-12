@@ -9,8 +9,9 @@ Three layers, each usable on its own:
   build_summary()  analysis JSON(s) -> summary dict (deterministic, saved as JSON)
   summary_text()   summary dict -> the text block that goes into the prompt
   build_prompt()   system + user prompt (Chinese output, fixed sections)
-The backend is the Anthropic API when ANTHROPIC_API_KEY is set; otherwise the
-prompt is written to a file to paste into any chat model.
+The prompt is always written to a file to paste into any chat model; the
+Anthropic API is called only when the user asks for it (`badminton review --api`)
+and ANTHROPIC_API_KEY is set. Only the prompt text is sent.
 """
 
 from __future__ import annotations
@@ -62,6 +63,8 @@ def compact(obj, max_list: int = 40):
         return [compact(v, max_list) for v in obj]
     if isinstance(obj, float):
         return round(obj, 2)
+    if isinstance(obj, str) and re.match(r"^(/|~|\.{1,2}/|[A-Za-z]:[\\/])", obj):
+        return re.split(r"[\\/]", obj)[-1]  # file paths: the name only, not the folders
     return obj
 
 
@@ -188,8 +191,11 @@ def build_summary(movement: dict, *, source: str = "", extras: dict | None = Non
         try:
             from .camera import camera_from_calibration
 
-            camera = {"height_m": round(float(camera_from_calibration(calib).center[2]), 2),
-                      "reprojection_error_px": round(float(calib.reprojection_error_px), 1)}
+            camera = {"height_m": round(float(camera_from_calibration(calib).center[2]), 2)}
+            # an automatic calibration (or exactly four clicked points) fits its markers
+            # exactly: an error of 0 there measures nothing, so it is left out
+            if calib.reprojection_error_px >= 0.05:
+                camera["reprojection_error_px"] = round(float(calib.reprojection_error_px), 1)
         except Exception:  # degenerate calibration: no camera numbers, the rest still works
             camera = None
 
@@ -315,7 +321,10 @@ def summary_text(s: dict) -> str:
                  "前/中/后场 = 自己半场从球网到底线三等分；左/右按球员面向球网的方向。时间是视频里的秒数。"
                  "回合里每人的速度 = 该回合的距离 ÷ 回合长度，跟踪丢失时偏低。")
     if s.get("camera"):
-        lines.append(f"【相机】高度约 {s['camera']['height_m']:g} 米；球场标定重投影误差 {s['camera']['reprojection_error_px']:g} 像素")
+        t = f"【相机】高度约 {s['camera']['height_m']:g} 米"
+        if "reprojection_error_px" in s["camera"]:
+            t += f"；球场标定重投影误差 {s['camera']['reprojection_error_px']:g} 像素"
+        lines.append(t)
     lines.append("【球员】")
     for p in s["players"]:
         z = p["zones_pct"]

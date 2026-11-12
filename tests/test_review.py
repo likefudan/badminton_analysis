@@ -228,7 +228,7 @@ def test_cli_without_key_writes_prompt_file(tmp_path, monkeypatch, capsys):
     assert summary["schema"] == 1 and "heatmap" not in json.dumps(summary)
     assert not (tmp_path / "match.review.md").exists()
     out = capsys.readouterr().out
-    assert "没有设置 ANTHROPIC_API_KEY" in out and "--response" in out
+    assert "没有联网" in out and "--response" in out and "--api" in out
 
 
 def fake_anthropic(monkeypatch, client):
@@ -241,7 +241,7 @@ def test_cli_with_key_calls_backend_and_writes_reports(tmp_path, monkeypatch, ca
     client = FakeClient(text=body)
     fake_anthropic(monkeypatch, client)
     p = write_inputs(tmp_path)
-    assert main(["review", str(p), "--model", "claude-haiku-5-5"]) == 0
+    assert main(["review", str(p), "--model", "claude-haiku-5-5", "--api"]) == 0
     assert client.calls[0]["model"] == "claude-haiku-5-5"
     md = (tmp_path / "match.review.md").read_text()
     assert "由 claude-haiku-5-5 通过 Anthropic API 生成" in md and "## 三条观察" in md
@@ -251,7 +251,7 @@ def test_cli_with_key_calls_backend_and_writes_reports(tmp_path, monkeypatch, ca
     assert "缺少这些小节" not in capsys.readouterr().out
 
     # follow-up: same context, earlier report as the assistant turn
-    assert main(["review", str(p), "--ask", "下次先练什么？"]) == 0
+    assert main(["review", str(p), "--ask", "下次先练什么？", "--api"]) == 0
     msgs = client.calls[1]["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"] and "下次先练什么？" in msgs[2]["content"]
     assert msgs[0]["content"] == client.calls[0]["messages"][0]["content"]
@@ -288,3 +288,57 @@ def test_markdown_to_html_escapes():
     page = rv.markdown_to_html("# 标题\n\n- a <b>\n- b\n\n> 引用\n\n正文")
     assert "<h1>标题</h1>" in page and "<li>a &lt;b&gt;</li>" in page and "<blockquote>引用</blockquote>" in page
     assert page.count("<ul>") == 1 and "<p>正文</p>" in page
+
+
+def test_key_alone_does_not_call_the_api(tmp_path, monkeypatch, capsys):
+    client = FakeClient(text="## 比赛概况\n好")
+    fake_anthropic(monkeypatch, client)
+    p = write_inputs(tmp_path)
+    assert main(["review", str(p)]) == 0
+    assert main(["review", str(p), "--ask", "谁更累？"]) == 0
+    assert client.calls == [] and not (tmp_path / "match.review.md").exists()
+    assert "已设置" in capsys.readouterr().out
+
+
+def test_api_without_key_is_an_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    p = write_inputs(tmp_path)
+    assert main(["review", str(p), "--api"]) == 1
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
+
+
+def test_review_help_works(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["review", "--help"])
+    assert e.value.code == 0 and "--shuttle-accuracy" in capsys.readouterr().out
+
+
+def test_imported_answer_cannot_inject_html(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    p = write_inputs(tmp_path)
+    reply = tmp_path / "reply.md"
+    reply.write_text("## 比赛概况\n<script>alert(1)</script> **<img src=x onerror=alert(1)>**\n"
+                     "- `<iframe>`\n> <b>x</b>\n### <svg onload=alert(1)>")
+    assert main(["review", str(p), "--response", str(reply)]) == 0
+    page = (tmp_path / "match.review.html").read_text()
+    body = page.split("<body>", 1)[1]
+    for bad in ("<script", "<img src=x", "<iframe", "<b>", "<svg"):
+        assert bad not in body
+    assert "&lt;script&gt;" in body
+
+
+def test_compact_keeps_file_names_not_folders():
+    out = rv.compact({"video": "/Users/someone/clips/match.mp4", "court": "C:\\x\\m.court.json",
+                      "rel": "../data/a.json", "ratio": "1/2", "label": "前/后"})
+    assert out == {"video": "match.mp4", "court": "m.court.json", "rel": "a.json", "ratio": "1/2", "label": "前/后"}
+
+
+def test_exact_calibration_has_no_reprojection_claim(camera):
+    calib = calibration(camera)  # markers projected exactly, as an automatic calibration saves them
+    assert calib.reprojection_error_px < 0.05
+    s = rv.build_summary(movement_json(), calib=calib)
+    assert "reprojection_error_px" not in s["camera"] and "重投影" not in rv.summary_text(s)
+    noisy = CourtCalibration({n: (x + (3 if i % 2 else -3), y) for i, (n, (x, y)) in enumerate(calib.image_points.items())},
+                             calib.frame_size)
+    s = rv.build_summary(movement_json(), calib=noisy)
+    assert s["camera"]["reprojection_error_px"] > 0 and "重投影" in rv.summary_text(s)

@@ -156,9 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--video", help="分析用的视频，只用来读帧率")
     s.add_argument("--fps", type=float, help="羽毛球 CSV 的帧率")
     s.add_argument("--shuttle-offset", type=float, default=0.0, help="羽毛球 CSV 第 0 帧在统计时间轴上的秒数")
-    s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%），写进数据质量说明")
+    s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%%），写进数据质量说明")
     s.add_argument("--response", help="把聊天模型的回答（文本文件）导入，生成 Markdown 和 HTML 报告")
-    s.add_argument("--prompt-only", action="store_true", help="有 API key 也不调用，只写提示词文件")
+    s.add_argument("--api", action="store_true",
+                   help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和第一个输入同目录")
 
     a = p.parse_args(argv)
@@ -862,14 +863,18 @@ def cmd_review(a) -> int:
     out = lambda suffix: out_dir / f"{stem}.review.{suffix}"  # noqa: E731
     out("summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1))
     model = a.model or rv.DEFAULT_MODEL
-    use_api = rv.have_api_key() and not a.prompt_only
+    # the API is only called when asked for (--api): a key in the environment alone is not consent
+    use_api = bool(a.api) and not a.response
+    if use_api and not rv.have_api_key():
+        print("--api 需要先设置 ANTHROPIC_API_KEY（并安装 pip install -e \".[review]\"）")
+        return 1
 
     def paste_instructions(prompt_path: Path, then: str) -> None:
         print(f"提示词已写入 {prompt_path}（只有数字和文字，不含视频和图片）")
-        if not use_api and not a.prompt_only:
-            print("没有设置 ANTHROPIC_API_KEY，所以没有调用模型。两种办法：")
-            print('  1. export ANTHROPIC_API_KEY=...（并安装 pip install -e ".[review]"），再运行一次；')
-            print(f"  2. 把这个文件的全部内容贴进任意聊天模型，{then}")
+        print("没有调用任何模型，也没有联网。两种办法：")
+        print("  1. 加 --api 通过 Anthropic API 直接生成（需要 ANTHROPIC_API_KEY，" +
+              ("已设置" if rv.have_api_key() else "现在没有设置") + "；只发送这个文件里的文字）；")
+        print(f"  2. 把这个文件的全部内容贴进任意聊天模型，{then}")
 
     if a.ask:
         report_path = out("md")
@@ -880,6 +885,7 @@ def cmd_review(a) -> int:
         if not use_api:
             paste_instructions(prompt_path, "直接看它的回答。")
             return 0
+        print(f"把 {prompt_path} 里的文字（{len(rv.prompt_file_text(system, messages))} 字）发送给 {model} ……")
         try:
             answer = rv.call_anthropic(system, messages, model)
         except rv.ReviewError as e:
@@ -897,6 +903,7 @@ def cmd_review(a) -> int:
     if a.response:
         body, origin = Path(a.response).read_text(), f"点评文字从 {Path(a.response).name} 导入（聊天模型按提示词文件生成）"
     elif use_api:
+        print(f"把 {prompt_path} 里的文字（{len(prompt_path.read_text())} 字）发送给 {model} ……")
         try:
             body = rv.call_anthropic(system, messages, model)
         except rv.ReviewError as e:

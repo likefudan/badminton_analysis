@@ -340,30 +340,42 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 把前面算出的统计交给通用大模型，写成球友看得懂的点评。大模型只读数字，不看视频和图片。
 
 ```bash
-# 可选：通过 Anthropic API 直接出点评
-pip install -e ".[review]"
-export ANTHROPIC_API_KEY=...
-
+# 默认不联网：只写出 match.review.summary.json（摘要）和 match.review.prompt.txt（完整提示词）
 badminton review match.movement.json
 #   双打可以再加上站位报告：badminton review match.movement.json match.positioning.json
-#   生成 match.review.md（同时打印出来）、match.review.html（并排嵌入跑动卡片）、
-#   match.review.summary.json（给模型看的摘要）和 match.review.prompt.txt（完整提示词）
 
-# 追问（沿用同一份数据和已有的点评），回答追加到 match.review.qa.md
-badminton review match.movement.json --ask "我下次最该先练哪一项？"
+# 把提示词贴进任意聊天模型，回答存成文本文件，再导入：生成 match.review.md 和 match.review.html（并排嵌入跑动卡片）
+badminton review match.movement.json --response 回答.md
+
+# 或者通过 Anthropic API 直接出点评：必须加 --api，光设置了 key 不会调用
+pip install -e ".[review]"
+export ANTHROPIC_API_KEY=...
+badminton review match.movement.json --api
+
+# 追问（沿用同一份数据和已有的点评），回答追加到 match.review.qa.md；不加 --api 就只写 match.review.ask.prompt.txt
+badminton review match.movement.json --ask "我下次最该先练哪一项？" --api
 
 # 和上一次比较：给上一次的摘要
 badminton review match.movement.json --previous last_week.review.summary.json
 ```
 
-没有设置 `ANTHROPIC_API_KEY` 时不调用任何模型，只写出 `match.review.prompt.txt`：把它的全部内容贴进任意聊天模型，把回答存成文本文件，再用 `--response 回答.md` 导入，同样生成 Markdown 和 HTML 报告。
+**发送了什么。** 只有加了 `--api`（并且设置了 `ANTHROPIC_API_KEY`）才会联网，发送的内容就是 `match.review.prompt.txt`（追问时是 `match.review.ask.prompt.txt`）里的文字，发送前会打印出文件名和字数，可以先打开看。里面有：
+
+- 程序算出的数字：时长、回合起止时间、跑动距离、速度、冲刺、站位比例、误差估计、羽毛球检测比例；
+- 球员的名字（`--names` / `label` 里起的名字，不想发真名就起个代号）和输入文件名（例如 `match`）；
+- `--previous` 给的上一次摘要、`--ask` 的问题、追问时之前的点评；
+- 再加上固定的说明和写作要求。
+
+不发送视频、画面、图片、骨架数据、文件夹路径（附加的 JSON 里的路径只保留文件名）。跑动卡片图片只嵌进本地的 HTML 报告。
+
+导入的回答（`--response` 或 API 返回的文字）在 HTML 里全部按纯文本转义，只认标题、列表、引用、粗体和代码这几种 Markdown 格式，回答里的 HTML 或脚本不会被执行。
 
 几个常用参数：
 
 - `--court match.court.json`：算出相机高度和每人平均站位处的位置误差，写进「数据质量」。
 - `--shuttle match.shuttle.csv --video match.mp4`：每个回合里羽毛球被检测到的比例（视频只用来读帧率，也可以直接给 `--fps`）。
 - `--shuttle-accuracy 73`：人工核对过的羽毛球位置正确率，程序算不出来，只能手动给。
-- `--model`：默认 `claude-sonnet-5-5`。`--prompt-only`：有 key 也不调用，只写提示词。
+- `--model`：和 `--api` 一起用，默认 `claude-sonnet-5-5`。
 
 摘要里有什么（都是程序算的，结果固定，同样的输入每次一样）：
 
@@ -375,7 +387,7 @@ badminton review match.movement.json --previous last_week.review.summary.json
 
 提示词要求模型按固定的五节写：比赛概况、球员跑动画像、三条观察（带数字，引用回合编号和时间）、三个练习建议（带理由）、数据不确定的地方；并且不许写数据里没有的击球、比分和胜负。
 
-用第一段球友录像试过（单打，159 秒，7 个回合）。程序算出：相机高度约 1.43 米；近端位置误差前后 0.09 米，远端 0.57 米；远端球员回合内只有 85% 的时间被跟踪到。这台机器没有 API key，所以只生成了摘要和提示词，另外按提示词手写了一份示例点评来看格式，还没有用 API 实际跑过。
+用第一段球友录像试过（单打，159 秒，7 个回合）。程序算出：相机高度约 1.43 米；近端位置误差前后 0.09 米，远端 0.57 米；远端球员回合内只有 85% 的时间被跟踪到。这台机器没有 API key，所以只生成了摘要和提示词，另外按提示词手写了点评再用 `--response` 导入（第二段录像 jay_cdl 也是这样做的），还没有用 API 实际跑过。
 
 已知的不足：摘要目前只有跑动和站位，没有每一拍的数据，所以点评说不了技术动作和战术细节；第 6、7 步完成后摘要会加上拍数和击球类型。
 
