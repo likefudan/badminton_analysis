@@ -29,7 +29,7 @@
 | 2. 跑动卡片 | 每人的跑动距离、最高速度、热力图 | 完成，已用转播单打实测 |
 | 3. 双打站位报告 + 一键处理 | 前后站 / 左右站比例、轮转、搭档间距、空当；拖进视频就出结果 | 代码完成，用合成双打数据测过；等真实双打录像 |
 | 4. AI 赛后点评 | 文字点评和练习建议，可以和以前比较、可以追问 | 代码完成；用第一段球友录像（单打）生成了摘要和提示词，还没有用 API 实际跑过 |
-| 5. 自动剪掉死球时间 | 只保留回合的精简视频和「最长回合」集锦 | 未开始 |
+| 5. 自动剪掉死球时间 | 只保留回合的精简视频和「最长回合」集锦 | 完成；用第二段球友录像（7 个回合）实测 |
 | 6. 每一拍的统计 | 拍数、谁打的、击球点和落点、回位时间 | 未开始 |
 | 7. 击球类型 | 杀、吊、高远、挑、网前、平抽的次数，剪出「我的全部杀球」 | 未开始 |
 | 8. 第二机位 | 远端半场更准，击球瞬间的 3D 动作 | 未开始 |
@@ -393,6 +393,24 @@ badminton review match.movement.json --previous last_week.review.summary.json
 
 已知的不足：摘要目前只有跑动和站位，没有每一拍的数据，所以点评说不了技术动作和战术细节；第 6、7 步完成后摘要会加上拍数和击球类型。
 
+## 剪掉死球时间
+
+```bash
+badminton cut match.mp4 -o match_analysis/
+#   match.rallies.mp4   只有回合的精简视频
+#   match.longest.mp4   最长的 3 个回合（--top 改数量，--top 0 不出）
+```
+
+用的是跑动卡片那一步切出的回合（`match.movement.json`），`badminton analyze` 跑完会自动剪（`--no-cut` 关掉）。需要 ffmpeg。
+
+- 回合切分是靠球员跑动判断的，发球那一两秒大家还没动，所以开头会晚 1–2 秒。剪的时候每个回合往前多留 2 秒、往后多留 1 秒（`--pre`、`--post`）。
+- 留白之后相隔不到 1 秒的两段直接连起来（`--merge-gap`），不会重复也不会跳一下。所以回合之间本来只隔 3 秒左右的录像，剪完变化不大。
+- 画面左上角标「回合 3/7 · 36 秒」，`--no-label` 关掉。秒数是切分出来的回合长度，不含留白。
+- 重新编码，切点精确到帧，保留原声。Mac 上加 `--encoder h264_videotoolbox` 更快。
+- 回合时间是按 movement 用的那段视频算的：剪的视频要和它时间轴相同（例如 SDR 版、防抖版、骨架视频都可以，只截了一段再分析的就不行），文件名不同时用 `--rallies` 指定。
+- iPhone 的 HDR 原片可以直接剪，但颜色会发灰，最好剪 `badminton sdr` 转好的版本；空间音频轨（apple_apac）会自动跳过，用普通的那条音轨。
+- 回合很多的长视频分批剪（每批 12 段）再无损拼接，不会一次打开几百个输入。
+
 ## 代码结构
 
 | 文件 | 内容 |
@@ -422,6 +440,7 @@ badminton review match.movement.json --previous last_week.review.summary.json
 | `scripts/check_tracknet_dataset.py` | 用 TrackNetV3 自己的 Dataset 类检查导出的目录（在它的虚拟环境里运行） |
 | `scripts/tracknet_finetune.py` | 从发布的权重开始微调：准备好之后原样运行 TrackNetV3 的 `train.py` |
 | `src/badminton/review.py` | 第 4 步：统计摘要、数据质量说明、提示词、Anthropic API 调用、Markdown / HTML 报告 |
+| `src/badminton/cut.py` | 剪掉死球时间：精简视频和最长回合集锦 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。

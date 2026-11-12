@@ -111,6 +111,17 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--duration", type=float)
     s.add_argument("--floor-from", type=float, help="只用画面这个高度比例以下的特征点（地面），例如 0.45")
 
+    s = sub.add_parser("cut", help="剪掉死球时间：输出只有回合的精简视频和最长回合集锦")
+    s.add_argument("video")
+    s.add_argument("--rallies", help="movement 生成的 .movement.json，默认 <视频名>.movement.json（先在输出目录找，再在视频旁边找）")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+    s.add_argument("--pre", type=float, default=2.0, help="每个回合开头往前多留几秒（回合切分的开头会晚 1–2 秒）")
+    s.add_argument("--post", type=float, default=1.0, help="每个回合结尾多留几秒")
+    s.add_argument("--merge-gap", type=float, default=1.0, help="留白后相隔不到这么多秒的两段直接连起来")
+    s.add_argument("--top", type=int, default=3, help="集锦取最长的几个回合；0 表示不出集锦")
+    s.add_argument("--no-label", action="store_true", help="不在画面左上角标「回合 3/7 · 36 秒」")
+    s.add_argument("--encoder", default="libx264", help="ffmpeg 编码器，Mac 上可用 h264_videotoolbox（更快）")
+
     s = sub.add_parser("analyze", help="一键处理：标定（已有就沿用）→ 骨架 → 跑动卡片 → 双打站位报告")
     s.add_argument("video")
     s.add_argument("--court", help="court.json，默认 <视频名>.court.json；没有就先打开窗口点标记点")
@@ -122,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--stride", type=int, default=2)
     s.add_argument("--duration", type=float, help="只处理前多少秒（试跑）")
     s.add_argument("--cuts")
+    s.add_argument("--no-cut", action="store_true", help="不剪精简视频和最长回合集锦")
     _model_args(s)
 
     s = sub.add_parser("annotate", help="标注羽毛球位置（浏览器里逐帧确认或点击），为微调 TrackNetV3 准备数据")
@@ -168,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze,
-            "review": cmd_review}[a.cmd](a)
+            "review": cmd_review, "cut": cmd_cut}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -644,6 +656,14 @@ def cmd_analyze(a) -> int:
     print("== 4/4 跑动卡片和站位报告 ==")
     if main(["movement", *common, "-o", str(out_dir)]) != 0:
         return 1
+    if not a.no_cut:
+        import shutil
+
+        if shutil.which("ffmpeg"):
+            print("== 剪掉死球时间 ==")
+            main(["cut", str(video), "-o", str(out_dir)])  # a failed cut does not fail the analysis
+        else:
+            print("没有装 ffmpeg，跳过精简视频和集锦（brew install ffmpeg 之后运行 badminton cut）")
     report = {"video": str(video), "court": str(court)}
     for key, name in (("movement", "movement"), ("positioning", "positioning")):
         f = out_dir / f"{video.stem}.{name}.json"
@@ -654,6 +674,38 @@ def cmd_analyze(a) -> int:
     print(f"\n全部结果在 {out_dir}/；汇总给 AI 点评用的数据：{out}")
     if not players.exists():
         print(f'看 {players.with_suffix(".png")} 里的编号，用 --names "1=...,2=..." 再运行一次就能带上名字（骨架不会重跑）')
+    return 0
+
+
+def cmd_cut(a) -> int:
+    from .cut import cut_match
+
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    candidates = [Path(a.rallies)] if a.rallies else [d / f"{video.stem}.movement.json" for d in (out_dir, video.parent)]
+    src = next((c for c in candidates if c.exists()), None)
+    if src is None:
+        print(f"找不到回合切分结果 {candidates[0]}：先运行 badminton movement {video} --court ...")
+        return 1
+    rallies = json.loads(src.read_text()).get("rallies", [])
+    if not rallies:
+        print(f"{src} 里没有切出回合，没有可剪的内容")
+        return 1
+    from .video import probe
+
+    if probe(video).is_hdr:
+        print("注意：这是 HDR 视频，直接剪出来颜色会发灰；建议先 badminton sdr 转成 SDR，再剪转好的那个（时间轴不变）")
+    try:
+        res = cut_match(video, rallies, out_dir, a.pre, a.post, a.merge_gap, a.top, not a.no_label, a.encoder)
+    except RuntimeError as e:
+        print(e)
+        return 1
+    r = res["rallies"]
+    saved = f"，原视频 {r['source_s']:.0f} 秒，剪掉 {r['source_s'] - r['duration_s']:.0f} 秒" if r["source_s"] else ""
+    print(f"精简视频：{len(rallies)} 个回合，{r['duration_s']:.0f} 秒{saved} -> {r['path']}")
+    if "longest" in res:
+        g = res["longest"]
+        print(f"最长回合集锦：回合 {'、'.join(str(n) for n in g['numbers'])}，{g['duration_s']:.0f} 秒 -> {g['path']}")
     return 0
 
 
