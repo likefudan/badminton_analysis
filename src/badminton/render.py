@@ -72,3 +72,27 @@ def draw_text(frame: np.ndarray, text: str, org=(12, 28)) -> None:
 
 def _pt(p) -> tuple[int, int]:
     return int(round(p[0])), int(round(p[1]))
+
+
+def draw_shuttle_video(video, rows, out_path, tail: int = 12) -> None:
+    """Copy of the video with the shuttle's recent trajectory drawn on it."""
+    from .video import VideoWriter, probe, read_frames
+
+    info = probe(video)
+    by_frame = {r[0]: r for r in rows}
+    hist: list = []
+    w = VideoWriter(out_path, info.width, info.height, info.fps or 30,
+                    audio_from=video if info.has_audio else None)
+    try:
+        for i, frame in read_frames(video, 0, len(rows)):
+            _, v, x, y = by_frame.get(i, (i, 0, 0, 0))
+            hist.append((x, y) if v else None)
+            pts = hist[-tail:]
+            for k in range(1, len(pts)):
+                if pts[k] and pts[k - 1]:
+                    cv2.line(frame, pts[k - 1], pts[k], (0, 255, 255), 2, cv2.LINE_AA)
+            if pts and pts[-1]:
+                cv2.circle(frame, pts[-1], 9, (0, 0, 255), 2, cv2.LINE_AA)
+            w.write(frame)
+    finally:
+        w.close()
