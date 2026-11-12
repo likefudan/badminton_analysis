@@ -226,6 +226,49 @@ badminton movement IMG_8923_stab.mp4 --court IMG_8923_stab.court.json --data ...
 - **羽毛球选点**（加 `--court` 时启用）：整段视频里经常出现候选点的位置（墙上的灯、地上的球、固定假点）直接排除；再从每帧所有候选点里挑一条最连贯的轨迹，不再逐帧选「面积最大的那块」。用户视频后半段：来回折返从 156 处降到 13 处，抽查正确率从约 48% 提到约 73%。
 - **三维相机**：从球场标定推出焦距和手机位置（`camera.py`），把网画回画面检查。机位高的时候还能把「本场地上方的空间」以外的候选点去掉；机位太低时这块空间覆盖整个画面，起不到作用。
 
+## 标注羽毛球位置，准备微调 TrackNetV3
+
+手机拍的视频上，TrackNetV3 发布的模型只有五到七成的帧是对的，要用自己的录像微调。`badminton annotate` 是为此做的标注工具：在浏览器里一帧一帧地看，模型的预测已经画在画面上，对的按空格确认，不对的点一下球的位置。三步：
+
+```bash
+# 1. 打开标注页面（http://localhost:8765，只在本机能访问）。第一次会先跑一遍 TrackNetV3 并缓存预测
+badminton annotate match.mp4 --rallies match.movement.json
+#   标注每一步都自动保存到 match.labels.csv（TrackNetV3 的格式：Frame, Visibility, X, Y，另加一列 Status）
+#   和 match.labels.json（谁、什么时候标的、工具版本）；标完按 Ctrl+C
+
+# 2. 导出成 TrackNetV3 训练用的目录（帧、csv、背景图，按回合分 train/val）
+badminton annotate-export match.mp4 -o data/tracknet_finetune
+
+# 3. 微调、再转成 Core ML：见 docs/tracknet_finetune.md
+```
+
+标注页面的按键：
+
+| 操作 | 含义 |
+| --- | --- |
+| 点击 | 球在这里 |
+| 空格 / V | 接受模型的预测 |
+| N | 这一帧没有球 |
+| O | 被挡住或拿不准（这一帧不用于训练） |
+| 1–5 | 选画面上编了号的候选点 |
+| ← → / J K | 上一帧、下一帧（加 Shift 跳 10 帧）；下方的时间条和滑块可以直接跳 |
+| U | 跳到本回合下一个模型没把握、还没看过的帧 |
+| [ ] | 上一个、下一个回合 |
+| Shift+A | 本回合里模型有把握、还没看过的帧一次全部接受 |
+| ⌫ | 删掉这一帧的标注；Z 开关放大镜 |
+
+每标一帧自动跳到下一帧，鼠标旁边有放大镜。画面上黄圈是这一帧的预测，前后几帧的预测画得淡（蓝色是之前、红色是之后），白色虚线圈是其他候选点，粉色虚线圈是 TrackNetV3 原版逐帧选的点（和黄圈不一致时才画）。
+
+TrackNetV3 用连续 8 帧做一个训练样本，所以要整个回合连着标，不能东一帧西一帧。工具做的是排顺序：按「模型有多没把握」给每一帧打分（原版选点和按轨迹选的点不一致、热力图分数低、同一帧有多个候选点、和前后帧相比跳得很远），回合按平均分从高到低排，最没把握的回合先标；回合内按 U 可以先看最可疑的帧。右侧显示已标帧数和估计还要多少分钟。
+
+- `--rallies` 是 `badminton movement` 生成的 `.movement.json`（和视频同名时自动找到）；没有就按球出现的时段切。
+- `--prefill N`：把最没把握的 N 个回合先填上模型的预测，状态是「机器预标注」，表示没人看过；导出时默认不包含，确认过才算。
+- 已经有 `badminton shuttle` 的结果、不想重跑：`--shuttle match.shuttle.csv --raw match.shuttle_raw.csv`（这样没有候选点和热力图分数，打分只看两份结果是否一致和轨迹跳变）。
+
+速度：确认一帧约 0.4 秒，点一帧约 2.5 秒。第一段球友视频里约 44% 的帧模型没把握，按这个比例 1000 帧大约 20–25 分钟（估计值，还没有人实际标完一遍来核对）。
+
+导出目录的格式（目录结构、CSV 的列、帧的命名、背景图、train/val 怎么分）、训练命令、预计时间、转 Core ML 的办法都写在 [docs/tracknet_finetune.md](docs/tracknet_finetune.md)。
+
 ## 第 3 步：双打站位报告和一键处理
 
 一条命令跑完前面所有步骤：
@@ -279,6 +322,10 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 | `src/badminton/stabilize.py` | 防抖：镜头静止时固定对齐，被碰动时跟着镜头走 |
 | `src/badminton/camera.py` | 从球场标定推出焦距和相机位置 |
 | `src/badminton/positioning.py` | 第 3 步：双打站位、轮转、搭档间距、空当、覆盖和站位卡片 |
+| `src/badminton/annotate.py`、`annotate.html` | 羽毛球标注：标注文件、模型没把握程度、本机网页（只用标准库） |
+| `src/badminton/annotate_export.py` | 把标注导出成 TrackNetV3 的训练目录 |
+| `scripts/check_tracknet_dataset.py` | 用 TrackNetV3 自己的 Dataset 类检查导出的目录（在它的虚拟环境里运行） |
+| `scripts/tracknet_finetune.py` | 从发布的权重开始微调：准备好之后原样运行 TrackNetV3 的 `train.py` |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。
