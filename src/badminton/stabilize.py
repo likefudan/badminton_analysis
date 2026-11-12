@@ -78,6 +78,7 @@ def _from_corners(dst, w, h):
 STILL_PX = 2.0  # frame-to-frame camera motion below this: the camera is still
 MIN_STILL_S = 0.5
 SEGMENT_SAMPLES = 9  # direct matches per still stretch, combined by the median
+KEEP_EVERY = 10  # keep the features of every Nth frame for those matches
 
 
 def stabilize(video, out_path, ref_time: float, start_s: float = 0.0, duration_s: float | None = None,
@@ -126,11 +127,14 @@ def stabilize(video, out_path, ref_time: float, start_s: float = 0.0, duration_s
                 st, mv = np.eye(3), np.inf  # unknown: treat as a bump
             steps.append(st)
             motion.append(float(mv))
-        feats_keep[n - 1] = f
+        if (n - 1) % KEEP_EVERY == 0:  # a few frames per still stretch are enough; all of them
+            feats_keep[n - 1] = f          # would be ~160 kB each (35 GB for an hour at 60 fps)
         prev = f
         if progress:
             progress(n, 2 * total, time.perf_counter() - t0)
     N = n
+    if N == 0:
+        raise RuntimeError(f"读不出视频画面：{video}")
     motion = np.array(motion)
     still = motion < STILL_PX
     still[0] = still[1] if N > 1 else True
@@ -151,7 +155,9 @@ def stabilize(video, out_path, ref_time: float, start_s: float = 0.0, duration_s
         segs = [(0, N - 1)]
     seg_H = []
     for a, b in segs:
-        idx = np.unique(np.linspace(a, b, min(SEGMENT_SAMPLES, b - a + 1)).astype(int))
+        kept = [j for j in range(a - a % KEEP_EVERY, b + 1, KEEP_EVERY) if a <= j <= b and j in feats_keep]
+        idx = [kept[int(q)] for q in np.unique(np.linspace(0, len(kept) - 1, min(SEGMENT_SAMPLES, len(kept))).round())] \
+            if kept else []
         corners = []
         for j in idx:
             D, kk = m.homography(feats_keep[j], ref)

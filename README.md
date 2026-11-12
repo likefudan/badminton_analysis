@@ -218,8 +218,10 @@ badminton stabilize IMG_8923.mp4 IMG_8923_stab.mp4 --ref-time 100 --start 33 --f
 badminton calibrate IMG_8923_stab.mp4 --time 67    # 在防抖后的视频上标定一次
 badminton shuttle IMG_8923_stab.mp4 --court IMG_8923_stab.court.json   # 用改进的选点方法
 badminton movement IMG_8923_stab.mp4 --court IMG_8923_stab.court.json --data ... --start 6
+badminton overlay IMG_8923_stab.skeleton.mp4 --shuttle IMG_8923_stab.shuttle.csv   # 骨架视频上再画球的轨迹
 ```
 
+- **iPhone 空间音频**：新款 iPhone 的视频第一条音轨可能是空间音频（apple_apac），ffmpeg 解不了；`sdr` 会自动改用能解的那条（通常是 AAC）。
 - **防抖**：先测出相邻帧之间镜头动了多少，把视频分成「镜头静止」和「被碰动」两类时间段。每段静止时间用同一个对齐方式（几帧结果的中位数），被碰动的几帧跟着镜头走，再平滑过渡到下一段。处理后相邻帧之间只差 0.2 像素，和原片一样稳。`--floor-from` 表示只用画面下部（地面）的特征点来对齐。
 - **跑动更准**：每个位置带着自己的精度（4 像素误差换算到球场上），用卡尔曼平滑。机位低时，远端 1 像素对应 12–17 厘米，原来的平滑会把抖动算成跑动（修正前远端多算了将近一倍）。
 - **排除场外的人**：瞬间移动不可能那么远、球衣颜色也对不上的检测，不算同一个人；在线外站着不动超过 0.5 秒的，不算球员；补空缺需要的速度超过 5 米/秒的，不补。
