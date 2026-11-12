@@ -49,7 +49,11 @@ def available_providers() -> list[str]:
 
 
 def resolve_device(device: str) -> str:
-    """'auto' -> 'cuda' | 'coreml' | 'cpu' depending on what ONNX Runtime offers."""
+    """'auto' -> 'cuda' | 'coreml' | 'cpu' depending on what ONNX Runtime offers.
+
+    Core ML can be tuned with 'coreml:<compute units>[:<model format>]', e.g.
+    'coreml:CPUAndNeuralEngine' or 'coreml:CPUAndGPU:NeuralNetwork'.
+    """
     if device != "auto":
         return device
     providers = available_providers()
@@ -58,6 +62,10 @@ def resolve_device(device: str) -> str:
     if "CoreMLExecutionProvider" in providers:
         return "coreml"
     return "cpu"
+
+
+COREML_UNITS = ("ALL", "CPUAndGPU", "CPUAndNeuralEngine", "CPUOnly")
+COREML_FORMATS = ("MLProgram", "NeuralNetwork")
 
 
 def provider_config(device: str) -> list:
@@ -69,11 +77,16 @@ def provider_config(device: str) -> list:
             "CUDAExecutionProvider",
             "CPUExecutionProvider",
         ]
-    if device == "coreml":
+    if device == "coreml" or device.startswith("coreml:"):
+        parts = device.split(":")
+        # MLProgram is the newer Core ML format and covers more operators than
+        # NeuralNetwork; ALL lets Core ML choose between GPU and Neural Engine.
+        units = parts[1] if len(parts) > 1 and parts[1] else "ALL"
+        fmt = parts[2] if len(parts) > 2 and parts[2] else "MLProgram"
+        if units not in COREML_UNITS or fmt not in COREML_FORMATS:
+            raise ValueError(f"Core ML 设置不对：{device}；计算单元可选 {COREML_UNITS}，格式可选 {COREML_FORMATS}")
         return [
-            # MLProgram is the newer Core ML format and covers more operators than
-            # NeuralNetwork; ALL lets Core ML choose between GPU and Neural Engine.
-            ("CoreMLExecutionProvider", {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"}),
+            ("CoreMLExecutionProvider", {"ModelFormat": fmt, "MLComputeUnits": units}),
             "CPUExecutionProvider",
         ]
     return ["CPUExecutionProvider"]

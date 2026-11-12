@@ -47,9 +47,21 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--devices", default="auto,cpu", help="逗号分隔：auto, coreml, cuda, tensorrt, cpu")
     s.add_argument("--mode", default="balanced", choices=["lightweight", "balanced", "performance"])
 
+    s = sub.add_parser("profile", help="分段计时：时间花在模型推理还是前后处理、解码编码上")
+    s.add_argument("video")
+    s.add_argument("--court")
+    s.add_argument("--frames", type=int, default=120)
+    s.add_argument("--start", type=float, default=0.0, help="从第几秒开始取帧")
+    s.add_argument("--mode", default="balanced", choices=["lightweight", "balanced", "performance"])
+    s.add_argument("--device", default="auto", help="分段计时用的后端")
+    s.add_argument("--devices", help="单模型测试要比较的后端，逗号分隔；默认 CPU 加几种 Core ML 设置")
+    s.add_argument("--runs", type=int, default=100, help="单模型测试每种设置跑几次")
+    s.add_argument("--singles", action="store_true")
+    s.add_argument("--json", help="把结果另存成 JSON")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
-            "skeleton": cmd_skeleton, "bench": cmd_bench}[a.cmd](a)
+            "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -162,6 +174,51 @@ def cmd_bench(a) -> int:
         results[f"{dev}->{est.device}"] = est.timing.summary()
         print(f"{dev}（{est.device}，{est.providers['det'][0]}）：{est.timing.summary()}")
     print(json.dumps(results, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_profile(a) -> int:
+    from .court import CourtCalibration
+    from .pose import PoseEstimator
+    from .profiling import bench_model, default_device_matrix, pipeline
+    from .video import probe
+
+    calib = CourtCalibration.load(a.court) if a.court else None
+    est = PoseEstimator(mode=a.mode, device=a.device)
+    report: dict = {"mode": a.mode, "device": est.device, "providers": est.providers}
+
+    print(f"== 1. 整条流程分段计时（{est.device}，{a.mode}，{a.frames} 帧）==")
+    fps = probe(a.video).fps or 30
+    timer, n, wall = pipeline(a.video, est, calib, a.frames, 1 if a.singles else 2,
+                              start_frame=int(a.start * fps))
+    rows = sorted(timer.table(n), key=lambda r: -r[1])
+    measured = sum(r[1] for r in rows)
+    print(f"{'阶段':<14}{'ms/帧':>8}{'占比':>8}{'ms/次':>8}{'次数':>7}")
+    for name, per_frame, per_call, calls in rows:
+        print(f"{name:<14}{per_frame:8.1f}{100 * per_frame / max(1e-9, 1000 * wall / max(1, n)):7.0f}%{per_call:8.2f}{calls:7d}")
+    wall_ms = 1000 * wall / max(1, n)
+    print(f"{'其他（未单独计时）':<14}{wall_ms - measured:8.1f}{100 * (wall_ms - measured) / max(1e-9, wall_ms):7.0f}%")
+    print(f"{'合计（实测墙钟）':<14}{wall_ms:8.1f}      -> {1000 / max(1e-9, wall_ms):.1f} 帧/秒（每帧都跑模型）")
+    model_ms = sum(r[1] for r in rows if "模型推理" in r[0])
+    print(f"其中模型推理 {model_ms:.1f} ms/帧，占 {100 * model_ms / max(1e-9, wall_ms):.0f}%；其余是 Python/numpy/解码/编码")
+    report["pipeline"] = {"frames": n, "wall_ms_per_frame": wall_ms,
+                          "stages": [dict(zip(("stage", "ms_per_frame", "ms_per_call", "calls"), r)) for r in rows]}
+
+    devices = a.devices.split(",") if a.devices else default_device_matrix()
+    print(f"\n== 2. 单独测模型（固定输入，每种设置 {a.runs} 次）==")
+    print(f"{'模型':<10}{'后端设置':<42}{'ms/次':>8}{'Core ML 接管节点':>18}{'分段':>6}")
+    report["models"] = []
+    for label, tool in (("检测", est.det), ("姿态", est.pose)):
+        for dev in devices:
+            r = bench_model(tool.onnx_model, dev.strip(), a.runs)
+            cov = f"{r.coreml_nodes}/{r.graph_nodes}" if r.graph_nodes else "-"
+            part = str(r.partitions) if r.partitions is not None else "-"
+            ms = f"{r.ms_per_run:8.2f}" if not r.error else "    失败"
+            print(f"{label:<10}{dev:<42}{ms}{cov:>18}{part:>6}" + (f"  {r.error[:80]}" if r.error else ""))
+            report["models"].append({"model": label, **r.__dict__})
+    if a.json:
+        Path(a.json).write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        print(f"\n已保存 {a.json}")
     return 0
 
 
