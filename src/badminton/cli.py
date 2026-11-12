@@ -25,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-o", "--output", default=None, help="默认是视频同名的 .court.json")
     s.add_argument("--time", type=float, default=1.0, help="用第几秒的画面来点（秒）")
     s.add_argument("--points", help="不开窗口，直接给点：name=x,y;name=x,y;...")
+    s.add_argument("--auto", action="store_true", help="自动标定：检测白色球场线并拟合标准球场，不用手点")
+    s.add_argument("--hint", help="自动标定时指定要哪片场地：场地内任意一点的像素坐标 x,y（画面里有多片场地时用）")
+    s.add_argument("--frames", type=int, default=5, help="自动标定取几帧做中值（去掉走动的人），默认 5；1 = 只用一帧")
+    s.add_argument("--every", type=float, help="自动标定后每隔这么多秒再对一次线，报告机位漂移")
 
     s = sub.add_parser("skeleton", help="第 1 步：输出叠加骨架的视频和每帧的姿态数据")
     s.add_argument("video")
@@ -166,6 +170,8 @@ def cmd_calibrate(a) -> int:
     idx = int(a.time * (info.fps or 30))
     if info.frames:
         idx = min(idx, info.frames - 1)
+    if a.auto:
+        return _calibrate_auto(a, info, idx)
     frame = read_frame(a.video, idx)
     points = parse_points(a.points) if a.points else click_points(frame)
     if not points:
@@ -185,6 +191,81 @@ def cmd_calibrate(a) -> int:
         print(f"  {suspect[0]} 可能点偏了：去掉它后其余点的误差降到 {suspect[1]:.1f} 像素，建议重点")
     if len(points) < 6:
         print("提示：只点了 4–5 个点，远端精度会差一些，建议再加发球线交点")
+    return 0
+
+
+def _calibrate_auto(a, info, idx: int) -> int:
+    """calibrate --auto: fit the court to the white lines, no clicking."""
+    import cv2
+    import numpy as np
+
+    from .autocal import AutoCalibrationError, auto_calibrate, intersection_distance_px, median_frame, track
+    from .render import draw_court, draw_markers
+    from .video import read_frame
+
+    if a.every is not None and a.every <= 0:
+        print("--every 必须大于 0 秒")
+        return 2
+    fps = info.fps or 30
+    last = info.frames - 1 if info.frames else None
+    # a few frames half a second apart: the median keeps the floor and drops the players
+    wanted = [idx + int(round(k * 0.5 * fps)) for k in range(max(1, a.frames))]
+    frames = [read_frame(a.video, i) for i in wanted if last is None or i <= last]
+    frame = median_frame(frames)
+    hint = tuple(float(v) for v in a.hint.split(",")) if a.hint else None
+    out = Path(a.output or Path(a.video).with_suffix(".court.json"))
+    try:
+        res = auto_calibrate(frame, hint)
+    except AutoCalibrationError as e:
+        print(f"自动标定失败：{e}")
+        bad = getattr(e, "result", None)
+        if bad is not None:  # show what was found, but do not save it as the calibration
+            preview = frames[0].copy()
+            draw_court(preview, bad.calib, (0, 0, 255), 2)
+            rejected = out.with_suffix(".rejected.png")
+            cv2.imwrite(str(rejected), preview)
+            print(f"  找到的最好结果画在 {rejected}（红线），没有保存标定")
+        print("请换一个球场线清楚、少有人挡的时刻（--time），或用 --hint x,y 指定场地，"
+              "或者改用手动标定：badminton calibrate 视频（不加 --auto）")
+        return 2
+    calib = res.calib
+    calib.save(out)
+    preview = frames[0].copy()
+    draw_court(preview, calib, (0, 255, 0), 2)
+    draw_markers(preview, calib)
+    cv2.imwrite(str(out.with_suffix(".png")), preview)
+    print(f"已保存 {out}（预览图 {out.with_suffix('.png')}，请看一眼绿线是否压在白线上）")
+    print(f"置信度 {res.confidence:.0%}（投影的球场线落在白线上的比例），"
+          f"对上 {res.lines_found}/{res.lines_visible} 条线，离白线平均 {res.mean_distance_px:.1f} 像素")
+    cam_side = calib.to_image(np.array([(0.0, 0.0)]))[0]
+    print(f"近端左角在画面 ({cam_side[0]:.0f}, {cam_side[1]:.0f})；如果选错了场地，用 --hint x,y 指定")
+    if a.every:
+        if not info.frames:
+            print("不知道视频总帧数，无法检查漂移")
+            return 0
+        print(f"机位漂移（每 {a.every:g} 秒对一次线，和第 {a.time:g} 秒比，画面内交点的像素偏移）：")
+        worst = 0.0
+        t = a.time + a.every
+        while int(t * fps) <= last:
+            cur = track(read_frame(a.video, int(t * fps)), calib)
+            if cur is None:
+                print(f"  {t:7.1f}s  找不到球场（机位大幅变化或线被挡住）")
+            else:
+                mean, mx = intersection_distance_px(calib, cur.calib, in_frame=True)
+                if not np.isfinite(mx):
+                    print(f"  {t:7.1f}s  原来的球场线交点都不在画面里了（机位大幅变化）")
+                    worst = mx
+                    t += a.every
+                    continue
+                worst = max(worst, mx)
+                print(f"  {t:7.1f}s  平均 {mean:5.1f}  最大 {mx:5.1f}  置信度 {cur.confidence:.0%}")
+            t += a.every
+        if not np.isfinite(worst):
+            print("机位变化太大：建议先运行 badminton stabilize 再标定")
+        elif worst > 5:
+            print(f"最大漂移 {worst:.1f} 像素：建议先运行 badminton stabilize 再标定")
+        else:
+            print(f"最大漂移 {worst:.1f} 像素：机位稳定")
     return 0
 
 
