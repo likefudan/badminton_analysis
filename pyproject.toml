@@ -16,6 +16,8 @@ dependencies = [
     "rtmlib>=0.0.13",
     # Apache-2.0; used to cut the detector graph before NMS (see detector.py).
     "onnx>=1.15",
+    # movement cards (step 2)
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]

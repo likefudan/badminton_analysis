@@ -59,9 +59,27 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--singles", action="store_true")
     s.add_argument("--json", help="把结果另存成 JSON")
 
+    for name, helptext in (("label", "第 2 步：给跟踪到的球员起名字（每局一次）"),
+                           ("movement", "第 2 步：跑动卡片（距离、速度、冲刺、站位热力图）和统计 JSON")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("video")
+        s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+        s.add_argument("--data", help="skeleton 生成的 .npz，默认 <视频名>.skeleton.npz")
+        s.add_argument("--players", help="球员名字文件，默认 <视频名>.players.json")
+        s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
+        s.add_argument("--no-appearance", action="store_true", help="不读视频比对球衣颜色（更快，双打交叉换位时容易换错编号）")
+        s.add_argument("--cuts", help="剪辑过的视频：剪辑点的时间（秒），逗号分隔；跑动不跨这些点计算。换镜头会自动识别，同一机位拼接要手动给")
+        if name == "label":
+            s.add_argument("--names", help='直接给名字："1=小王,2=小李"；不给就在终端里逐个输入')
+            s.add_argument("--time", type=float, help="用第几秒的画面标编号，默认找所有人都在场的第一帧")
+        else:
+            s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+            s.add_argument("--shuttle", help="可选：TrackNetV3 的 _ball.csv，只用来对照回合切分")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
-            "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile}[a.cmd](a)
+            "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
+            "label": cmd_label, "movement": cmd_movement}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -244,6 +262,120 @@ def cmd_profile(a) -> int:
     if a.json:
         Path(a.json).write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str))
         print(f"\n已保存 {a.json}")
+    return 0
+
+
+def _tracking(a):
+    import numpy as np
+
+    from .court import CourtCalibration
+    from .tracking import load_npz, track_players, video_features
+
+    video = Path(a.video)
+    data_path = Path(a.data) if a.data else video.with_suffix(".skeleton.npz")
+    if not data_path.exists():
+        raise SystemExit(f"找不到 {data_path}：先运行 badminton skeleton，或用 --data 指定 .npz")
+    data = load_npz(data_path)
+    calib = CourtCalibration.load(a.court)
+    if a.singles:
+        per_side = 1
+    else:  # most people seen on one half in a frame
+        counts = [max(((data["side"][i] == s) & data["valid"][i]).sum() for s in (0, 1)) for i in range(len(data["valid"]))]
+        per_side = int(np.percentile(counts, 90)) if counts else 2
+        per_side = min(2, max(1, per_side))
+    features, cuts = (None, None) if a.no_appearance else video_features(video, data)
+    if a.cuts:
+        cuts = np.zeros(len(data["time_s"]), bool) if cuts is None else cuts
+        for c in (float(v) for v in a.cuts.split(",") if v.strip()):
+            cuts[int(np.searchsorted(data["time_s"], c))] = True
+    if cuts is not None and cuts.any():
+        print(f"视频里有 {int(cuts.sum())} 处剪辑切换（{', '.join(f'{t:.1f}' for t in data['time_s'][cuts])} 秒），跑动不跨切换点计算")
+    tracking = track_players(data, calib, per_side, features, cuts=cuts)
+    names_path = Path(a.players) if a.players else video.with_suffix(".players.json")
+    if names_path.exists():
+        names = {int(k): v for k, v in json.loads(names_path.read_text()).items()}
+        for t in tracking.tracks:
+            t.name = names.get(t.id, "")
+    return tracking, data, names_path
+
+
+def cmd_label(a) -> int:
+    import cv2
+    import numpy as np
+
+    from .render import draw_text
+    from .video import probe, read_frame
+
+    tracking, data, names_path = _tracking(a)
+    if not tracking.tracks:
+        print("没有跟踪到球员")
+        return 1
+    seen = np.stack([t.seen for t in tracking.tracks], axis=1)
+    if a.time is not None:
+        i = int(np.argmin(np.abs(tracking.time_s - a.time)))
+    else:
+        i = int(np.argmax(seen.sum(1)))
+    frame = read_frame(a.video, int(tracking.frame[i]))
+    scale = probe(a.video).height / 1080
+    for t in tracking.tracks:
+        if t.det_index[i] < 0:
+            continue
+        x0, y0, x1, y1 = data["bbox"][i, t.det_index[i]].astype(int)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 255), max(1, int(2 * scale)))
+        label = f"{t.id}" + (f" {t.name}" if t.name else "")
+        cv2.putText(frame, label, (x0, max(30, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.4 * scale, (0, 0, 0),
+                    int(8 * scale), cv2.LINE_AA)
+        cv2.putText(frame, label, (x0, max(30, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.4 * scale, (0, 255, 255),
+                    int(3 * scale), cv2.LINE_AA)
+    draw_text(frame, f"{tracking.time_s[i]:.1f}s")
+    png = names_path.with_suffix(".png")
+    cv2.imwrite(str(png), frame)
+    print(f"编号画在 {png}（第 {tracking.time_s[i]:.1f} 秒）")
+    ids = [t.id for t in tracking.tracks]
+    if a.names:
+        names = {int(k): v.strip() for k, v in (pair.split("=", 1) for pair in a.names.split(",") if pair.strip())}
+    elif sys.stdin.isatty():
+        names = {}
+        for tid in ids:
+            n = input(f"{tid} 号是谁（回车跳过）：").strip()
+            if n:
+                names[tid] = n
+    else:
+        print('看一眼图片，然后用 --names "1=名字,2=名字" 再运行一次')
+        return 0
+    unknown = set(names) - set(ids)
+    if unknown:
+        print(f"没有这些编号：{sorted(unknown)}；现有编号 {ids}")
+        return 1
+    names_path.write_text(json.dumps({str(k): v for k, v in sorted(names.items())}, ensure_ascii=False, indent=2))
+    print(f"已保存 {names_path}：" + "，".join(f"{k}={v}" for k, v in sorted(names.items())))
+    return 0
+
+
+def cmd_movement(a) -> int:
+    from .card import render_card
+    from .movement import analyse, json_ready, shuttle_agreement
+
+    tracking, _, _ = _tracking(a)
+    result = analyse(tracking)
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if a.shuttle:
+        result["shuttle_check"] = shuttle_agreement(a.shuttle, tracking.frame, result["_in_play"])
+    print(f"视频 {result['duration_s']:.0f} 秒，切出 {len(result['rallies'])} 个回合，回合内共 {result['in_play_s']:.0f} 秒")
+    for p, tr, (pos, _) in zip(result["players"], tracking.tracks, result["_smoothed"]):
+        png = render_card(p, pos, result["_in_play"], out_dir / f"{video.stem}.movement.{p['id']}.png")
+        print(f"  {p['id']} {p['name']}（{'近端' if p['side'] == 'near' else '远端'}）：{p['distance_m']:.0f} 米，"
+              f"最高 {p['max_speed_mps']:.1f} 米/秒，平均 {p['mean_speed_mps']:.1f} 米/秒，冲刺 {p['sprints']} 次，"
+              f"腾空/异常 {p['airborne_frames']} 帧 -> {png}")
+    if "shuttle_check" in result:
+        c = result["shuttle_check"]
+        print(f"和 TrackNetV3 对照：{c['agreement_pct']:.0f}% 的帧一致（回合内球在飞 {c['in_play_shuttle_moving_pct']:.0f}%，"
+              f"死球时间球在飞 {c['dead_shuttle_moving_pct']:.0f}%）")
+    out_json = out_dir / f"{video.stem}.movement.json"
+    out_json.write_text(json.dumps(json_ready(result), ensure_ascii=False, indent=1))
+    print(f"统计已写入 {out_json}")
     return 0
 
 

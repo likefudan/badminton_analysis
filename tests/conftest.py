@@ -33,8 +33,9 @@ def camera():
     return Camera()
 
 
-def fake_person(camera: Camera, x: float, y: float, height: float = 1.75, score: float = 0.9):
-    """17 COCO keypoints for an upright person standing at court point (x, y)."""
+def fake_person(camera: Camera, x: float, y: float, height: float = 1.75, score: float = 0.9, lift: float = 0.0):
+    """17 COCO keypoints for an upright person standing at court point (x, y),
+    or `lift` metres up in the air (a jump)."""
     # (dx across, z up) of each keypoint for a person facing the camera
     layout = {
         0: (0, 1.62), 1: (-0.03, 1.66), 2: (0.03, 1.66), 3: (-0.07, 1.63), 4: (0.07, 1.63),
@@ -43,7 +44,7 @@ def fake_person(camera: Camera, x: float, y: float, height: float = 1.75, score:
         15: (-0.15, 0.07), 16: (0.15, 0.07),
     }
     s = height / 1.75
-    pts3 = np.array([(x + dx * s, y, z * s if j not in (15, 16) else 0.0) for j, (dx, z) in layout.items()])
+    pts3 = np.array([(x + dx * s, y, lift + (z * s if j not in (15, 16) else 0.0)) for j, (dx, z) in layout.items()])
     kp = camera.project(pts3)
     x0, y0 = kp.min(0) - 8
     x1, y1 = kp.max(0) + 8
