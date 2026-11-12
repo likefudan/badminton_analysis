@@ -95,7 +95,11 @@ class ModelBench:
     error: str = ""
 
 
-def bench_model(path: str, device: str, runs: int = 100, fixed_batch: bool = True) -> ModelBench:
+def bench_model(path: str, device: str, runs: int = 100, fixed_batch: bool = True,
+                x: np.ndarray | None = None) -> ModelBench:
+    """Time one ONNX model alone. `x` is the input tensor; pass a real preprocessed
+    frame for a detector: on random noise it finds nobody, and the Core ML EP
+    cannot run the post-NMS nodes on an empty tensor."""
     import onnxruntime as ort
 
     from .pose import provider_config
@@ -115,13 +119,18 @@ def bench_model(path: str, device: str, runs: int = 100, fixed_batch: bool = Tru
     m = _PARTITION_RE.search(log["text"])
     inp = sess.get_inputs()[0]
     shape = [d if isinstance(d, int) and d > 0 else 1 for d in inp.shape]
-    x = np.random.default_rng(0).random(shape, dtype=np.float32) * 255
-    feed = {inp.name: x}
-    for _ in range(5):  # warm-up (Core ML compiles / specialises on first runs)
-        sess.run(None, feed)
-    t = time.perf_counter()
-    for _ in range(runs):
-        sess.run(None, feed)
+    if x is None:
+        x = np.random.default_rng(0).random(shape, dtype=np.float32) * 255
+    feed = {inp.name: np.ascontiguousarray(x, dtype=np.float32)}
+    try:
+        for _ in range(5):  # warm-up (Core ML compiles / specialises on first runs)
+            sess.run(None, feed)
+        t = time.perf_counter()
+        for _ in range(runs):
+            sess.run(None, feed)
+    except Exception as e:  # noqa: BLE001 - report and keep going with other settings
+        return ModelBench(os.path.basename(path), device, load_s, float("nan"), sess.get_providers(),
+                          error=str(e).splitlines()[0])
     ms = 1000 * (time.perf_counter() - t) / runs
     return ModelBench(
         os.path.basename(path), device, load_s, ms, sess.get_providers(),

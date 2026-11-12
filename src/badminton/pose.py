@@ -158,6 +158,15 @@ class PoseEstimator:
             self.providers[name] = tool.session.get_providers()
         self.timing = Timing()
 
+    def _detect(self, img: np.ndarray) -> np.ndarray:
+        try:
+            boxes = self.det(img)
+        except Exception as e:  # onnxruntime raises a plain Fail/RuntimeException
+            if not _is_empty_nms_error(e):
+                raise
+            boxes = []
+        return np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
+
     def __call__(
         self,
         frame: np.ndarray,
@@ -174,11 +183,11 @@ class PoseEstimator:
         t0 = time.perf_counter()
         if roi is not None:
             x0, y0, x1, y1 = roi
-            boxes = np.asarray(self.det(frame[y0:y1, x0:x1]), dtype=np.float64).reshape(-1, 4)
+            boxes = self._detect(frame[y0:y1, x0:x1])
             boxes[:, [0, 2]] += x0
             boxes[:, [1, 3]] += y0
         else:
-            boxes = np.asarray(self.det(frame), dtype=np.float64).reshape(-1, 4)
+            boxes = self._detect(frame)
         if box_filter is not None and len(boxes):
             boxes = boxes[np.asarray(box_filter(boxes), dtype=bool)]
         t1 = time.perf_counter()
@@ -193,6 +202,19 @@ class PoseEstimator:
         self.timing.frames += 1
         self.timing.persons += len(result)
         return result
+
+
+def _is_empty_nms_error(err: Exception) -> bool:
+    """Core ML EP failure when the detector's NMS keeps no box.
+
+    The detector ONNX graph ends in NonMaxSuppression followed by Gather/Concat
+    nodes whose size is the number of kept boxes. Core ML runs some of those
+    nodes, and the Core ML EP refuses a tensor with zero elements, so a frame
+    with nobody in it (empty court, close-up, black frame) raises instead of
+    returning no boxes.
+    """
+    msg = str(err)
+    return "CoreML" in msg and "zero elements" in msg
 
 
 def _make_session(path: str, device: str, fixed_dims: dict[str, int] | None = None):

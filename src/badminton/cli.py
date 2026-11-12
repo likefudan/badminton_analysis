@@ -177,6 +177,25 @@ def cmd_bench(a) -> int:
     return 0
 
 
+def _model_inputs(est, video: str, frame_idx: int, calib) -> dict:
+    """Real input tensors for the single-model benchmark, made with rtmlib's own
+    preprocessing from one video frame (detector: the court crop; pose: the
+    first person found, or the whole frame if nobody is)."""
+    import numpy as np
+
+    from .court import detection_roi
+    from .video import read_frame
+
+    frame = read_frame(video, frame_idx)
+    x0, y0, x1, y1 = detection_roi(calib) if calib is not None else (0, 0, frame.shape[1], frame.shape[0])
+    det_img, _ = est.det.preprocess(frame[y0:y1, x0:x1])
+    res = est(frame, (x0, y0, x1, y1))
+    bbox = res.bboxes[0] if len(res) else [0, 0, frame.shape[1], frame.shape[0]]
+    pose_img, _, _ = est.pose.preprocess(frame, bbox)
+    to_nchw = lambda im: np.ascontiguousarray(im.transpose(2, 0, 1)[None], dtype=np.float32)  # noqa: E731
+    return {"检测": to_nchw(det_img), "姿态": to_nchw(pose_img)}
+
+
 def cmd_profile(a) -> int:
     from .court import CourtCalibration
     from .pose import PoseEstimator
@@ -205,12 +224,13 @@ def cmd_profile(a) -> int:
                           "stages": [dict(zip(("stage", "ms_per_frame", "ms_per_call", "calls"), r)) for r in rows]}
 
     devices = a.devices.split(",") if a.devices else default_device_matrix()
+    inputs = _model_inputs(est, a.video, int(a.start * fps), calib)
     print(f"\n== 2. 单独测模型（固定输入，每种设置 {a.runs} 次）==")
     print(f"{'模型':<10}{'后端设置':<42}{'ms/次':>8}{'Core ML 接管节点':>18}{'分段':>6}")
     report["models"] = []
     for label, tool in (("检测", est.det), ("姿态", est.pose)):
         for dev in devices:
-            r = bench_model(tool.onnx_model, dev.strip(), a.runs)
+            r = bench_model(tool.onnx_model, dev.strip(), a.runs, x=inputs[label])
             cov = f"{r.coreml_nodes}/{r.graph_nodes}" if r.graph_nodes else "-"
             part = str(r.partitions) if r.partitions is not None else "-"
             ms = f"{r.ms_per_run:8.2f}" if not r.error else "    失败"
