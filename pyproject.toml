@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "badminton-analysis"
+version = "0.1.0"
+description = "Local, open-source analysis of amateur badminton videos"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    # Apache-2.0; pulls in onnxruntime (CPU + CoreML on macOS).
+    # On NVIDIA replace it with onnxruntime-gpu (see README).
+    "rtmlib>=0.0.13",
+    # Apache-2.0; used to cut the detector graph before NMS (see detector.py).
+    "onnx>=1.15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# Native fp16 Core ML models on a Mac (device "coremlnative"). torch and
+# onnx2torch are only needed once, to convert the ONNX models.
+coreml = ["coremltools>=8", "torch>=2.2", "onnx2torch>=1.5"]
+
+[project.scripts]
+badminton = "badminton.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
