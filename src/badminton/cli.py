@@ -424,9 +424,11 @@ def cmd_stabilize(a) -> int:
 
     log = stabilize(a.video, a.output, a.ref_time, a.start, a.duration, progress=print_progress,
                     floor_from=a.floor_from)
-    k = np.array(log["inliers"])
-    print(f"已写入 {a.output}：{len(k)} 帧，匹配点中位数 {np.median(k):.0f}，"
-          f"{int(np.sum(log['chained']))} 帧借助前一帧对齐（和参考帧差别太大）")
+    segs = log["still_segments"]
+    still = sum(b - a + 1 for a, b in segs)
+    n = len(log["H"])
+    print(f"已写入 {a.output}：{n} 帧，镜头静止的 {len(segs)} 段共 {still} 帧（{100 * still / max(1, n):.0f}%），"
+          f"其余 {n - still} 帧是镜头被碰动的过渡")
     return 0
 
 
