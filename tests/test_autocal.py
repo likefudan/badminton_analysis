@@ -142,3 +142,28 @@ def test_line_mask_ignores_wide_white_areas():
     mask = autocal.line_mask(img)
     assert mask[275, 310] or mask[274, 310] or mask[276, 310]
     assert not mask[115, 265]
+
+
+def _write_clip(path, frame, n=8):
+    w = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (frame.shape[1], frame.shape[0]))
+    for _ in range(n):
+        w.write(frame)
+    w.release()
+
+
+def test_cli_auto_saves_calibration_and_refuses_an_empty_floor(camera, tmp_path, capsys):
+    from badminton.cli import main
+
+    video = tmp_path / "court.mp4"
+    _write_clip(video, render(camera))
+    assert main(["calibrate", str(video), "--auto", "--time", "0", "--frames", "3", "--every", "0.1"]) == 0
+    calib = CourtCalibration.load(tmp_path / "court.court.json")
+    assert autocal.intersection_distance_px(calib, truth(camera))[0] < 2.0
+    assert (tmp_path / "court.court.png").exists()
+    assert "机位稳定" in capsys.readouterr().out
+
+    empty = tmp_path / "empty.mp4"
+    _write_clip(empty, np.full((camera.size[1], camera.size[0], 3), (70, 140, 60), np.uint8))
+    assert main(["calibrate", str(empty), "--auto", "--time", "0"]) != 0
+    assert not (tmp_path / "empty.court.json").exists()
+    assert "手动标定" in capsys.readouterr().out
