@@ -27,3 +27,19 @@ def test_short_gaps_are_filled_long_ones_not():
     q = fill_short_gaps(p, 3)
     assert q[1, 0] == 1 and abs(q[2, 1] - 20) < 1e-9
     assert q[5, 0] == 0
+
+
+def test_overlay_command_writes_video(tmp_path):
+    import cv2
+
+    from badminton.cli import main
+
+    vid = tmp_path / "clip.skeleton.mp4"
+    w = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"mp4v"), 30, (320, 240))
+    for _ in range(20):
+        w.write(np.zeros((240, 320, 3), np.uint8))
+    w.release()
+    csv = tmp_path / "clip.shuttle.csv"
+    csv.write_text("Frame,Visibility,X,Y\n" + "".join(f"{i},1,{10 + 5 * i},100\n" for i in range(20)))
+    assert main(["overlay", str(vid), "--shuttle", str(csv)]) == 0
+    assert (tmp_path / "clip.combined.mp4").exists()
