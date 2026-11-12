@@ -167,6 +167,45 @@ badminton movement match.mp4 --court match.court.json
 
 已知的不足：转播机位很高，跳起时脚的换算位置偏得不多，判断是否在空中的办法只能抓到一部分跳跃帧（这段视频里近端一次后撤跳杀抓到 4/6 帧）。手机放在 2.5–4 米高时，跳起时的偏差大得多，这个判断也更灵。
 
+## 羽毛球轨迹（准备第 5、6 步）
+
+用 [TrackNetV3](https://github.com/qaz812345/TrackNetV3)（MIT 许可证）找出每一帧里球的位置，转换成原生 Core ML 模型在 Mac 上跑。
+
+TrackNetV3 的代码和权重不放进本项目，只在第一次转换模型时用到：
+
+```bash
+pip install -e ".[coreml]"                       # 转换模型要用 PyTorch 和 coremltools
+git clone https://github.com/qaz812345/TrackNetV3.git ~/codebase/third_party/TrackNetV3
+# 按它的 README 下载权重，解压到 ckpts/（TrackNet_best.pt 和 InpaintNet_best.pt）
+export TRACKNETV3_DIR=~/codebase/third_party/TrackNetV3
+
+badminton shuttle match.mp4 --overlay
+#   生成 match.shuttle.csv（每帧：Frame, Visibility, X, Y）和画了轨迹的 match.shuttle.mp4
+```
+
+转换好的模型缓存在 `~/.cache/badminton/`，以后不再需要 TrackNetV3 文件夹。
+
+处理方式和 TrackNetV3 原版的 `predict.py` 一样：8 帧加一张背景中位数图一起送进 TrackNet，重叠的窗口按 1,2,3,4,4,3,2,1 加权平均，再用 InpaintNet 补短暂的丢失。只在下面几处做了提速：
+
+- 每帧只解码、缩小一次（原版每帧要在 8 个窗口里各缩小一次）。
+- 解码和缩小放在另一个进程里，和模型推理同时进行。
+- 两个窗口一起送进模型。
+- 模型转换成 Core ML 半精度格式。和骨架模型不同，TrackNet 在神经网络引擎上比 GPU 快。
+
+实测（M5，72 秒 1080p30 转播单打，2166 帧）：
+
+| | 原版（PyTorch，Apple GPU） | `badminton shuttle` |
+| --- | --- | --- |
+| 总耗时 | 779 秒 | 37 秒（背景图 5 秒 + 逐帧 32 秒） |
+| 逐帧速度 | 约 2.8 帧/秒 | 68 帧/秒 |
+| 每帧耗时 | — | 模型 13 毫秒；解码加缩小 12 毫秒，和模型同时进行 |
+
+结果和原版对比：每一帧「有没有球」的判断完全一致；位置 99.4% 的帧相差 5 像素以内（中位数 1 像素）；之前人工核对过的 40 帧，全部在 3 像素以内。
+
+用 `--resize area` 改用 OpenCV 缩小画面，会稍快一点，但只有 95.9% 的帧在 5 像素以内，所以默认用和原版一样的 Pillow。
+
+这段转播视频接近 TrackNetV3 的训练数据（30 fps 转播）。自己用手机拍的视频（机位更低、60 fps）很可能要用自己的录像微调。
+
 ## 代码结构
 
 | 文件 | 内容 |
@@ -185,10 +224,13 @@ badminton movement match.mp4 --court match.court.json
 | `src/badminton/tracking.py` | 第 2 步：球员跟踪编号、跳起检测、补短暂丢失 |
 | `src/badminton/movement.py` | 第 2 步：回合切分、跑动距离、速度、冲刺、站位、热力图 |
 | `src/badminton/card.py` | 第 2 步：跑动卡片 PNG |
+| `src/badminton/shuttle.py` | 羽毛球轨迹：TrackNetV3 转 Core ML、加权平均、补丢失 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。
 
 ## 许可证说明
+
+羽毛球轨迹用的是 [TrackNetV3](https://github.com/qaz812345/TrackNetV3)（Chen & Wang，代码和权重都是 MIT 许可证）。它的代码和权重不在本仓库里；`shuttle.py` 按它的 `predict.py` 重写了推理流程，转换出来的 Core ML 模型只缓存在本机。
 
 检测和姿态模型来自 [rtmlib](https://github.com/Tau-J/rtmlib)（Apache-2.0）：人体检测用的是它自带的 YOLOX（Megvii，Apache-2.0，在 COCO + HumanArt 上训练），姿态用 RTMPose。方案里写的是 RTMDet，两者都是 Apache-2.0；rtmlib 的现成模型配的是 YOLOX，先用它，远端漏检多再换。
