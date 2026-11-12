@@ -70,6 +70,20 @@ def _has_filter(name: str) -> bool:
     return any(line.split()[1:2] == [name] for line in out.splitlines() if len(line.split()) > 1)
 
 
+UNDECODABLE_AUDIO = {"apple_apac"}  # iPhone spatial audio; ffmpeg cannot decode it
+
+
+def _audio_map(src) -> list[str]:
+    """-map for the first audio stream ffmpeg can decode (newer iPhones put spatial
+    audio, apple_apac, first and plain AAC second); none if there is no such stream."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name",
+                          "-of", "csv=p=0", str(src)], capture_output=True, text=True).stdout.split()
+    for k, codec in enumerate(out):
+        if codec not in UNDECODABLE_AUDIO:
+            return ["-map", f"0:a:{k}"]
+    return []
+
+
 def to_sdr(src: str | Path, dst: str | Path, height: int | None = None) -> None:
     """Convert an HDR (HLG/PQ) iPhone clip to SDR BT.709 H.264 so colours are not washed out.
 
@@ -91,7 +105,7 @@ def to_sdr(src: str | Path, dst: str | Path, height: int | None = None) -> None:
     else:
         raise RuntimeError("这个 ffmpeg 既没有 zscale 也没有 scale_vt，无法把 HDR 转成 SDR")
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", *pre, "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+        ["ffmpeg", "-y", "-v", "error", *pre, "-i", str(src), "-map", "0:v:0", *_audio_map(src), "-vf", vf,
          "-c:v", "libx264", "-crf", "18", "-preset", "fast",
          "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
          "-c:a", "aac", "-b:a", "160k", str(dst)],
