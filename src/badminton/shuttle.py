@@ -178,7 +178,10 @@ def convert_models(tracknet_dir: str | os.PathLike | None, out_dir: Path = CACHE
     mod = _import_tracknet(d)
     paths = []
     for name, shape_fn in (("TrackNet", None), ("InpaintNet", None)):
-        ckpt = torch.load(d / "ckpts" / f"{name}_best.pt", map_location="cpu")  # weights_only (safe) by default
+        # weights_only (safe) by default. A checkpoint written by TrackNetV3's train.py (a
+        # fine-tuned one) also holds its best validation accuracy as a numpy scalar.
+        with torch.serialization.safe_globals([(getattr(np, "_core", None) or np.core).multiarray.scalar, np.dtype, type(np.dtype(np.float64))]):
+            ckpt = torch.load(d / "ckpts" / f"{name}_best.pt", map_location="cpu")
         p = ckpt["param_dict"]
         if name == "TrackNet":
             assert p["bg_mode"] == "concat" and p["seq_len"] == SEQ_LEN, p
@@ -211,11 +214,16 @@ def _model_path(name: str, out_dir: Path = CACHE_DIR) -> Path:
     return out_dir / f"tracknetv3_{name.lower()}_fp16_b{batch}.mlpackage"
 
 
-def load_models(tracknet_dir=None, compute_units: str = "ALL"):
+def load_models(tracknet_dir=None, compute_units: str = "ALL", model_dir: str | os.PathLike | None = None):
+    """The two Core ML models from the cache, or from `model_dir` (a folder written by
+    convert_models, e.g. a fine-tuned TrackNet: docs/tracknet_finetune.md)."""
     import coremltools as ct
 
-    tn, ip = _model_path("TrackNet"), _model_path("InpaintNet")
+    out_dir = Path(model_dir).expanduser() if model_dir else CACHE_DIR
+    tn, ip = _model_path("TrackNet", out_dir), _model_path("InpaintNet", out_dir)
     if not (tn.exists() and ip.exists()):
+        if model_dir:
+            raise SystemExit(f"{out_dir} 里没有 {tn.name} 和 {ip.name}")
         print("第一次使用：把 TrackNetV3 转换成 Core ML 模型（约半分钟）")
         convert_models(tracknet_dir)
     cu = getattr(ct.ComputeUnit, compute_units)
@@ -320,7 +328,8 @@ def _reader(video, max_frames, method, q, busy, step=1, start=0):
 
 def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "ALL", inpaint: bool = True,
                   max_frames: int | None = None, progress=None, resize: str = "pil", frame_step: int = 1,
-                  start_frame: int = 0, debug: dict | None = None):
+                  start_frame: int = 0, debug: dict | None = None,
+                  model_dir: str | os.PathLike | None = None):
     """Returns (rows, timing); rows = list of (frame, visibility, x, y) in video pixels, one per video frame.
 
     start_frame: begin there (row frame numbers stay video frame numbers).
@@ -337,7 +346,7 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     import queue
 
     tm = ShuttleTiming()
-    tracknet, inpaintnet = load_models(tracknet_dir, compute_units)
+    tracknet, inpaintnet = load_models(tracknet_dir, compute_units, model_dir)
     cap = cv2.VideoCapture(str(video))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     ok, first = cap.read()  # size of the decoded frame: a phone video's rotation flag is already applied

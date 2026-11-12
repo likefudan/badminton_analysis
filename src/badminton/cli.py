@@ -86,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("video")
     s.add_argument("-o", "--output", help="输出 CSV，默认 <视频名>.shuttle.csv")
     s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要），也可用环境变量 TRACKNETV3_DIR")
+    s.add_argument("--model-dir", help="用这个文件夹里的 Core ML 模型（比如微调后的，见 docs/tracknet_finetune.md），默认用缓存里的")
     s.add_argument("--compute-units", default="ALL", choices=["ALL", "CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"])
     s.add_argument("--no-inpaint", action="store_true", help="不用 InpaintNet 补短暂丢失")
     s.add_argument("--max-frames", type=int, help="只处理前 N 帧（试跑）")
@@ -756,7 +757,7 @@ def cmd_shuttle(a) -> int:
     debug = {} if a.court else None
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
-                             frame_step=a.frame_step, debug=debug)
+                             frame_step=a.frame_step, debug=debug, model_dir=a.model_dir)
     if a.raw_output:
         write_csv(rows, a.raw_output)
     if a.court:

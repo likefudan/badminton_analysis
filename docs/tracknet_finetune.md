@@ -116,14 +116,23 @@ $T/.venv/bin/python scripts/tracknet_finetune.py --tracknet-dir $T \
 - 想看训练曲线：`$T/.venv/bin/pip install tensorboard`，训练时另开终端 `tensorboard --logdir data/tracknet_exp/logs`。
 - 只微调 TrackNet（找球的网络）。InpaintNet 只看坐标序列、不看画面，沿用发布的权重。
 
-预计时间（M5，MPS，实测的是单步耗时，用随机输入测的，不含真实训练）：批大小 8 时每步 1.9 秒，即每个 8 帧样本 0.24 秒；验证每批 0.5 秒；读数据每个样本 0.03 秒，8 个进程并行，不是瓶颈。训练集的样本数约等于训练帧数（每段少 7 个）。
+实测时间（M5，24 GB，MPS，批大小 8）：用上面 IMG_8923 的导出（训练 286 个样本、验证 79 个样本，标签是机器预标注）从发布的权重训练了 2 轮，共 6 分 26 秒，没有算子退回 CPU。
+
+| 阶段 | 实测 |
+| --- | --- |
+| 训练 | 每步 1.87 秒，即每个 8 帧样本 0.23 秒（每秒 4.3 个样本） |
+| 验证 | 79 个样本 14 秒 |
+| 每轮固定开销 | 约 100 秒：训练和验证各等约 50 秒，是 8 个读数据的进程启动和退出的时间，和数据量无关 |
+| 内存 | 批大小 8 约 12 GB，批大小 4 约 6–8 GB（速度一样） |
+
+训练集的样本数约等于训练帧数（每段少 7 个）。按上面的数字推算：
 
 | 标注量（其中约 80% 进训练集） | 每轮 | 10 轮 |
 | --- | --- | --- |
-| 1000 帧 | 约 3–4 分钟 | 约 35 分钟 |
-| 全部 7 个回合（3831 帧） | 约 12–13 分钟 | 约 2 小时 |
+| 1000 帧 | 约 5 分钟 | 约 50 分钟 |
+| 全部 7 个回合（3831 帧） | 约 13–14 分钟 | 约 2 小时 15 分钟 |
 
-说明：已经实际跑通的是空跑（`--epochs 0`，到「Start training」为止）和上面的单步计时；按要求没有真正训练，所以 `train.py` 的训练循环和验证循环在 MPS 上还没有整轮跑过。第一次正式训练建议先 `--epochs 1` 看一轮能否走完。
+说明：这次试跑的标签是模型自己的预测，只验证了流程和耗时，训练出的模型好不好没有意义；`train.py` 打印的验证准确率也是和机器预标注比的。有了人工标注的回合再看准确率。中断后续跑（再运行一次同样的命令）也实测过。
 
 ## 4. 转成 Core ML
 
@@ -141,13 +150,22 @@ python -c "
 from pathlib import Path
 from badminton.shuttle import convert_models
 print(convert_models('data/tracknet_exp/convert', Path('data/tracknet_exp/coreml')))"
+```
 
-# 备份原来的模型，再换上微调的（文件名必须不变）
+转换约 6 秒。然后用 `--model-dir` 让 `badminton shuttle` 用这个文件夹里的模型，缓存里发布的模型不动：
+
+```bash
+badminton shuttle data/IMG_8923_stab.mp4 --model-dir data/tracknet_exp/coreml -o outputs/IMG_8923.finetuned.shuttle.csv
+```
+
+速度和发布的模型一样（M5 上约 75 帧/秒）。确认微调的模型更好之后，想让所有命令（包括 `badminton annotate` 的预标）都默认用它，就把它换进缓存（文件名必须不变）：
+
+```bash
 C=~/.cache/badminton
 mv $C/tracknetv3_tracknet_fp16_b2.mlpackage $C/tracknetv3_tracknet_fp16_b2.released.mlpackage
 cp -R data/tracknet_exp/coreml/tracknetv3_tracknet_fp16_b2.mlpackage $C/
 ```
 
-之后 `badminton shuttle` 用的就是微调后的模型。换回去：删掉 `$C/tracknetv3_tracknet_fp16_b2.mlpackage`，把 `.released` 那个改回原名。`badminton annotate` 缓存的预测（`<视频名>.annotate.npz`）是旧模型的，换模型后删掉它再标，预测才是新模型的。
+换回去：删掉 `$C/tracknetv3_tracknet_fp16_b2.mlpackage`，把 `.released` 那个改回原名。`badminton annotate` 缓存的预测（`<视频名>.annotate.npz`）是旧模型的，换模型后删掉它再标，预测才是新模型的。
 
-比较微调前后：用两个模型各跑一遍 `badminton shuttle`，和验证回合的人工标注（`match.labels.csv` 里 `human` 的帧）比对有无球是否一致、位置相差多少像素。
+比较微调前后：用两个模型各跑一遍 `badminton shuttle`（一次不加、一次加 `--model-dir`），和验证回合的人工标注（`match.labels.csv` 里 `human` 的帧）比对有无球是否一致、位置相差多少像素。

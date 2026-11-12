@@ -27,7 +27,6 @@ and stops before the first training step: a dry run.
 
 import argparse
 import os
-import runpy
 import sys
 from pathlib import Path
 
@@ -109,11 +108,22 @@ def main() -> int:
         stub.SummaryWriter = _NoWriter
         sys.modules["torch.utils.tensorboard"] = stub
 
+    # train.py saves its best validation accuracy as a numpy scalar, which torch.load
+    # refuses by default (weights_only) when the run is continued. The checkpoints read
+    # here are the released one and the ones this run wrote.
+    _load = torch.load
+    torch.load = lambda *args, **kw: _load(*args, **{"weights_only": False, **kw})
+
     sys.path.insert(0, str(tracknet))
     sys.argv = ["train.py", "--model_name", "TrackNet", "--epochs", str(a.epochs), "--save_dir", str(save),
                 "--resume_training", "--verbose"]
     print(f"device {device}; running {tracknet / 'train.py'} {' '.join(sys.argv[1:])}")
-    runpy.run_path(str(tracknet / "train.py"), run_name="__main__")
+    # Not runpy.run_path: that makes train.py the main module, and on a Mac every data
+    # loader process (started with "spawn") then imports train.py again, without the
+    # stand-ins above, and dies on `import tensorboard`. Executed like this, the main
+    # module stays this script, which the loader processes can import harmlessly.
+    train_py = tracknet / "train.py"
+    exec(compile(train_py.read_text(), str(train_py), "exec"), {"__name__": "__main__", "__file__": str(train_py)})
     return 0
 
 
