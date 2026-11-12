@@ -287,7 +287,9 @@ def _tracking(a):
     if a.cuts:
         cuts = np.zeros(len(data["time_s"]), bool) if cuts is None else cuts
         for c in (float(v) for v in a.cuts.split(",") if v.strip()):
-            cuts[int(np.searchsorted(data["time_s"], c))] = True
+            k = int(np.searchsorted(data["time_s"], c))
+            if 0 < k < len(cuts):
+                cuts[k] = True
     if cuts is not None and cuts.any():
         print(f"视频里有 {int(cuts.sum())} 处剪辑切换（{', '.join(f'{t:.1f}' for t in data['time_s'][cuts])} 秒），跑动不跨切换点计算")
     tracking = track_players(data, calib, per_side, features, cuts=cuts)
@@ -333,7 +335,15 @@ def cmd_label(a) -> int:
     print(f"编号画在 {png}（第 {tracking.time_s[i]:.1f} 秒）")
     ids = [t.id for t in tracking.tracks]
     if a.names:
-        names = {int(k): v.strip() for k, v in (pair.split("=", 1) for pair in a.names.split(",") if pair.strip())}
+        names = {}
+        for pair in (x.strip() for x in a.names.replace("，", ",").split(",")):
+            k, sep, v = pair.partition("=")
+            if not pair:
+                continue
+            if not sep or not k.strip().isdigit() or not v.strip():
+                print(f'看不懂 "{pair}"：格式是 --names "1=小王,2=小李"')
+                return 1
+            names[int(k)] = v.strip()
     elif sys.stdin.isatty():
         names = {}
         for tid in ids:

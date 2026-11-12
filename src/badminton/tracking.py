@@ -291,9 +291,10 @@ def _airborne_by_scale(raw, det, data, calib, window_s: float = 6.0, upright_pct
     # Broadcast singles clip (camera high above the court): upright ~1.3,
     # crouched ~1.0, jumps 1.36-1.43 near / +30-45 % far. With a phone 2.5-4 m
     # high a jump moves the projected foot much further, so the cue is stronger.
+    lo = np.searchsorted(t, t - window_s / 2, side="left")  # t is sorted: window = slice
+    hi = np.searchsorted(t, t + window_s / 2, side="right")
     for i in np.flatnonzero(ok):
-        m = np.abs(t - t[i]) <= window_s / 2
-        out[i] = r[i] > AIRBORNE_RATIO * np.nanpercentile(r[m], upright_pct)
+        out[i] = r[i] > AIRBORNE_RATIO * np.nanpercentile(r[lo[i]:hi[i]], upright_pct)
     return out
 
 

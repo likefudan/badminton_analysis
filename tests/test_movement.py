@@ -79,3 +79,27 @@ def test_analyse_and_card(tmp_path):
     json.dumps(json_ready(res), ensure_ascii=False)
     png = render_card(res["players"][0], res["_smoothed"][0][0], res["_in_play"], tmp_path / "card.png")
     assert png.exists() and png.stat().st_size > 10_000
+
+
+def test_edge_cases_do_not_crash(tmp_path):
+    from badminton.tracking import track_players
+
+    t = np.arange(0, 3, 1 / FPS)
+    F = len(t)
+    empty = {"frame": np.arange(F), "time_s": t, "valid": np.zeros((F, 4), bool),
+             "bbox": np.full((F, 4, 4), np.nan), "keypoints": np.full((F, 4, 17, 2), np.nan),
+             "scores": np.zeros((F, 4, 17)), "court_xy": np.full((F, 4, 2), np.nan), "side": np.full((F, 4), -1)}
+    res = analyse(track_players(empty))
+    assert res["players"] == [] and res["rallies"] == []
+
+    # one player only, standing still the whole time: no rally, zero in-play time
+    still = make_track(np.tile([[3.0, 3.0]], (F, 1)))
+    res = analyse(Tracking(t, np.arange(F), [still]))
+    p = res["players"][0]
+    assert res["rallies"] == [] and p["in_play_s"] == 0 and p["distance_m"] == 0 and p["mean_speed_mps"] == 0
+    render_card(p, res["_smoothed"][0][0], res["_in_play"], tmp_path / "still.png")
+
+    # a track that is never seen
+    ghost = make_track(np.full((F, 2), np.nan))
+    res = analyse(Tracking(t, np.arange(F), [ghost]))
+    assert res["players"][0]["distance_m"] == 0
