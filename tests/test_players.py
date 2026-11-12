@@ -1,7 +1,7 @@
 import numpy as np
 
 from badminton.court import CourtCalibration
-from badminton.players import FAR, NEAR, foot_points, select_players
+from badminton.players import FAR, NEAR, court_box_filter, foot_points, select_players
 from badminton.pose import PoseResult
 from conftest import H, W, fake_person, marker_pixels
 
@@ -62,3 +62,10 @@ def test_without_calibration_keeps_most_confident(camera):
 
 def test_empty(camera):
     assert len(select_players(PoseResult.empty(), None).pose) == 0
+
+
+def test_box_filter_drops_people_off_court_before_pose(camera):
+    calib = CourtCalibration(marker_pixels(camera, SIX), (W, H))
+    pose = make_pose(camera, [(1.5, 2.0), (4.5, 11.5), (-3.5, 4.0), (3.0, -4.0), (7.0, 12.0)])
+    keep = court_box_filter(calib)(pose.bboxes)
+    assert keep.tolist() == [True, True, False, False, True]

@@ -44,7 +44,7 @@ class FakeEstimator:
         self.calls = 0
         self.rois = []
 
-    def __call__(self, frame, roi=None):
+    def __call__(self, frame, roi=None, box_filter=None):
         t = self.calls * 0.05
         self.calls += 1
         self.rois.append(roi)

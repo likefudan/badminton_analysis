@@ -13,6 +13,7 @@ list that was actually applied is reported for every model.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -138,11 +139,25 @@ class PoseEstimator:
         self.pose = RTMPose(pose_model or pose_url, model_input_size=pose_size, device="cpu")
         self.providers = {}
         for name, tool in (("det", self.det), ("pose", self.pose)):
-            tool.session = _make_session(tool.onnx_model, self.device)
+            # rtmlib feeds the pose model one person at a time; pinning the
+            # dynamic batch dimension to 1 lets Core ML compile the whole graph.
+            tool.session = _make_session(tool.onnx_model, self.device, fixed_dims={"batch": 1})
             self.providers[name] = tool.session.get_providers()
         self.timing = Timing()
 
-    def __call__(self, frame: np.ndarray, roi: tuple[int, int, int, int] | None = None) -> PoseResult:
+    def __call__(
+        self,
+        frame: np.ndarray,
+        roi: tuple[int, int, int, int] | None = None,
+        box_filter: Callable[[np.ndarray], np.ndarray] | None = None,
+    ) -> PoseResult:
+        """Detect people (inside `roi` if given), then estimate pose.
+
+        `box_filter(boxes) -> bool mask` drops boxes before the pose model runs.
+        The pose model costs a few ms per person and a broadcast or club frame
+        holds many people (umpire, line judges, crowd), so filtering first is
+        much faster than estimating everyone and selecting afterwards.
+        """
         t0 = time.perf_counter()
         if roi is not None:
             x0, y0, x1, y1 = roi
@@ -151,6 +166,8 @@ class PoseEstimator:
             boxes[:, [1, 3]] += y0
         else:
             boxes = np.asarray(self.det(frame), dtype=np.float64).reshape(-1, 4)
+        if box_filter is not None and len(boxes):
+            boxes = boxes[np.asarray(box_filter(boxes), dtype=bool)]
         t1 = time.perf_counter()
         if len(boxes) == 0:
             result = PoseResult.empty()
@@ -165,9 +182,11 @@ class PoseEstimator:
         return result
 
 
-def _make_session(path: str, device: str):
+def _make_session(path: str, device: str, fixed_dims: dict[str, int] | None = None):
     import onnxruntime as ort
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    for dim, value in (fixed_dims or {}).items():
+        opts.add_free_dimension_override_by_name(dim, value)
     return ort.InferenceSession(path, sess_options=opts, providers=provider_config(device))

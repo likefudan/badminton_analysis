@@ -11,14 +11,14 @@ from typing import Callable, Protocol
 import numpy as np
 
 from .court import CourtCalibration, detection_roi
-from .players import Players, select_players
+from .players import Players, court_box_filter, select_players
 from .pose import PoseResult
 from .render import draw_court, draw_players, draw_roi, draw_text
 from .video import VideoWriter, probe, read_frames
 
 
 class Estimator(Protocol):
-    def __call__(self, frame: np.ndarray, roi=None) -> PoseResult: ...
+    def __call__(self, frame: np.ndarray, roi=None, box_filter=None) -> PoseResult: ...
 
 
 @dataclass
@@ -59,6 +59,7 @@ def run_skeleton(
     max_frames = int(round(opts.duration_s * fps)) if opts.duration_s else None
     total = max_frames or max(0, info.frames - start)
     roi = detection_roi(calib) if (calib is not None and opts.use_roi) else None
+    box_filter = court_box_filter(calib) if calib is not None else None
     P = max(opts.max_persons, 2 * opts.players_per_side)
 
     rec = {k: [] for k in ("frame", "valid", "bbox", "keypoints", "scores", "court_xy", "side")}
@@ -73,7 +74,7 @@ def run_skeleton(
     try:
         for i, frame in read_frames(video, start, max_frames):
             if (i - start) % opts.stride == 0:
-                last = select_players(estimator(frame, roi), calib, opts.players_per_side)
+                last = select_players(estimator(frame, roi, box_filter), calib, opts.players_per_side)
                 _record(rec, i, last, P)
             if writer:
                 if opts.draw_court and calib is not None:

@@ -144,19 +144,21 @@ def cmd_skeleton(a) -> int:
 
 def cmd_bench(a) -> int:
     from .court import CourtCalibration, detection_roi
+    from .players import court_box_filter
     from .pose import PoseEstimator
     from .video import read_frames
 
     calib = CourtCalibration.load(a.court) if a.court else None
     roi = detection_roi(calib) if calib else None
+    keep = court_box_filter(calib) if calib else None
     frames = [f for _, f in read_frames(a.video, 0, a.frames)]
     results = {}
     for dev in a.devices.split(","):
         est = PoseEstimator(mode=a.mode, device=dev.strip())
-        est(frames[0], roi)  # warm-up: Core ML compiles the model on first run
+        est(frames[0], roi, keep)  # warm-up: Core ML compiles the model on first run
         est.timing = type(est.timing)()
         for f in frames:
-            est(f, roi)
+            est(f, roi, keep)
         results[f"{dev}->{est.device}"] = est.timing.summary()
         print(f"{dev}（{est.device}，{est.providers['det'][0]}）：{est.timing.summary()}")
     print(json.dumps(results, ensure_ascii=False, indent=2))

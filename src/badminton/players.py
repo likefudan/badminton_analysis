@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -81,3 +82,20 @@ def select_players(
         chosen.extend(cand[order][:players_per_side].tolist())
     idx = np.array(chosen, dtype=int)
     return Players(pose.select(idx), xy[idx], side[idx])
+
+
+def court_box_filter(
+    calib: CourtCalibration, side_margin: float = 1.5, end_margin: float = 2.5
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Box filter for PoseEstimator: keep boxes whose bottom centre is near the court.
+
+    Applied before the pose model, so it uses the box bottom instead of the
+    ankles; the margins are 0.5 m wider than select_players' so a box whose
+    bottom edge sits a little off the feet is not dropped by mistake.
+    """
+
+    def keep(boxes: np.ndarray) -> np.ndarray:
+        bottom = np.stack([(boxes[:, 0] + boxes[:, 2]) / 2, boxes[:, 3]], axis=1)
+        return in_play_area(calib.to_court(bottom), side_margin, end_margin)
+
+    return keep
