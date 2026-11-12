@@ -271,15 +271,22 @@ class ShuttleTiming:
                 f"另加背景图 {self.median_s:.1f} 秒；每帧 ms：{parts}")
 
 
-def _reader(video, max_frames, method, q, busy):
+def _reader(video, max_frames, method, q, busy, step=1):
     """Decode + resize in a separate process. Core ML's predict() keeps Python's
     GIL while it runs, so a thread could not overlap with it; a process can.
-    Frames travel as uint8 (440 kB each); `busy` accumulates seconds spent."""
+    Frames travel as uint8 (440 kB each); `busy` accumulates seconds spent.
+    Only every `step`-th frame is sent. An exception is sent as ("error", text)
+    so the caller fails instead of silently getting a shorter result."""
     cap = cv2.VideoCapture(str(video))
-    n = 0
+    i = 0
     try:
-        while max_frames is None or n < max_frames:
+        while max_frames is None or i < max_frames:
             t0 = time.perf_counter()
+            if i % step:
+                if not cap.grab():
+                    break
+                i += 1
+                continue
             ok, f = cap.read()
             if not ok:
                 break
@@ -287,24 +294,35 @@ def _reader(video, max_frames, method, q, busy):
             with busy.get_lock():
                 busy.value += time.perf_counter() - t0
             q.put(small)
-            n += 1
+            i += 1
+    except Exception as e:  # noqa: BLE001 - reported to the parent
+        q.put(("error", f"{type(e).__name__}: {e}"))
     finally:
         cap.release()
         q.put(None)
 
 
 def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "ALL", inpaint: bool = True,
-                  max_frames: int | None = None, progress=None, resize: str = "pil"):
-    """Returns (rows, timing); rows = list of (frame, visibility, x, y) in video pixels."""
+                  max_frames: int | None = None, progress=None, resize: str = "pil", frame_step: int = 1):
+    """Returns (rows, timing); rows = list of (frame, visibility, x, y) in video pixels, one per video frame.
+
+    frame_step=2 feeds every second frame to the models: TrackNetV3 was trained
+    on 30 fps footage, so a 60 fps video looks like it does in training (the
+    shuttle moves twice as far between the frames the model sees). The skipped
+    frames are filled by linear interpolation between their neighbours when
+    both have the shuttle."""
     import multiprocessing as mp
     import queue
 
     tm = ShuttleTiming()
     tracknet, inpaintnet = load_models(tracknet_dir, compute_units)
     cap = cv2.VideoCapture(str(video))
-    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ok, first = cap.read()  # size of the decoded frame: a phone video's rotation flag is already applied
     cap.release()
+    if not ok:
+        raise RuntimeError(f"读不出视频画面：{video}")
+    h, w = first.shape[:2]
     sx, sy = w / WIDTH, h / HEIGHT
 
     t = time.perf_counter()
@@ -349,7 +367,7 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     ctx = mp.get_context("spawn")
     q = ctx.Queue(maxsize=32)
     busy = ctx.Value("d", 0.0)
-    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy), daemon=True)
+    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy, frame_step), daemon=True)
     reader.start()
     n = 0
     last = None
@@ -362,6 +380,9 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
             continue
         if item is None:
             break
+        if isinstance(item, tuple):
+            reader.join()
+            raise RuntimeError(f"读视频时出错（第 {n * frame_step} 帧附近）：{item[1]}")
         # CHW, 0..1 as the model expects. Must be C-contiguous: astype() keeps the
         # transposed layout, and Core ML converts a non-contiguous input 2.4x slower.
         last = np.ascontiguousarray(item.transpose(2, 0, 1)).astype(np.float32) / 255
@@ -370,7 +391,7 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         if len(frames) == SEQ_LEN:
             run_window()
         if progress:
-            progress(n, max_frames or n_total, time.perf_counter() - wall)
+            progress(n, (max_frames or n_total) // frame_step, time.perf_counter() - wall)
     reader.join()
     tm.seconds["decode+resize（并行）"] = busy.value
     if 0 < n < SEQ_LEN:  # shorter than one window: pad with the last frame, like the reference
@@ -392,8 +413,27 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         xs, ys, vis = _inpaint(inpaintnet, xs, ys, vis, w, h)
         tm.seconds["inpaint"] += time.perf_counter() - t0
     tm.wall_s = time.perf_counter() - wall
+    if frame_step > 1:
+        return expand_rows(xs, ys, vis, frame_step, max_frames or n_total), tm
     rows = [(i, int(vis[i]), int(xs[i]), int(ys[i])) for i in range(n)]
     return rows, tm
+
+
+def expand_rows(xs, ys, vis, step: int, n_frames: int) -> list:
+    """Results for every `step`-th frame -> one row per video frame; skipped frames
+    interpolated when the shuttle is seen on both sides, otherwise not seen."""
+    rows = []
+    last = (len(xs) - 1) * step
+    for f in range(min(n_frames, last + 1)):
+        k, r = divmod(f, step)
+        if r == 0:
+            rows.append((f, int(vis[k]), int(xs[k]), int(ys[k])))
+        elif vis[k] and vis[k + 1]:
+            a = r / step
+            rows.append((f, 1, int(round((1 - a) * xs[k] + a * xs[k + 1])), int(round((1 - a) * ys[k] + a * ys[k + 1]))))
+        else:
+            rows.append((f, 0, 0, 0))
+    return rows
 
 
 def _inpaint(model, xs, ys, vis, w, h):

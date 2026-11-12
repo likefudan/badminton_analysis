@@ -52,3 +52,14 @@ def test_inpaint_mask_fills_gaps_but_not_exits_at_the_top():
     y = np.array([200, 210, 0, 0, 220, 15, 0, 0, 0, 230, 240])  # second gap starts at the top edge
     m = inpaint_mask(y, vis, th_h=30)
     assert m.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+
+
+def test_expand_rows_interpolates_skipped_frames():
+    from badminton.shuttle import expand_rows
+
+    xs, ys, vis = np.array([10, 20, 0, 40]), np.array([100, 110, 0, 130]), np.array([1, 1, 0, 1])
+    rows = expand_rows(xs, ys, vis, 2, 100)
+    assert [r[0] for r in rows] == list(range(7))
+    assert rows[1] == (1, 1, 15, 105)  # between two seen frames
+    assert rows[3] == (3, 0, 0, 0) and rows[5] == (5, 0, 0, 0)  # next to a frame without shuttle
+    assert rows[6] == (6, 1, 40, 130)
