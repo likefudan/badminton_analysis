@@ -114,11 +114,27 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--cuts")
     _model_args(s)
 
+    s = sub.add_parser("review", help="第 4 步：AI 赛后点评（大模型只读程序算出的数字，不看视频）")
+    s.add_argument("inputs", nargs="+", metavar="ANALYSIS_JSON", help="movement.json，可再加 positioning.json")
+    s.add_argument("--ask", help="追问一个问题（沿用同一份数据和已有的点评）")
+    s.add_argument("--previous", help="上一次的 review.summary.json，用来比较")
+    s.add_argument("--model", default=None, help="Anthropic 模型，默认 claude-sonnet-5-5")
+    s.add_argument("--court", help="court.json：算出相机高度和每人的位置误差，写进数据质量说明")
+    s.add_argument("--shuttle", help="羽毛球轨迹 CSV：每个回合里球被检测到的比例（需要 --video 或 --fps）")
+    s.add_argument("--video", help="分析用的视频，只用来读帧率")
+    s.add_argument("--fps", type=float, help="羽毛球 CSV 的帧率")
+    s.add_argument("--shuttle-offset", type=float, default=0.0, help="羽毛球 CSV 第 0 帧在统计时间轴上的秒数")
+    s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%），写进数据质量说明")
+    s.add_argument("--response", help="把聊天模型的回答（文本文件）导入，生成 Markdown 和 HTML 报告")
+    s.add_argument("--prompt-only", action="store_true", help="有 API key 也不调用，只写提示词文件")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和第一个输入同目录")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
-            "stabilize": cmd_stabilize, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
+            "stabilize": cmd_stabilize, "positioning": cmd_positioning, "analyze": cmd_analyze,
+            "review": cmd_review}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -582,6 +598,98 @@ def cmd_shuttle(a) -> int:
         ov = out.with_suffix(".mp4")
         draw_shuttle_video(video, rows, ov)
         print(f"轨迹视频 {ov}")
+    return 0
+
+
+def cmd_review(a) -> int:
+    from . import review as rv
+
+    paths = [Path(x) for x in a.inputs]
+    loaded = [(x, json.loads(x.read_text())) for x in paths]
+    main = next(((x, d) for x, d in loaded if rv.is_movement(d)), None)
+    if main is None:
+        print("输入里没有跑动统计（badminton movement 生成的 .movement.json）")
+        return 1
+    path, movement = main
+    stem = rv.stem_of(path)
+    extras = {x.name[len(rv.stem_of(x)):].strip(".").removesuffix(".json") or x.stem: d
+              for x, d in loaded if x is not path}
+    calib = None
+    if a.court:
+        from .court import CourtCalibration
+
+        calib = CourtCalibration.load(a.court)
+    shuttle = None
+    if a.shuttle:
+        fps = a.fps
+        if not fps and a.video:
+            from .video import probe
+
+            fps = probe(a.video).fps
+        if not fps:
+            print("--shuttle 需要帧率：加 --video <分析用的视频> 或 --fps 30")
+            return 1
+        shuttle = rv.shuttle_stats(a.shuttle, fps, movement.get("rallies", []), a.shuttle_offset)
+    summary = rv.build_summary(movement, source=stem, extras=extras, calib=calib, shuttle=shuttle,
+                               shuttle_accuracy_pct=a.shuttle_accuracy)
+    previous = json.loads(Path(a.previous).read_text()) if a.previous else None
+    out_dir = Path(a.out_dir) if a.out_dir else path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = lambda suffix: out_dir / f"{stem}.review.{suffix}"  # noqa: E731
+    out("summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1))
+    model = a.model or rv.DEFAULT_MODEL
+    use_api = rv.have_api_key() and not a.prompt_only
+
+    def paste_instructions(prompt_path: Path, then: str) -> None:
+        print(f"提示词已写入 {prompt_path}（只有数字和文字，不含视频和图片）")
+        if not use_api and not a.prompt_only:
+            print("没有设置 ANTHROPIC_API_KEY，所以没有调用模型。两种办法：")
+            print('  1. export ANTHROPIC_API_KEY=...（并安装 pip install -e ".[review]"），再运行一次；')
+            print(f"  2. 把这个文件的全部内容贴进任意聊天模型，{then}")
+
+    if a.ask:
+        report_path = out("md")
+        report = report_path.read_text() if report_path.exists() else None
+        system, messages = rv.build_messages(summary, previous, report, a.ask)
+        prompt_path = out("ask.prompt.txt")
+        prompt_path.write_text(rv.prompt_file_text(system, messages))
+        if not use_api:
+            paste_instructions(prompt_path, "直接看它的回答。")
+            return 0
+        try:
+            answer = rv.call_anthropic(system, messages, model)
+        except rv.ReviewError as e:
+            print(f"{e}\n提示词在 {prompt_path}，可以贴进任意聊天模型。")
+            return 1
+        with open(out("qa.md"), "a") as f:
+            f.write(f"## 问：{a.ask.strip()}\n\n{answer}\n\n")
+        print(answer)
+        print(f"\n（{model} 回答；已追加到 {out('qa.md')}）")
+        return 0
+
+    system, messages = rv.build_messages(summary, previous)
+    prompt_path = out("prompt.txt")
+    prompt_path.write_text(rv.prompt_file_text(system, messages))
+    if a.response:
+        body, origin = Path(a.response).read_text(), f"点评文字从 {Path(a.response).name} 导入（聊天模型按提示词文件生成）"
+    elif use_api:
+        try:
+            body = rv.call_anthropic(system, messages, model)
+        except rv.ReviewError as e:
+            print(f"{e}\n提示词在 {prompt_path}，可以贴进任意聊天模型，再用 --response 导入回答。")
+            return 1
+        origin = f"由 {model} 通过 Anthropic API 生成"
+    else:
+        paste_instructions(prompt_path, f"把回答存成文本文件，再运行：badminton review {path} --response 回答.md")
+        return 0
+    missing = rv.missing_sections(body)
+    md = rv.report_markdown(summary, body, origin)
+    out("md").write_text(md)
+    out("html").write_text(rv.report_html(md, rv.find_cards(path, summary), f"赛后点评：{stem}"))
+    print(md)
+    if missing:
+        print(f"注意：回答里缺少这些小节：{'、'.join(missing)}")
+    print(f"报告：{out('md')}、{out('html')}；摘要：{out('summary.json')}")
     return 0
 
 
