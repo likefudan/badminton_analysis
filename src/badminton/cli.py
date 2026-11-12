@@ -93,12 +93,6 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
                    help="缩小画面的方法：pil 和 TrackNetV3 原版一样（默认）；area 稍快但位置稍有偏差")
 
-    s = sub.add_parser("overlay", help="把羽毛球轨迹画到视频上（通常是 skeleton 输出的骨架视频），得到球场线+骨架+球轨迹的合成视频")
-    s.add_argument("video", help="底图视频，例如 <视频名>.skeleton.mp4")
-    s.add_argument("--shuttle", required=True, help="badminton shuttle 输出的 CSV")
-    s.add_argument("-o", "--output", help="默认 <视频名>.combined.mp4")
-    s.add_argument("--tail", type=int, default=15, help="轨迹尾巴保留几帧")
-
     s = sub.add_parser("stabilize", help="手持或晃动的视频：把每一帧对齐到参考帧，之后才能用一次标定")
     s.add_argument("video")
     s.add_argument("output")
@@ -124,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
-            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
+            "stabilize": cmd_stabilize, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -533,21 +527,6 @@ def cmd_analyze(a) -> int:
     print(f"\n全部结果在 {out_dir}/；汇总给 AI 点评用的数据：{out}")
     if not players.exists():
         print(f'看 {players.with_suffix(".png")} 里的编号，用 --names "1=...,2=..." 再运行一次就能带上名字（骨架不会重跑）')
-    return 0
-
-
-def cmd_overlay(a) -> int:
-    import csv
-
-    from .render import draw_shuttle_video
-
-    with open(a.shuttle) as f:
-        rows = [(int(r["Frame"]), int(r["Visibility"]), int(float(r["X"])), int(float(r["Y"]))) for r in csv.DictReader(f)]
-    video = Path(a.video)
-    stem = video.stem[: -len(".skeleton")] if video.stem.endswith(".skeleton") else video.stem
-    out = Path(a.output or video.with_name(f"{stem}.combined.mp4"))
-    draw_shuttle_video(video, rows, out, tail=a.tail)
-    print(f"已写入 {out}")
     return 0
 
 

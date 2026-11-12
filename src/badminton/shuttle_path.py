@@ -62,13 +62,18 @@ def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, f
 
 def airspace_mask(calib, margin_m: float = 1.0, height_m: float = AIR_HEIGHT_M) -> np.ndarray:
     """Image mask of the volume above the court (plus margins) up to `height_m`."""
+    from .camera import camera_from_calibration
+
+    return airspace_mask_for_camera(camera_from_calibration(calib), margin_m, height_m)
+
+
+def airspace_mask_for_camera(cam, margin_m: float = 1.0, height_m: float = AIR_HEIGHT_M) -> np.ndarray:
+    """The same mask for a known camera (also used by scripts/recording_planner.py)."""
     import cv2
 
-    from .camera import camera_from_calibration
     from .court import LENGTH, WIDTH
 
-    cam = camera_from_calibration(calib)
-    w, h = calib.frame_size
+    w, h = cam.size
     # sample the volume densely and keep what is in front of the camera (a low camera
     # may stand inside the margins); the image region is the hull of those points
     g = np.stack(np.meshgrid(np.linspace(-margin_m, WIDTH + margin_m, 9),
