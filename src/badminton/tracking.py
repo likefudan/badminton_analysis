@@ -37,6 +37,8 @@ import numpy as np
 from .court import CourtCalibration
 
 MAX_SPEED = 8.0  # m/s: faster than any badminton player moves on court
+REACQUIRE_S = 3.0  # after this long without the player, take whoever step 1 found
+SAME_PERSON_HIST = 0.25  # torso colour distance below which a far jump is still the same person
 MAX_GAP_S = 0.8  # bridge missing / airborne stretches up to this long (a jump smash with take-off and landing ~0.7 s)
 AIRBORNE_RATIO = 1.06  # body-height/floor-scale ratio above the player's upright level by this factor
 _SHOULDERS, _HIPS, _ANKLES = (5, 6), (11, 12), (15, 16)
@@ -53,6 +55,7 @@ class Track:
     airborne: np.ndarray  # (F,) detected but judged off the ground (or implausible jump)
     det_index: np.ndarray  # (F,) row in the step-1 arrays, -1 when not seen
     name: str = ""
+    meas_cov: np.ndarray | None = None  # (F, 2, 2) uncertainty of xy in m^2 (NaN where interpolated / unknown)
 
 
 @dataclass
@@ -231,8 +234,16 @@ def track_players(
                     cost[a, b] = geo + appearance_weight * app
             for a, b in _assign(cost):
                 tr, p = live[tracks[a]], dets[b]
+                feat = None if features is None else features[i, p]
+                if tr.last_xy is not None and tr.last_t is not None and t - tr.last_t < REACQUIRE_S:
+                    reach = MAX_SPEED * (t - tr.last_t) + 0.5
+                    if np.linalg.norm(court_xy[i, p] - tr.last_xy) > reach and \
+                            _hist_distance(tr.hist, feat) > SAME_PERSON_HIST:
+                        # nobody runs that fast and the shirt does not match: someone else
+                        # (step 1 picked a bystander while the player was missed)
+                        continue
                 tr.det[i] = p
-                tr.update(court_xy[i, p], t, None if features is None else features[i, p])
+                tr.update(court_xy[i, p], t, feat)
 
     out = Tracking(time_s, np.asarray(data["frame"]), cuts=cuts)
     for tr in live:
@@ -257,10 +268,37 @@ def _finish(tr: _Live, data: dict, calib: CourtCalibration | None, cuts: np.ndar
     airborne = np.zeros(F, bool)
     if calib is not None:
         airborne |= _airborne_by_scale(raw, tr.det, data, calib)
-    ground = seen & ~airborne
-    airborne |= seen & _speed_outliers(raw, ground, time_s, cuts)
-    xy = _bridge(raw, seen & ~airborne, time_s, cuts)
-    return Track(0, tr.side, raw, xy, seen, airborne & seen, tr.det)
+    ground = seen & ~airborne & ~_parked_outside(raw, seen, time_s)
+    ground &= ~_glitch_islands(raw, ground, time_s, cuts)
+    airborne |= seen & ~ground
+    airborne |= seen & _speed_outliers(raw, airborne == 0, time_s, cuts)
+    good = seen & ~airborne
+    xy = _bridge(raw, good, time_s, cuts)
+    cov = measurement_cov(raw, good, calib) if calib is not None else None
+    return Track(0, tr.side, raw, xy, seen, airborne & seen, tr.det, meas_cov=cov)
+
+
+KPT_SIGMA_PX = 4.0  # typical ankle keypoint error, pixels (1080p)
+
+
+def measurement_cov(xy: np.ndarray, good: np.ndarray, calib: CourtCalibration,
+                    sigma_px: float = KPT_SIGMA_PX) -> np.ndarray:
+    """Covariance (m^2) of each floor position: an isotropic `sigma_px` pixel error
+    pushed through the image->court homography at that point. Far from a low camera
+    one pixel up the image spans many centimetres along the court, so far-court
+    positions are much less certain in that direction than near ones."""
+    F = len(xy)
+    cov = np.full((F, 2, 2), np.nan)
+    idx = np.flatnonzero(good & np.isfinite(xy).all(1))
+    if len(idx) == 0:
+        return cov
+    img = calib.to_image(xy[idx])
+    e = 0.5
+    cx = (calib.to_court(img + (e, 0)) - calib.to_court(img - (e, 0))) / (2 * e)  # d court / d u
+    cy = (calib.to_court(img + (0, e)) - calib.to_court(img - (0, e))) / (2 * e)  # d court / d v
+    J = np.stack([cx, cy], axis=2)  # (n, 2, 2): columns = d/du, d/dv
+    cov[idx] = sigma_px**2 * J @ J.transpose(0, 2, 1)
+    return cov
 
 
 def body_scale_ratio(kp: np.ndarray, sc: np.ndarray, foot_xy: np.ndarray, calib: CourtCalibration) -> float:
@@ -295,6 +333,62 @@ def _airborne_by_scale(raw, det, data, calib, window_s: float = 6.0, upright_pct
     hi = np.searchsorted(t, t + window_s / 2, side="right")
     for i in np.flatnonzero(ok):
         out[i] = r[i] > AIRBORNE_RATIO * np.nanpercentile(r[lo[i]:hi[i]], upright_pct)
+    return out
+
+
+PARKED_S = 0.5  # standing still this long outside the lines: not the player (during a rally)
+PARKED_RADIUS_M = 0.4  # far-court positions jitter ~0.2 m
+OUTSIDE_M = 0.3
+
+
+def _parked_outside(raw, seen, t) -> np.ndarray:
+    """Frames where the 'player' stands still outside the court lines for more than
+    PARKED_S. That is almost always someone else (a waiting player or spectator
+    behind the baseline) whom step 1 picked while the real player was missed;
+    a player in a rally does not stand still outside the lines."""
+    from .court import LENGTH, WIDTH
+
+    out = np.zeros(len(raw), bool)
+    x, y = raw[:, 0], raw[:, 1]
+    with np.errstate(invalid="ignore"):
+        outside = seen & ((x < -OUTSIDE_M) | (x > WIDTH + OUTSIDE_M) | (y < -OUTSIDE_M) | (y > LENGTH + OUTSIDE_M))
+    idx = np.flatnonzero(outside)
+    k = 0
+    while k < len(idx):
+        m = k
+        while m + 1 < len(idx) and t[idx[m + 1]] - t[idx[m]] <= MAX_GAP_S and \
+                np.linalg.norm(raw[idx[m + 1]] - raw[idx[k:m + 1]].mean(0)) <= PARKED_RADIUS_M:
+            m += 1
+        if t[idx[m]] - t[idx[k]] >= PARKED_S:
+            out[idx[k]:idx[m] + 1] = outside[idx[k]:idx[m] + 1]
+        k = m + 1
+    return out
+
+
+GLITCH_MAX_S = 0.6  # a stretch this short between two impossible jumps is someone else
+
+
+def _glitch_islands(raw, good, t, cuts) -> np.ndarray:
+    """Short stretches that start and end with an impossible jump (faster than
+    MAX_SPEED) are a different person picked by step 1 while the player was
+    missed (a bystander behind the baseline, a player of the next court).
+    Returns the frames to drop."""
+    idx = np.flatnonzero(good)
+    if len(idx) < 3:
+        return np.zeros(len(raw), bool)
+    seg = np.cumsum(cuts)
+    dt = np.diff(t[idx])
+    jump = (np.hypot(*np.diff(raw[idx], axis=0).T) > MAX_SPEED * dt + 0.3) & (seg[idx[1:]] == seg[idx[:-1]])
+    out = np.zeros(len(raw), bool)
+    starts = np.flatnonzero(jump)  # jump between idx[k] and idx[k+1]
+    for a, b in zip(starts[:-1], starts[1:]):
+        lo, hi = idx[a + 1], idx[b]  # island = idx[a+1 .. b]
+        if t[hi] - t[lo] <= GLITCH_MAX_S:
+            # the island is the glitch only if the positions on both sides agree with each other
+            before, after = raw[idx[a]], raw[idx[b + 1]]
+            gap = t[idx[b + 1]] - t[idx[a]]
+            if np.linalg.norm(after - before) <= MAX_SPEED * gap + 0.3:
+                out[lo:hi + 1] = True
     return out
 
 

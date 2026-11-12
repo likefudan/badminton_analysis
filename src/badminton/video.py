@@ -65,20 +65,36 @@ def probe(path: str | Path) -> VideoInfo:
     return info
 
 
+def _has_filter(name: str) -> bool:
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+    return any(line.split()[1:2] == [name] for line in out.splitlines() if len(line.split()) > 1)
+
+
 def to_sdr(src: str | Path, dst: str | Path, height: int | None = None) -> None:
     """Convert an HDR (HLG/PQ) iPhone clip to SDR BT.709 H.264 so colours are not washed out.
 
+    Uses zscale + tonemap when ffmpeg is built with zimg; Homebrew's ffmpeg is
+    not, so on a Mac it falls back to VideoToolbox (scale_vt converts the
+    transfer function and primaries with Apple's own tone mapping).
     Optionally downscale to `height` (e.g. 1080 for 4K footage).
     """
-    scale = f"zscale=w=-2:h={height}," if height else ""
-    vf = (
-        scale
-        + "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
-        "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
-    )
+    if _has_filter("zscale"):
+        scale = f"zscale=w=-2:h={height}," if height else ""
+        vf = (scale + "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+              "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+        pre = []
+    elif _has_filter("scale_vt"):
+        size = f"w=-2:h={height}:" if height else ""
+        vf = (f"scale_vt={size}color_matrix=bt709:color_primaries=bt709:color_transfer=bt709,"
+              "hwdownload,format=p010le,format=yuv420p")
+        pre = ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
+    else:
+        raise RuntimeError("这个 ffmpeg 既没有 zscale 也没有 scale_vt，无法把 HDR 转成 SDR")
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf", vf,
-         "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", str(dst)],
+        ["ffmpeg", "-y", "-v", "error", *pre, "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+         "-c:a", "aac", "-b:a", "160k", str(dst)],
         check=True,
     )
 

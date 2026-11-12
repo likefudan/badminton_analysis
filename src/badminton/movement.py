@@ -44,8 +44,64 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
-def smooth_track(xy: np.ndarray, t: np.ndarray, window_s: float = SMOOTH_S) -> tuple[np.ndarray, np.ndarray]:
-    """Smoothed position and velocity (m/s), per continuous (non-NaN) stretch."""
+ACCEL_PSD = 10.0  # m^2/s^3, white-acceleration noise of the constant-velocity model; tuned on synthetic rallies (see tests)
+
+
+def kalman_smooth(xy: np.ndarray, t: np.ndarray, cov: np.ndarray, q: float = ACCEL_PSD) -> tuple[np.ndarray, np.ndarray]:
+    """Constant-velocity Kalman filter + Rauch-Tung-Striebel smoother, per continuous stretch.
+
+    Each position is weighted by its own covariance `cov` (F, 2, 2), so precise
+    near-court positions are followed closely and imprecise far-court ones are
+    smoothed along the direction in which they are uncertain. Frames with a
+    position but no covariance (interpolated across a jump) get a loose one.
+    """
+    pos = np.full_like(xy, np.nan)
+    vel = np.full_like(xy, np.nan)
+    I2 = np.eye(2)
+    for a, b in _runs(np.isfinite(xy).all(1)):
+        n = b - a
+        if n < 2:
+            pos[a:b], vel[a:b] = xy[a:b], 0.0
+            continue
+        tt = t[a:b]
+        R = cov[a:b].copy()
+        fallback = np.nanmedian(R, axis=0) if np.isfinite(R).any() else 0.05 * I2
+        loose = ~np.isfinite(R).all(axis=(1, 2))
+        R[loose] = 4 * fallback + 0.01 * I2
+        xs = np.zeros((n, 4)); Ps = np.zeros((n, 4, 4))
+        xp = np.zeros((n, 4)); Pp = np.zeros((n, 4, 4))
+        x = np.r_[xy[a], 0.0, 0.0]
+        P = np.diag([R[0, 0, 0], R[0, 1, 1], 9.0, 9.0])
+        Fs = []
+        for k in range(n):
+            if k:
+                dt = tt[k] - tt[k - 1]
+                F_ = np.block([[I2, dt * I2], [np.zeros((2, 2)), I2]])
+                Q = q * np.block([[dt**3 / 3 * I2, dt**2 / 2 * I2], [dt**2 / 2 * I2, dt * I2]])
+                x = F_ @ x
+                P = F_ @ P @ F_.T + Q
+                Fs.append(F_)
+            xp[k], Pp[k] = x, P
+            S = P[:2, :2] + R[k]
+            K = P[:, :2] @ np.linalg.inv(S)
+            x = x + K @ (xy[a + k] - x[:2])
+            P = P - K @ P[:2, :]
+            xs[k], Ps[k] = x, P
+        for k in range(n - 2, -1, -1):  # RTS backward pass
+            C = Ps[k] @ Fs[k].T @ np.linalg.inv(Pp[k + 1])
+            xs[k] = xs[k] + C @ (xs[k + 1] - xp[k + 1])
+            Ps[k] = Ps[k] + C @ (Ps[k + 1] - Pp[k + 1]) @ C.T
+        pos[a:b], vel[a:b] = xs[:, :2], xs[:, 2:]
+    return pos, vel
+
+
+def smooth_track(xy: np.ndarray, t: np.ndarray, window_s: float = SMOOTH_S,
+                 cov: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Smoothed position and velocity (m/s), per continuous (non-NaN) stretch.
+    With per-frame covariances (from tracking) a Kalman smoother is used,
+    otherwise a Savitzky-Golay filter."""
+    if cov is not None and np.isfinite(cov).any():
+        return kalman_smooth(xy, t, cov)
     pos = np.full_like(xy, np.nan)
     vel = np.full_like(xy, np.nan)
     dt = float(np.median(np.diff(t))) if len(t) > 1 else 1.0
@@ -138,7 +194,7 @@ def heatmap(xy: np.ndarray, side: int, cell: float = HEAT_CELL_M, margin: float 
 
 
 def player_stats(track, t: np.ndarray, in_play: np.ndarray, rallies) -> PlayerStats:
-    pos, vel = smooth_track(track.xy, t)
+    pos, vel = smooth_track(track.xy, t, cov=getattr(track, "meas_cov", None))
     speed = np.hypot(vel[:, 0], vel[:, 1])
     ok = np.isfinite(pos).all(1)
     play = in_play & ok
@@ -172,7 +228,7 @@ def player_stats(track, t: np.ndarray, in_play: np.ndarray, rallies) -> PlayerSt
 def analyse(tracking: Tracking) -> dict:
     """Rally segmentation + per-player stats. Returns a JSON-ready dict."""
     t = tracking.time_s
-    smoothed = [smooth_track(tr.xy, t) for tr in tracking.tracks]
+    smoothed = [smooth_track(tr.xy, t, cov=getattr(tr, "meas_cov", None)) for tr in tracking.tracks]
     speeds = np.stack([np.hypot(v[:, 0], v[:, 1]) for _, v in smoothed], axis=1) if smoothed else np.zeros((len(t), 0))
     in_play = segment_rallies(speeds, t, tracking.cuts) if smoothed else np.zeros(len(t), bool)
     rallies = _runs(in_play)

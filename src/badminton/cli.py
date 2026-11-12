@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
         s.add_argument("--no-appearance", action="store_true", help="不读视频比对球衣颜色（更快，双打交叉换位时容易换错编号）")
         s.add_argument("--cuts", help="剪辑过的视频：剪辑点的时间（秒），逗号分隔；跑动不跨这些点计算。换镜头会自动识别，同一机位拼接要手动给")
+        s.add_argument("--start", type=float, default=0.0, help="从第几秒开始统计（跳过开头还在摆手机的部分）")
         if name == "label":
             s.add_argument("--names", help='直接给名字："1=小王,2=小李"；不给就在终端里逐个输入')
             s.add_argument("--time", type=float, help="用第几秒的画面标编号，默认找所有人都在场的第一帧")
@@ -89,10 +90,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
                    help="缩小画面的方法：pil 和 TrackNetV3 原版一样（默认）；area 稍快但位置稍有偏差")
 
+    s = sub.add_parser("stabilize", help="手持或晃动的视频：把每一帧对齐到参考帧，之后才能用一次标定")
+    s.add_argument("video")
+    s.add_argument("output")
+    s.add_argument("--ref-time", type=float, required=True, help="参考帧在第几秒（选一帧球场线清楚、人少挡线的）")
+    s.add_argument("--start", type=float, default=0.0)
+    s.add_argument("--duration", type=float)
+    s.add_argument("--floor-from", type=float, help="只用画面这个高度比例以下的特征点（地面），例如 0.45")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
-            "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle}[a.cmd](a)
+            "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
+            "stabilize": cmd_stabilize}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -289,6 +299,10 @@ def _tracking(a):
     if not data_path.exists():
         raise SystemExit(f"找不到 {data_path}：先运行 badminton skeleton，或用 --data 指定 .npz")
     data = load_npz(data_path)
+    if getattr(a, "start", 0.0):
+        keep = data["time_s"] >= a.start
+        data = {k: (v[keep] if isinstance(v, np.ndarray) and v.ndim and len(v) == len(keep) else v)
+                for k, v in data.items()}
     calib = CourtCalibration.load(a.court)
     if a.singles:
         per_side = 1
@@ -399,6 +413,20 @@ def cmd_movement(a) -> int:
     out_json = out_dir / f"{video.stem}.movement.json"
     out_json.write_text(json.dumps(json_ready(result), ensure_ascii=False, indent=1))
     print(f"统计已写入 {out_json}")
+    return 0
+
+
+def cmd_stabilize(a) -> int:
+    import numpy as np
+
+    from .pipeline import print_progress
+    from .stabilize import stabilize
+
+    log = stabilize(a.video, a.output, a.ref_time, a.start, a.duration, progress=print_progress,
+                    floor_from=a.floor_from)
+    k = np.array(log["inliers"])
+    print(f"已写入 {a.output}：{len(k)} 帧，匹配点中位数 {np.median(k):.0f}，"
+          f"{int(np.sum(log['chained']))} 帧借助前一帧对齐（和参考帧差别太大）")
     return 0
 
 
