@@ -256,6 +256,21 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 
 目前只有合成的双打数据测过（测试里有一段脚本：先前后站位、中途前后换位，再左右站位、中途左右换位）。真实的双打录像到了以后，再检查阈值是否合适。
 
+## 剪掉死球时间
+
+```bash
+badminton cut match.mp4 -o match_analysis/
+#   match.rallies.mp4   只有回合的精简视频
+#   match.longest.mp4   最长的 3 个回合（--top 改数量，--top 0 不出）
+```
+
+用的是跑动卡片那一步切出的回合（`match.movement.json`），`badminton analyze` 跑完会自动剪（`--no-cut` 关掉）。需要 ffmpeg。
+
+- 回合切分是靠球员跑动判断的，发球那一两秒大家还没动，所以开头会晚 1–2 秒。剪的时候每个回合往前多留 2 秒、往后多留 1 秒（`--pre`、`--post`）。
+- 留白之后相隔不到 1 秒的两段直接连起来（`--merge-gap`），不会重复也不会跳一下。所以回合之间本来只隔 3 秒左右的录像，剪完变化不大。
+- 画面左上角标「回合 3/7 · 36 秒」，`--no-label` 关掉。秒数是切分出来的回合长度，不含留白。
+- 重新编码，切点精确到帧，保留原声。Mac 上加 `--encoder h264_videotoolbox` 更快。
+
 ## 代码结构
 
 | 文件 | 内容 |
@@ -279,6 +294,7 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 | `src/badminton/stabilize.py` | 防抖：镜头静止时固定对齐，被碰动时跟着镜头走 |
 | `src/badminton/camera.py` | 从球场标定推出焦距和相机位置 |
 | `src/badminton/positioning.py` | 第 3 步：双打站位、轮转、搭档间距、空当、覆盖和站位卡片 |
+| `src/badminton/cut.py` | 剪掉死球时间：精简视频和最长回合集锦 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。
