@@ -70,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
         s.add_argument("--no-appearance", action="store_true", help="不读视频比对球衣颜色（更快，双打交叉换位时容易换错编号）")
         s.add_argument("--cuts", help="剪辑过的视频：剪辑点的时间（秒），逗号分隔；跑动不跨这些点计算。换镜头会自动识别，同一机位拼接要手动给")
+        s.add_argument("--start", type=float, default=0.0, help="从第几秒开始统计（跳过开头还在摆手机的部分）")
         if name == "label":
             s.add_argument("--names", help='直接给名字："1=小王,2=小李"；不给就在终端里逐个输入')
             s.add_argument("--time", type=float, help="用第几秒的画面标编号，默认找所有人都在场的第一帧")
@@ -85,10 +86,26 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-inpaint", action="store_true", help="不用 InpaintNet 补短暂丢失")
     s.add_argument("--max-frames", type=int, help="只处理前 N 帧（试跑）")
     s.add_argument("--overlay", action="store_true", help="同时输出画了轨迹的视频 <视频名>.shuttle.mp4")
+    s.add_argument("--court", help="球场标定：给了就用改进的选点（去掉静止干扰点、场地上方空间、按轨迹连续性挑点）")
+    s.add_argument("--raw-output", help="另存 TrackNetV3 原版逐帧选点的结果（用来对比）")
     s.add_argument("--frame-step", type=int, default=1,
                    help="每 N 帧送一帧给模型；60fps 视频建议 2（TrackNetV3 是用 30fps 训练的），跳过的帧用插值补")
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
                    help="缩小画面的方法：pil 和 TrackNetV3 原版一样（默认）；area 稍快但位置稍有偏差")
+
+    s = sub.add_parser("overlay", help="把羽毛球轨迹画到视频上（通常是 skeleton 输出的骨架视频），得到球场线+骨架+球轨迹的合成视频")
+    s.add_argument("video", help="底图视频，例如 <视频名>.skeleton.mp4")
+    s.add_argument("--shuttle", required=True, help="badminton shuttle 输出的 CSV")
+    s.add_argument("-o", "--output", help="默认 <视频名>.combined.mp4")
+    s.add_argument("--tail", type=int, default=15, help="轨迹尾巴保留几帧")
+
+    s = sub.add_parser("stabilize", help="手持或晃动的视频：把每一帧对齐到参考帧，之后才能用一次标定")
+    s.add_argument("video")
+    s.add_argument("output")
+    s.add_argument("--ref-time", type=float, required=True, help="参考帧在第几秒（选一帧球场线清楚、人少挡线的）")
+    s.add_argument("--start", type=float, default=0.0)
+    s.add_argument("--duration", type=float)
+    s.add_argument("--floor-from", type=float, help="只用画面这个高度比例以下的特征点（地面），例如 0.45")
 
     s = sub.add_parser("analyze", help="一键处理：标定（已有就沿用）→ 骨架 → 跑动卡片 → 双打站位报告")
     s.add_argument("video")
@@ -107,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
-            "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
+            "stabilize": cmd_stabilize, "overlay": cmd_overlay, "positioning": cmd_positioning, "analyze": cmd_analyze}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -304,6 +321,10 @@ def _tracking(a):
     if not data_path.exists():
         raise SystemExit(f"找不到 {data_path}：先运行 badminton skeleton，或用 --data 指定 .npz")
     data = load_npz(data_path)
+    if getattr(a, "start", 0.0):
+        keep = data["time_s"] >= a.start
+        data = {k: (v[keep] if isinstance(v, np.ndarray) and v.ndim and len(v) == len(keep) else v)
+                for k, v in data.items()}
     calib = CourtCalibration.load(a.court)
     if a.singles:
         per_side = 1
@@ -515,6 +536,37 @@ def cmd_analyze(a) -> int:
     return 0
 
 
+def cmd_overlay(a) -> int:
+    import csv
+
+    from .render import draw_shuttle_video
+
+    with open(a.shuttle) as f:
+        rows = [(int(r["Frame"]), int(r["Visibility"]), int(float(r["X"])), int(float(r["Y"]))) for r in csv.DictReader(f)]
+    video = Path(a.video)
+    stem = video.stem[: -len(".skeleton")] if video.stem.endswith(".skeleton") else video.stem
+    out = Path(a.output or video.with_name(f"{stem}.combined.mp4"))
+    draw_shuttle_video(video, rows, out, tail=a.tail)
+    print(f"已写入 {out}")
+    return 0
+
+
+def cmd_stabilize(a) -> int:
+    import numpy as np
+
+    from .pipeline import print_progress
+    from .stabilize import stabilize
+
+    log = stabilize(a.video, a.output, a.ref_time, a.start, a.duration, progress=print_progress,
+                    floor_from=a.floor_from)
+    segs = log["still_segments"]
+    still = sum(b - a + 1 for a, b in segs)
+    n = len(log["H"])
+    print(f"已写入 {a.output}：{n} 帧，镜头静止的 {len(segs)} 段共 {still} 帧（{100 * still / max(1, n):.0f}%），"
+          f"其余 {n - still} 帧是镜头被碰动的过渡")
+    return 0
+
+
 def cmd_shuttle(a) -> int:
     from .pipeline import print_progress
     from .shuttle import track_shuttle, write_csv
@@ -528,9 +580,19 @@ def cmd_shuttle(a) -> int:
     if a.frame_step == 1 and info.fps and info.fps > 45:
         print(f"提示：视频是 {info.fps:.0f} fps，TrackNetV3 是用 30 fps 训练的，可以试试 --frame-step 2")
     out = Path(a.output or video.with_suffix(".shuttle.csv"))
+    debug = {} if a.court else None
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
-                             frame_step=a.frame_step)
+                             frame_step=a.frame_step, debug=debug)
+    if a.raw_output:
+        write_csv(rows, a.raw_output)
+    if a.court:
+        from .court import CourtCalibration
+        from .shuttle_path import rows_from_candidates
+
+        if a.frame_step != 1:
+            raise SystemExit("--court 目前只支持 --frame-step 1")
+        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), CourtCalibration.load(a.court))
     write_csv(rows, out)
     seen = sum(r[1] for r in rows)
     print(f"已写入 {out}：{len(rows)} 帧，{seen} 帧有球（{100 * seen / max(1, len(rows)):.1f}%）")

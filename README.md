@@ -208,6 +208,26 @@ badminton shuttle match.mp4 --overlay
 
 这段转播视频接近 TrackNetV3 的训练数据（30 fps 转播）。自己用手机拍的视频（机位更低、60 fps）很可能要用自己的录像微调。
 
+## 手机录像的处理（第一段球友录像的经验）
+
+第一段球友视频是手机手持拍的：HDR、机位低（离地 1.43 米）、在球场边上斜着拍，背景里有隔壁场地、观众和一排灯，手机偶尔被碰到。针对这些情况加了下面几样：
+
+```bash
+badminton sdr IMG_8923.mov IMG_8923.mp4            # HDR 转 SDR（ffmpeg 没有 zscale 时改用 Mac 的 VideoToolbox）
+badminton stabilize IMG_8923.mp4 IMG_8923_stab.mp4 --ref-time 100 --start 33 --floor-from 0.42
+badminton calibrate IMG_8923_stab.mp4 --time 67    # 在防抖后的视频上标定一次
+badminton shuttle IMG_8923_stab.mp4 --court IMG_8923_stab.court.json   # 用改进的选点方法
+badminton movement IMG_8923_stab.mp4 --court IMG_8923_stab.court.json --data ... --start 6
+badminton overlay IMG_8923_stab.skeleton.mp4 --shuttle IMG_8923_stab.shuttle.csv   # 骨架视频上再画球的轨迹
+```
+
+- **iPhone 空间音频**：新款 iPhone 的视频第一条音轨可能是空间音频（apple_apac），ffmpeg 解不了；`sdr` 会自动改用能解的那条（通常是 AAC）。
+- **防抖**：先测出相邻帧之间镜头动了多少，把视频分成「镜头静止」和「被碰动」两类时间段。每段静止时间用同一个对齐方式（几帧结果的中位数），被碰动的几帧跟着镜头走，再平滑过渡到下一段。处理后相邻帧之间只差 0.2 像素，和原片一样稳。`--floor-from` 表示只用画面下部（地面）的特征点来对齐。
+- **跑动更准**：每个位置带着自己的精度（4 像素误差换算到球场上），用卡尔曼平滑。机位低时，远端 1 像素对应 12–17 厘米，原来的平滑会把抖动算成跑动（修正前远端多算了将近一倍）。
+- **排除场外的人**：瞬间移动不可能那么远、球衣颜色也对不上的检测，不算同一个人；在线外站着不动超过 0.5 秒的，不算球员；补空缺需要的速度超过 5 米/秒的，不补。
+- **羽毛球选点**（加 `--court` 时启用）：整段视频里经常出现候选点的位置（墙上的灯、地上的球、固定假点）直接排除；再从每帧所有候选点里挑一条最连贯的轨迹，不再逐帧选「面积最大的那块」。用户视频后半段：来回折返从 156 处降到 13 处，抽查正确率从约 48% 提到约 73%。
+- **三维相机**：从球场标定推出焦距和手机位置（`camera.py`），把网画回画面检查。机位高的时候还能把「本场地上方的空间」以外的候选点去掉；机位太低时这块空间覆盖整个画面，起不到作用。
+
 ## 第 3 步：双打站位报告和一键处理
 
 一条命令跑完前面所有步骤：
@@ -257,6 +277,9 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 | `src/badminton/movement.py` | 第 2 步：回合切分、跑动距离、速度、冲刺、站位、热力图 |
 | `src/badminton/card.py` | 第 2 步：跑动卡片 PNG |
 | `src/badminton/shuttle.py` | 羽毛球轨迹：TrackNetV3 转 Core ML、加权平均、补丢失 |
+| `src/badminton/shuttle_path.py` | 羽毛球选点：静止干扰点、场地上方空间、按轨迹连续性挑点 |
+| `src/badminton/stabilize.py` | 防抖：镜头静止时固定对齐，被碰动时跟着镜头走 |
+| `src/badminton/camera.py` | 从球场标定推出焦距和相机位置 |
 | `src/badminton/positioning.py` | 第 3 步：双打站位、轮转、搭档间距、空当、覆盖和站位卡片 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 

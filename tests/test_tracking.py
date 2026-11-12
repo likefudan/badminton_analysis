@@ -122,3 +122,56 @@ def test_jump_does_not_add_distance(camera):
     true_distance = x[-1] - x[0]
     assert abs(stats.distance_m - true_distance) / true_distance < 0.03
     assert stats.max_speed_mps < 2.3
+
+
+def test_kalman_smoother_tames_far_court_noise():
+    """Far from a low camera one pixel spans ~15 cm along the court. With that
+    noise in y only, the plain window filter would add metres of fake running;
+    the covariance-aware smoother stays close to the true distance."""
+    from badminton.movement import smooth_track
+
+    rng = np.random.default_rng(1)
+    t = np.arange(0, 20, 1 / FPS)
+    true = np.stack([3.0 + 1.5 * np.sin(0.8 * t), 10.0 + 1.2 * np.sin(0.5 * t + 1)], 1)
+    noisy = true + np.stack([rng.normal(0, 0.02, len(t)), rng.normal(0, 0.18, len(t))], 1)
+    cov = np.tile(np.diag([0.02**2, 0.18**2]), (len(t), 1, 1))
+    length = lambda p: np.hypot(*np.diff(p, axis=0).T).sum()  # noqa: E731
+    d_true = length(true)
+    d_sg = length(smooth_track(noisy, t)[0])
+    d_kf = length(smooth_track(noisy, t, cov=cov)[0])
+    assert abs(d_kf - d_true) / d_true < 0.1
+    assert d_sg > 1.2 * d_true  # what the step-2 filter did with such noise
+
+
+def test_short_identity_glitch_is_dropped(camera):
+    """Step 1 picks a bystander behind the baseline for 0.2 s while the far player
+    is missed; the track must not run to the bystander and back."""
+    calib = calib_for(camera)
+    F = 45
+    t = np.arange(F) / FPS
+    far_x = 2.0 + 0.5 * t
+    frames = []
+    for i in range(F):
+        far = (-0.3, 15.0, 0.0) if 20 <= i < 23 else (far_x[i], 11.0, 0.0)
+        frames.append([(3.0, 3.0, 0.0), far])
+    tr = track_players(make_data(camera, calib, frames), calib, players_per_side=1)
+    far_track = tr.tracks[1]
+    assert not np.isfinite(far_track.raw_xy[20:23]).all() or far_track.airborne[20:23].all()
+    assert np.nanmax(np.abs(far_track.xy[:, 1] - 11.0)) < 0.1  # never follows the bystander
+    stats = player_stats(far_track, t, np.ones(F, bool), [(0, F)])
+    assert stats.max_speed_mps < 1.0
+
+
+def test_person_parked_behind_the_baseline_is_not_the_player(camera):
+    calib = calib_for(camera)
+    F = 60
+    t = np.arange(F) / FPS
+    frames = []
+    for i in range(F):
+        far = (-0.2, 15.0, 0.0) if 15 <= i < 40 else (2.0 + 0.02 * i, 11.0, 0.0)  # 1.7 s at the same spot
+        frames.append([(3.0, 3.0, 0.0), far])
+    tr = track_players(make_data(camera, calib, frames), calib, players_per_side=1)
+    far_track = tr.tracks[1]
+    assert np.isnan(far_track.xy[16:39]).all()
+    stats = player_stats(far_track, t, np.ones(F, bool), [(0, F)])
+    assert stats.max_speed_mps < 1.0

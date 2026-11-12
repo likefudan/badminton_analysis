@@ -76,6 +76,20 @@ def largest_blob_center(heatmap: np.ndarray, thr: float = 0.5) -> tuple[int, int
     return int(x + w / 2), int(y + h / 2)
 
 
+def blob_candidates(heatmap: np.ndarray, thr: float = 0.3) -> np.ndarray:
+    """All blobs above `thr` in one (merged) heatmap: rows of
+    (x, y, peak, area, bbox_area) in heatmap pixels, x/y = bbox centre like the
+    reference, largest bbox first. Used to look beyond the top-1 point."""
+    binary = (heatmap > thr).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    out = []
+    for k in range(1, n):
+        x, y, w, h, area = stats[k]
+        out.append((x + w / 2, y + h / 2, float(heatmap[lab == k].max()), float(area), float(w * h)))
+    out.sort(key=lambda r: -r[4])
+    return np.array(out, dtype=np.float32).reshape(-1, 5)
+
+
 def inpaint_mask(y: np.ndarray, vis: np.ndarray, th_h: float) -> np.ndarray:
     """Frames InpaintNet should fill: gaps with the shuttle seen (below `th_h`
     from the top) on both sides; a gap after the shuttle left the top of the
@@ -271,13 +285,15 @@ class ShuttleTiming:
                 f"另加背景图 {self.median_s:.1f} 秒；每帧 ms：{parts}")
 
 
-def _reader(video, max_frames, method, q, busy, step=1):
+def _reader(video, max_frames, method, q, busy, step=1, start=0):
     """Decode + resize in a separate process. Core ML's predict() keeps Python's
     GIL while it runs, so a thread could not overlap with it; a process can.
     Frames travel as uint8 (440 kB each); `busy` accumulates seconds spent.
     Only every `step`-th frame is sent. An exception is sent as ("error", text)
     so the caller fails instead of silently getting a shorter result."""
     cap = cv2.VideoCapture(str(video))
+    if start:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     i = 0
     try:
         while max_frames is None or i < max_frames:
@@ -303,8 +319,14 @@ def _reader(video, max_frames, method, q, busy, step=1):
 
 
 def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "ALL", inpaint: bool = True,
-                  max_frames: int | None = None, progress=None, resize: str = "pil", frame_step: int = 1):
+                  max_frames: int | None = None, progress=None, resize: str = "pil", frame_step: int = 1,
+                  start_frame: int = 0, debug: dict | None = None):
     """Returns (rows, timing); rows = list of (frame, visibility, x, y) in video pixels, one per video frame.
+
+    start_frame: begin there (row frame numbers stay video frame numbers).
+    debug: if a dict is given, it receives per processed frame the blob candidates
+    of the merged heatmap ("candidates") and, for processed frames listed in
+    debug["keep_heatmaps"] (a set), the merged heatmaps ("heatmaps", fp16).
 
     frame_step=2 feeds every second frame to the models: TrackNetV3 was trained
     on 30 fps footage, so a 60 fps video looks like it does in training (the
@@ -333,7 +355,17 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     ens = _WindowEnsemble(SEQ_LEN)
     xs, ys, vis = [], [], []
 
+    if debug is not None:
+        debug.setdefault("candidates", [])
+        debug.setdefault("heatmaps", {})
+        keep_hm = debug.get("keep_heatmaps", set())
+
     def locate(heat):
+        if debug is not None:
+            k = len(xs)
+            debug["candidates"].append(blob_candidates(heat))
+            if k in keep_hm:
+                debug["heatmaps"][k] = heat.astype(np.float16)
         t0 = time.perf_counter()
         c = largest_blob_center(heat)
         if c is None:
@@ -367,7 +399,8 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     ctx = mp.get_context("spawn")
     q = ctx.Queue(maxsize=32)
     busy = ctx.Value("d", 0.0)
-    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy, frame_step), daemon=True)
+    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy, frame_step, start_frame),
+                         daemon=True)
     reader.start()
     n = 0
     last = None
@@ -414,9 +447,10 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         tm.seconds["inpaint"] += time.perf_counter() - t0
     tm.wall_s = time.perf_counter() - wall
     if frame_step > 1:
-        return expand_rows(xs, ys, vis, frame_step, max_frames or n_total), tm
-    rows = [(i, int(vis[i]), int(xs[i]), int(ys[i])) for i in range(n)]
-    return rows, tm
+        rows = expand_rows(xs, ys, vis, frame_step, max_frames or (n_total - start_frame))
+    else:
+        rows = [(i, int(vis[i]), int(xs[i]), int(ys[i])) for i in range(n)]
+    return [(f + start_frame, v, x, y) for f, v, x, y in rows], tm
 
 
 def expand_rows(xs, ys, vis, step: int, n_frames: int) -> list:
