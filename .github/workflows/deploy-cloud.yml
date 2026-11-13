@@ -1,0 +1,128 @@
+name: 部署 ba.llmat.dev
+
+# cloud/ 有改动合并到 main 时自动发布，也可以在 Actions 页面手动运行。
+# 需要的仓库 secret：
+#   CLOUDFLARE_API_TOKEN   权限：Workers Scripts 编辑、Workers R2 Storage 编辑、D1 编辑、
+#                          llmat.dev 的 Workers Routes 编辑
+#   CLOUDFLARE_ACCOUNT_ID
+#   BA_ACCESS_TOKEN        网站登录口令（自己定）
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloud/**"
+      - ".github/workflows/deploy-cloud.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloud
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BUCKET: ba-files
+      DATABASE: ba-db
+      SITE: https://ba.llmat.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: 检查 secret 是否齐全
+        env:
+          BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          [ -n "$BA_ACCESS_TOKEN" ] || missing="$missing BA_ACCESS_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少仓库 secret:$missing"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - name: R2 桶（没有就创建）
+        run: |
+          if npx wrangler r2 bucket info "$BUCKET" >/dev/null 2>&1; then
+            echo "桶 $BUCKET 已存在"
+          else
+            npx wrangler r2 bucket create "$BUCKET"
+          fi
+
+      - name: 7 天后清理没传完的分片上传
+        run: |
+          curl -sS --fail-with-body -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET/lifecycle" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"rules":[{"id":"abort-stale-uploads","enabled":true,"conditions":{"prefix":""},"abortMultipartUploadsTransition":{"condition":{"type":"Age","maxAge":604800}}}]}'
+
+      - name: D1 数据库（没有就创建），把 id 写进 wrangler.toml
+        run: |
+          lookup() {
+            npx wrangler d1 list --json | jq -r --arg n "$DATABASE" '.[] | select(.name == $n) | .uuid'
+          }
+          id="$(lookup)"
+          if [ -z "$id" ]; then
+            npx wrangler d1 create "$DATABASE"
+            id="$(lookup)"
+          fi
+          if [ -z "$id" ]; then
+            echo "::error::找不到 D1 数据库 $DATABASE"
+            exit 1
+          fi
+          echo "D1 $DATABASE = $id"
+          # 仓库里还是占位 id 时在这里替换；已经填了真实 id 就必须一致
+          sed -i "s/00000000-0000-0000-0000-000000000000/$id/" wrangler.toml
+          grep -q "database_id = \"$id\"" wrangler.toml || {
+            echo "::error::wrangler.toml 里的 database_id 和账号里的 $DATABASE 不一致"
+            exit 1
+          }
+
+      - name: 数据库迁移
+        run: npx wrangler d1 migrations apply "$DATABASE" --remote
+
+      - name: 发布
+        run: npx wrangler deploy
+
+      - name: 设置登录口令
+        env:
+          BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
+        run: printf '%s' "$BA_ACCESS_TOKEN" | npx wrangler secret put ACCESS_TOKEN
+
+      - name: 线上检查
+        env:
+          BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
+        run: |
+          check() { # 名称 期望状态码 curl 参数...
+            name="$1"; want="$2"; shift 2
+            for i in $(seq 1 12); do
+              got="$(curl -s -o /dev/null -w '%{http_code}' "$@" || true)"
+              [ "$got" = "$want" ] && { echo "$name: $got"; return 0; }
+              sleep 10 # 第一次绑定域名时证书要等一会儿
+            done
+            echo "::error::$name 期望 $want，实际 $got"
+            return 1
+          }
+          check "首页" 200 "$SITE/"
+          check "未登录 /api/v1/me" 401 "$SITE/api/v1/me"
+          check "登录后 /api/v1/me" 200 -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me"
