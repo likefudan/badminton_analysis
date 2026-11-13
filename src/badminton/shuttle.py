@@ -170,13 +170,12 @@ def _resolve_dir(tracknet_dir: str | os.PathLike | None) -> Path:
 
 
 def _load_checkpoint(path: Path) -> dict:
+    """torch.load with weights_only (the safe default), plus the numpy scalar that
+    TrackNetV3's train.py stores in a fine-tuned checkpoint (its best validation accuracy)."""
     import torch
 
-    safe = getattr(torch.serialization, "safe_globals", None)
-    if safe is None:  # torch before 2.5 has no weights_only allow-list
-        return torch.load(path, map_location="cpu")
-    numpy_scalar = [(getattr(np, "_core", None) or np.core).multiarray.scalar, np.dtype, type(np.dtype(np.float64))]
-    with safe(numpy_scalar):
+    core = getattr(np, "_core", None) or np.core  # numpy 2 / numpy 1
+    with torch.serialization.safe_globals([core.multiarray.scalar, np.dtype, type(np.dtype(np.float64))]):
         return torch.load(path, map_location="cpu")
 
 
@@ -189,8 +188,6 @@ def convert_models(tracknet_dir: str | os.PathLike | None, out_dir: Path = CACHE
     mod = _import_tracknet(d)
     paths = []
     for name, shape_fn in (("TrackNet", None), ("InpaintNet", None)):
-        # weights_only (safe) by default. A checkpoint written by TrackNetV3's train.py (a
-        # fine-tuned one) also holds its best validation accuracy as a numpy scalar.
         ckpt = _load_checkpoint(d / "ckpts" / f"{name}_best.pt")
         p = ckpt["param_dict"]
         if name == "TrackNet":
