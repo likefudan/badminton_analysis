@@ -42,7 +42,7 @@ test("没有口令或口令不对都是 401", async () => {
 test("首页和脚本能打开", async () => {
   const page = await fetch(`http://127.0.0.1:${PORT}/`);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /上传录像/);
+  assert.match(await page.text(), /选择录像/);
   assert.equal((await fetch(`http://127.0.0.1:${PORT}/app.js`)).status, 200);
 });
 
@@ -125,4 +125,89 @@ test("参数不对的新建请求被拒绝", async () => {
     const res = await call("/videos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     assert.equal(res.status, 400);
   }
+});
+
+test("处理任务：排队、领取、汇报进度、传结果、读结果、删云端原片、重新处理", async () => {
+  const json = { "content-type": "application/json" };
+  const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
+  const upload = async (name, mode) => {
+    const data = randomBytes(1000);
+    const v = await (await post("/videos", { filename: name, size: data.length, contentType: "video/mp4", options: { mode, junk: 1 } })).json();
+    assert.equal((await call(`/videos/${v.id}/parts/1`, { method: "PUT", body: data })).status, 200);
+    return { v: await (await post(`/videos/${v.id}/complete`)).json(), data };
+  };
+
+  // 没有可处理的录像时领不到
+  assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video, null);
+
+  const { v, data } = await upload("a.mp4", "doubles");
+  assert.equal(v.job.status, "queued");
+  assert.deepEqual(v.options, { mode: "doubles" });
+
+  // 领取一次，第二次领不到
+  const claimed = (await (await post("/node/claim", { node: "mac" })).json()).video;
+  assert.equal(claimed.id, v.id);
+  assert.equal(claimed.job.status, "processing");
+  assert.equal((await (await post("/node/claim", { node: "mac2" })).json()).video, null);
+
+  // 取原片后让云端删掉
+  assert.deepEqual(Buffer.from(await (await call(`/videos/${v.id}/file`)).arrayBuffer()), data);
+  assert.equal((await post(`/videos/${v.id}/original/release`)).status, 200);
+  assert.equal((await call(`/videos/${v.id}/file`)).status, 410);
+
+  // 进度
+  let st = await (await post(`/videos/${v.id}/job`, { status: "processing", stage: "骨架 40%" })).json();
+  assert.equal(st.job.stage, "骨架 40%");
+  assert.equal(st.originalDeleted, true);
+  assert.equal((await post(`/videos/${v.id}/job`, { status: "weird" })).status, 400);
+
+  // 小结果直接传，大结果分片传
+  const card = randomBytes(5000);
+  assert.equal((await call(`/videos/${v.id}/results/movement.1.png`, { method: "PUT", body: card })).status, 200);
+  assert.equal((await call(`/videos/${v.id}/results/..%2Fevil`, { method: "PUT", body: card })).status, 404);
+  const clip = randomBytes(6 * 1024 * 1024 + 77);
+  const { uploadId } = await (await post(`/videos/${v.id}/results/rallies.mp4/multipart`)).json();
+  const q = `uploadId=${encodeURIComponent(uploadId)}`;
+  const parts = [];
+  for (const [i, body] of [clip.subarray(0, 5 * 1024 * 1024), clip.subarray(5 * 1024 * 1024)].entries()) {
+    const r = await call(`/videos/${v.id}/results/rallies.mp4/multipart?${q}&part=${i + 1}`, { method: "PUT", body });
+    assert.equal(r.status, 200);
+    parts.push(await r.json());
+  }
+  assert.equal((await post(`/videos/${v.id}/results/rallies.mp4/multipart?${q}`, { parts })).status, 200);
+
+  st = await (await post(`/videos/${v.id}/job`, { status: "done", stage: "完成" })).json();
+  assert.equal(st.job.status, "done");
+  assert.deepEqual(st.results.map((r) => [r.name, r.size, r.contentType]), [
+    ["movement.1.png", 5000, "image/png"],
+    ["rallies.mp4", clip.length, "video/mp4"],
+  ]);
+  // 任务结束后节点不能再改状态
+  assert.equal((await post(`/videos/${v.id}/job`, { status: "processing" })).status, 409);
+
+  // 网页用 cookie 读结果（<img>、<video> 带不了 Authorization），支持 Range；cookie 不能用来改数据
+  const session = await post("/session");
+  const cookie = session.headers.get("set-cookie").split(";")[0];
+  assert.match(session.headers.get("set-cookie"), /HttpOnly/);
+  const img = await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie } });
+  assert.equal(img.status, 200);
+  assert.equal(img.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await img.arrayBuffer()), card);
+  const ranged = await fetch(`${BASE}/videos/${v.id}/results/rallies.mp4`, { headers: { cookie, range: "bytes=10-19" } });
+  assert.equal(ranged.status, 206);
+  assert.deepEqual(Buffer.from(await ranged.arrayBuffer()), clip.subarray(10, 20));
+  assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie: "ba_session=nope" } })).status, 401);
+  assert.equal((await fetch(`${BASE}/videos/${v.id}`, { method: "DELETE", headers: { cookie } })).status, 401);
+
+  // 重新处理：回到排队，可以改单打/双打
+  st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();
+  assert.equal(st.job.status, "queued");
+  assert.deepEqual(st.options, { mode: "singles" });
+  assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.id, v.id);
+  st = await (await post(`/videos/${v.id}/job`, { status: "failed", stage: "自动标定球场", error: "找不到球场线" })).json();
+  assert.equal(st.job.error, "找不到球场线");
+
+  // 删除录像时结果一起删
+  assert.equal((await call(`/videos/${v.id}`, { method: "DELETE" })).status, 200);
+  assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie } })).status, 404);
 });

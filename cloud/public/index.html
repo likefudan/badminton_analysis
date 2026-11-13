@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="羽毛球分析">
-<title>羽毛球分析 · 上传录像</title>
+<title>羽毛球分析</title>
 <style>
   :root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --ink: #1c1c1a; --quiet: #6b6b66; --line: #dcdcd6; --accent: #1f6feb; --good: #1a7f37; --bad: #cf222e; --warn: #9a6700; }
   @media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #222220; --ink: #ecece8; --quiet: #a3a39c; --line: #3a3a36; --accent: #58a6ff; --good: #3fb950; --bad: #f85149; --warn: #d29922; } }
@@ -34,12 +34,29 @@
   li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
   li:first-child { border-top: 0; }
   li a { color: var(--bad); cursor: pointer; white-space: nowrap; }
+  li.video { cursor: pointer; align-items: center; }
+  li.video .name { font-weight: 600; word-break: break-all; }
+  li.video .chev { color: var(--quiet); }
+  .seg { display: flex; gap: 8px; margin: 10px 0 0; }
+  .seg label { flex: 1; padding: 9px; border: 1px solid var(--line); border-radius: 10px; text-align: center; cursor: pointer; }
+  .seg input { display: none; }
+  .seg input:checked + span { color: var(--accent); font-weight: 600; }
+  .seg label:has(input:checked) { border-color: var(--accent); }
+  #detail img, #detail video { display: block; width: 100%; border-radius: 8px; background: #000; margin: 6px 0 14px; }
+  #detail img { background: none; }
+  #detail h3 { font-size: 14px; margin: 14px 0 2px; }
+  #dError { white-space: pre-wrap; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 4px; border-top: 1px solid var(--line); }
+  th { color: var(--quiet); font-weight: 400; border-top: 0; }
+  th:first-child, td:first-child { text-align: left; }
+  .back { color: var(--accent); cursor: pointer; font-size: 14px; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
-  <h1>羽毛球分析 · 上传录像</h1>
+  <h1>羽毛球分析</h1>
 
   <section class="card" id="login" hidden>
     <h2>输入口令</h2>
@@ -66,6 +83,10 @@
         <dt>每分钟大小</dt><dd id="iRate"></dd>
       </dl>
       <p id="verdict"></p>
+      <div class="seg" id="mode">
+        <label><input type="radio" name="mode" value="singles" checked><span>单打</span></label>
+        <label><input type="radio" name="mode" value="doubles"><span>双打</span></label>
+      </div>
       <div class="row">
         <button id="startBtn">开始上传</button>
         <button id="pauseBtn" class="plain" hidden>暂停</button>
@@ -87,9 +108,22 @@
       </dl>
     </section>
 
-    <section class="card">
-      <h2>云端的录像</h2>
+    <section class="card" id="listCard">
+      <h2>我的录像</h2>
       <ul id="list"><li class="quiet">读取中</li></ul>
+      <p class="quiet">传完后由家里的 Mac 自动处理，处理完点开就能看结果。</p>
+    </section>
+
+    <section class="card" id="detail" hidden>
+      <a class="back" id="dBack">‹ 返回列表</a>
+      <h2 id="dTitle" style="margin-top:8px"></h2>
+      <p id="dStatus"></p>
+      <p id="dError" class="bad" hidden></p>
+      <div id="dBody"></div>
+      <div class="row">
+        <button class="plain" id="dRetry" hidden>重新处理</button>
+        <button class="plain" id="dDelete">删除这局</button>
+      </div>
     </section>
 
     <section class="card">

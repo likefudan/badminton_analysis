@@ -538,6 +538,8 @@ badminton hits match.mp4 --court match.court.json
 | `src/badminton/provenance.py` | 数据来源标记：实测、插值、推算、人工 |
 | `scripts/hit_sound_probe.py` | 击球声实验：声音起点和击球时刻对得上的比例（没有采用） |
 | `labels/hits/` | 击球对照标注（`Frame, Player, Note`） |
+| `src/badminton/node.py` | 处理节点 `badminton node`：从 ba.llmat.dev 取手机上传的录像，本机分析，结果传回（见 `cloud/README.md`） |
+| `cloud/` | 手机上传和看结果的网站：Cloudflare Worker + D1 + R2 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。
