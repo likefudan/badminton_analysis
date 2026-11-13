@@ -205,6 +205,7 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();
   assert.equal(st.job.status, "queued");
   assert.deepEqual(st.options, { mode: "singles" });
+  assert.deepEqual(st.results, []); // 旧结果清掉
   assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.id, v.id);
   st = await (await post(`/videos/${v.id}/job`, { status: "failed", stage: "自动标定球场", error: "找不到球场线" })).json();
   assert.equal(st.job.error, "找不到球场线");
