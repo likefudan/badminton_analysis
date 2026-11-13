@@ -15,27 +15,35 @@ const auth = { authorization: `Bearer ${TOKEN}` };
 const state = mkdtempSync(join(tmpdir(), "ba-test-"));
 let server;
 
-// 假的 Anthropic API：记下收到的请求，按流式格式回一段文字
+// 假的模型服务：两种接口都认，记下收到的请求，按流式格式回一段文字和用量
 const AI_PORT = 8798;
 const aiCalls = [];
 const ai = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
-    if (req.headers["x-api-key"] !== "test-ai-key") {
+    const openai = req.url === "/openai/chat/completions";
+    if ((openai ? req.headers["api-key"] : req.headers["x-api-key"]) !== "test-ai-key" || (!openai && req.url !== "/anthropic/v1/messages")) {
       res.writeHead(401, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }));
+      return res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid key or path " + req.url } }));
     }
     const data = JSON.parse(body);
-    aiCalls.push(data);
+    aiCalls.push({ ...data, path: req.url });
     const last = data.messages.at(-1).content;
     const answer = last.startsWith("追问") ? ["先练", "步法。"] : ["## 比赛概况\n\n打了 ", "**25 秒**。<script>x</script>"];
     res.writeHead(200, { "content-type": "text/event-stream" });
-    const send = (ev) => res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
-    send({ type: "message_start", message: { content: [] } });
-    for (const text of answer) send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-    send({ type: "message_delta", delta: { stop_reason: "end_turn" } });
-    send({ type: "message_stop" });
+    const send = (ev) => res.write(`${ev.type ? `event: ${ev.type}\n` : ""}data: ${JSON.stringify(ev)}\n\n`);
+    if (openai) {
+      for (const text of answer) send({ choices: [{ delta: { content: text } }] });
+      send({ choices: [{ delta: {}, finish_reason: "stop" }] });
+      send({ choices: [], usage: { prompt_tokens: 900, completion_tokens: 40, total_tokens: 1500 } }); // 600 个思考 token 只在 total 里
+      res.write("data: [DONE]\n\n");
+    } else {
+      send({ type: "message_start", message: { content: [], usage: { input_tokens: 1000, output_tokens: 1 } } });
+      for (const text of answer) send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+      send({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 500 } });
+      send({ type: "message_stop" });
+    }
     res.end();
   });
 });
@@ -49,7 +57,8 @@ before(async () => {
   });
   server = spawn("npx", ["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", state,
     "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key",
-    "--var", "AI_API_KEY:test-ai-key", "--var", `AI_ENDPOINT:http://127.0.0.1:${AI_PORT}`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+    "--var", "AI_API_KEY:test-ai-key", "--var", `AI_ENDPOINT_ANTHROPIC:http://127.0.0.1:${AI_PORT}/anthropic`,
+    "--var", `AI_ENDPOINT_OPENAI:http://127.0.0.1:${AI_PORT}/openai`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(BASE + "/me")).status === 401) return; } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -239,6 +248,11 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie: "ba_session=nope" } })).status, 401);
   assert.equal((await fetch(`${BASE}/videos/${v.id}`, { method: "DELETE", headers: { cookie } })).status, 401);
 
+  // 起标题
+  st = await (await call(`/videos/${v.id}`, { method: "PATCH", headers: json, body: JSON.stringify({ title: "  周六双打第 2 局 " }) })).json();
+  assert.equal(st.title, "周六双打第 2 局");
+  assert.equal((await call(`/videos/${v.id}`, { method: "PATCH", headers: json, body: "{}" })).status, 400);
+
   // 重新处理：回到排队，可以改单打/双打
   st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();
   assert.equal(st.job.status, "queued");
@@ -254,7 +268,7 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie } })).status, 404);
 });
 
-test("AI 报告：网站拿节点传上来的统计摘要去问模型，存成结果；可以追问", async () => {
+test("AI 报告：网站拿节点传上来的统计摘要去问模型，存成结果；可以追问、选模型，记用量和价格", async () => {
   const json = { "content-type": "application/json" };
   const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
   const data = randomBytes(1000);
@@ -263,32 +277,64 @@ test("AI 报告：网站拿节点传上来的统计摘要去问模型，存成�
   await post(`/videos/${v.id}/complete`);
   assert.equal((await (await call("/me")).json()).review, true);
 
+  // 能选的模型、默认模型；单价有内置的公开价，查不到的是空的
+  let info = await (await call("/ai")).json();
+  assert.equal(info.available, true);
+  assert.equal(info.defaultModel, "claude-sonnet-5-5");
+  assert.ok(info.models.some((m) => m.id === "gpt-6.1-sol" && m.priceIn === 2 && m.priceOut === 10));
+  assert.ok(info.models.some((m) => m.id === "gpt-6.1-terra" && m.priceIn === null));
+  assert.deepEqual(info.usage, []);
+
   // 还没有统计摘要
   assert.equal((await post(`/videos/${v.id}/review`)).status, 409);
-  const request = { schema: 1, model: "claude-test", max_tokens: 16000, system: "你是教练", user: "摘要……请写点评", ask: "追问：{question}" };
+  const request = { schema: 1, model: "whatever", max_tokens: 16000, system: "你是教练", user: "摘要……请写点评", ask: "追问：{question}" };
   await call(`/videos/${v.id}/results/review.request.json`, { method: "PUT", body: JSON.stringify(request) });
 
+  // 默认模型是 Claude：走 Anthropic 接口
   let res = await post(`/videos/${v.id}/review`);
   assert.equal(res.status, 200);
   v = await res.json();
   assert.ok(v.results.some((r) => r.name === "review.md" && r.contentType.startsWith("text/markdown")));
-  assert.deepEqual([aiCalls[0].model, aiCalls[0].system, aiCalls[0].stream], ["claude-test", "你是教练", true]);
+  assert.deepEqual([aiCalls[0].path, aiCalls[0].model, aiCalls[0].system, aiCalls[0].stream], ["/anthropic/v1/messages", "claude-sonnet-5-5", "你是教练", true]);
   assert.deepEqual(aiCalls[0].messages, [{ role: "user", content: "摘要……请写点评" }]);
   const report = await (await call(`/videos/${v.id}/results/review.md`)).text();
-  assert.match(report, /^## 比赛概况\n\n打了 \*\*25 秒\*\*。<script>x<\/script>\n\n> 由 claude-test /);
+  assert.match(report, /^## 比赛概况\n\n打了 \*\*25 秒\*\*。<script>x<\/script>\n\n> 由 Claude Sonnet 5.5 /);
+  // 用量记下来了，按内置单价估算：(1000×2 + 500×10) / 100 万
+  assert.deepEqual(v.ai.map((u) => [u.kind, u.model, u.inputTokens, u.outputTokens, u.costUsd]), [["report", "claude-sonnet-5-5", 1000, 500, 0.007]]);
 
-  // 追问：带上原来的摘要、报告和之前的问答
+  // 填单价、改默认模型
+  assert.equal((await call("/ai/settings", { method: "PUT", headers: json, body: JSON.stringify({ defaultModel: "nope" }) })).status, 400);
+  info = await (await call("/ai/settings", {
+    method: "PUT", headers: json,
+    body: JSON.stringify({ defaultModel: "gpt-6.1-sol", prices: { "gpt-6.1-sol": { in: 3, out: 12 }, "claude-sonnet-5-5": { in: 3, out: 15 }, junk: { in: 1, out: 1 } } }),
+  })).json();
+  assert.equal(info.defaultModel, "gpt-6.1-sol");
+  assert.deepEqual(info.models.find((m) => m.id === "gpt-6.1-sol"), { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", priceIn: 3, priceOut: 12 });
+
+  // 追问：带上原来的摘要、报告和之前的问答；现在默认走 OpenAI 接口
   assert.equal((await post(`/videos/${v.id}/review/ask`, { question: " " })).status, 400);
+  assert.equal((await post(`/videos/${v.id}/review/ask`, { question: "x", model: "nope" })).status, 400);
   res = await post(`/videos/${v.id}/review/ask`, { question: "先练什么？" });
-  assert.equal((await res.json()).answer, "先练步法。");
-  await post(`/videos/${v.id}/review/ask`, { question: "为什么？" });
+  const asked = await res.json();
+  assert.equal(asked.answer, "先练步法。");
+  assert.deepEqual([aiCalls.at(-1).path, aiCalls.at(-1).model, aiCalls.at(-1).messages[0]], ["/openai/chat/completions", "gpt-6.1-sol", { role: "system", content: "你是教练" }]);
+  assert.deepEqual(aiCalls.at(-1).stream_options, { include_usage: true });
+  // 思考 token 算在输出里：1500 - 900 = 600；价格按刚填的单价 (900×3 + 600×12) / 100 万
+  const u = asked.video.ai.at(-1);
+  assert.deepEqual([u.kind, u.model, u.inputTokens, u.outputTokens], ["ask", "gpt-6.1-sol", 900, 600]);
+  assert.ok(Math.abs(u.costUsd - 0.0099) < 1e-9);
+  await post(`/videos/${v.id}/review/ask`, { question: "为什么？", model: "claude-sonnet-5-5" });
   assert.deepEqual(aiCalls.at(-1).messages.map((m) => m.role), ["user", "assistant", "user", "assistant", "user"]);
   assert.deepEqual(aiCalls.at(-1).messages.slice(2).map((m) => m.content), ["追问：先练什么？", "先练步法。", "追问：为什么？"]);
   const qa = await (await call(`/videos/${v.id}/results/review.qa.md`)).text();
   assert.equal(qa, "## 问：先练什么？\n\n先练步法。\n\n## 问：为什么？\n\n先练步法。\n\n");
 
-  // 重新生成报告后，旧的追问清掉
-  v = await (await post(`/videos/${v.id}/review`)).json();
+  // 重新生成报告后，旧的追问清掉；累计用量按模型分开，录像删了也还在
+  v = await (await post(`/videos/${v.id}/review`, { model: "claude-sonnet-5-5" })).json();
   assert.ok(!v.results.some((r) => r.name === "review.qa.md"));
   await call(`/videos/${v.id}`, { method: "DELETE" });
+  info = await (await call("/ai")).json();
+  const claude = info.usage.find((x) => x.model === "claude-sonnet-5-5");
+  assert.deepEqual([claude.calls, claude.inputTokens, claude.outputTokens, claude.unpricedCalls], [3, 3000, 1500, 0]);
+  assert.ok(Math.abs(claude.costUsd - (0.007 + 2 * (1000 * 3 + 500 * 15) / 1e6)) < 1e-9);
 });

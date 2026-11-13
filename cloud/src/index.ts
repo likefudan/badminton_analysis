@@ -10,9 +10,9 @@ export interface Env {
   // AI 报告用的模型。只有 key 是秘密（secret），其余写在 wrangler.toml 的 [vars] 里。没有 key 就不出报告。
   AI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string; // 旧名字，等同于 AI_API_KEY
-  AI_FORMAT?: string; // "anthropic"（默认，Messages 接口）或 "openai"（Chat Completions 接口）
-  AI_ENDPOINT?: string; // 默认 https://api.anthropic.com；Azure AI Foundry 填资源的地址
-  AI_MODEL?: string; // 模型或部署名；不填就用节点摘要里写的
+  AI_ENDPOINT_ANTHROPIC?: string; // Claude 走的地址（后面补 /v1/messages），默认 https://api.anthropic.com
+  AI_ENDPOINT_OPENAI?: string; // 其它模型走的地址（后面补 /chat/completions）
+  AI_MODELS?: string; // 可选：JSON 数组 [{id, label, format}]，替换内置的模型列表
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -51,6 +51,7 @@ type VideoRow = {
   original_deleted_at: string | null;
   job_progress: string;
   job_started_at: string | null;
+  title: string;
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -136,7 +137,13 @@ async function describe(env: Env, v: VideoRow) {
   const results = await env.DB.prepare("SELECT name, size, content_type FROM results WHERE video_id = ? ORDER BY name")
     .bind(v.id)
     .all<Pick<ResultRow, "name" | "size" | "content_type">>();
+  const usage = await env.DB.prepare(
+    "SELECT video_id, kind, model, input_tokens, output_tokens, cost_usd, created_at FROM ai_usage WHERE video_id = ? ORDER BY id DESC LIMIT 50",
+  )
+    .bind(v.id)
+    .all<UsageRow>();
   return {
+    ai: usage.results.reverse().map(usageJson),
     job: {
       status: v.job_status,
       stage: v.job_stage,
@@ -150,6 +157,7 @@ async function describe(env: Env, v: VideoRow) {
     originalDeleted: v.original_deleted_at !== null,
     results: results.results.map((r) => ({ name: r.name, size: r.size, contentType: r.content_type })),
     id: v.id,
+    title: v.title,
     filename: v.filename,
     size: v.size,
     contentType: v.content_type,
@@ -175,16 +183,17 @@ async function createVideo(req: Request, env: Env): Promise<Response> {
   const meta = JSON.stringify(body?.meta && typeof body.meta === "object" ? body.meta : {});
   if (meta.length > 4000) throw new HttpError(400, "meta 太长");
   const options = JSON.stringify(cleanOptions(body?.options));
+  const title = typeof body?.title === "string" ? body.title.trim().slice(0, 80) : "";
 
   const id = crypto.randomUUID();
   const ext = (filename.match(/\.([A-Za-z0-9]{1,5})$/)?.[1] ?? "bin").toLowerCase();
   const key = `originals/${USER_ID}/${id}.${ext}`;
   const upload = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType } });
   await env.DB.prepare(
-    `INSERT INTO videos (id, user_id, filename, size, content_type, part_size, r2_key, upload_id, status, meta, options, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?, ?)`,
+    `INSERT INTO videos (id, user_id, filename, size, content_type, part_size, r2_key, upload_id, status, meta, options, title, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?)`,
   )
-    .bind(id, USER_ID, filename, size, contentType, partSizeFor(size), key, upload.uploadId, meta, options, new Date().toISOString())
+    .bind(id, USER_ID, filename, size, contentType, partSizeFor(size), key, upload.uploadId, meta, options, title, new Date().toISOString())
     .run();
   return json(await describe(env, await getVideo(env, id)), 201);
 }
@@ -235,6 +244,14 @@ async function completeVideo(env: Env, id: string): Promise<Response> {
   )
     .bind(now, now, id)
     .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+async function renameVideo(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { title?: unknown } | null;
+  if (typeof body?.title !== "string") throw new HttpError(400, "缺少标题");
+  await env.DB.prepare("UPDATE videos SET title = ? WHERE id = ?").bind(body.title.trim().slice(0, 80), id).run();
   return json(await describe(env, await getVideo(env, id)));
 }
 
@@ -429,16 +446,128 @@ async function getResult(req: Request, env: Env, id: string, name: string): Prom
 }
 
 // ---------- AI 报告 ----------
-// 节点上传 review.request.json（badminton review 写的：system、user、追问模板、模型），里面只有统计数字和文字。
-// 这里拿它去问 Anthropic API，回答存成 review.md；追问的问答追加到 review.qa.md。key 只在 Worker 里。
+// 节点上传 review.request.json（badminton review 写的：system、user、追问模板），里面只有统计数字和文字。
+// 这里拿它去问模型，回答存成 review.md；追问的问答追加到 review.qa.md。key 只在 Worker 里。
+// 每次调用的 token 用量记在 ai_usage 表里，按设置里的单价估算价格。
 
 interface ReviewRequest {
-  model: string;
+  model?: string;
   max_tokens: number;
   system: string;
   user: string;
   ask: string; // 含 {question}
   title?: string;
+}
+
+// 可以选的模型：id 是部署名。Claude 走 Anthropic 的 Messages 接口，其余走 OpenAI 的 Chat Completions 接口。
+interface Model {
+  id: string;
+  label: string;
+  format: "anthropic" | "openai";
+  in?: number; // 默认单价，美元 / 100 万 token；设置里填了就用设置里的
+  out?: number;
+}
+// 默认单价是 2026 年 11 月从第三方价格汇总网站查到的公开价，不是 Azure 账单上的实际价格；查不到的留空。
+const DEFAULT_MODELS: Model[] = [
+  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", format: "anthropic", in: 2, out: 10 },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5", format: "anthropic", in: 4, out: 20 },
+  { id: "claude-haiku-5-5-2", label: "Claude Haiku 5.5", format: "anthropic", in: 0.1, out: 0.5 },
+  { id: "claude-fable-5-1", label: "Claude Fable 5.1", format: "anthropic", in: 10, out: 50 },
+  { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", format: "openai", in: 2, out: 10 },
+  { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", format: "openai" },
+  { id: "gpt-6-luna", label: "GPT-6 Luna", format: "openai", in: 0.1, out: 0.5 },
+  { id: "grok-4.6", label: "Grok 4.6", format: "openai" },
+];
+
+function models(env: Env): Model[] {
+  if (!env.AI_MODELS) return DEFAULT_MODELS;
+  try {
+    const list = JSON.parse(env.AI_MODELS) as Model[];
+    if (Array.isArray(list) && list.every((m) => m && typeof m.id === "string")) {
+      return list.map((m) => ({ id: m.id, label: m.label || m.id, format: m.format === "openai" ? "openai" : "anthropic", in: price(m.in), out: price(m.out) }));
+    }
+  } catch {}
+  return DEFAULT_MODELS;
+}
+
+const aiKey = (env: Env) => env.AI_API_KEY || env.ANTHROPIC_API_KEY || "";
+
+function modelUrl(env: Env, m: Model): string {
+  const base = (m.format === "openai" ? env.AI_ENDPOINT_OPENAI || "https://api.openai.com/v1" : env.AI_ENDPOINT_ANTHROPIC || "https://api.anthropic.com").replace(/\/+$/, "");
+  return base + (m.format === "openai" ? "/chat/completions" : "/v1/messages");
+}
+
+type Prices = Record<string, { in?: number; out?: number }>; // 美元 / 100 万 token
+interface AiSettings {
+  defaultModel: string;
+  prices: Prices;
+}
+
+async function aiSettings(env: Env): Promise<AiSettings> {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE user_id = ? AND key = 'ai'").bind(USER_ID).first<{ value: string }>();
+  let saved: Partial<AiSettings> = {};
+  try {
+    saved = row ? (JSON.parse(row.value) as Partial<AiSettings>) : {};
+  } catch {}
+  const list = models(env);
+  const defaultModel = list.some((m) => m.id === saved.defaultModel) ? saved.defaultModel! : (list[0]?.id ?? "");
+  return { defaultModel, prices: saved.prices && typeof saved.prices === "object" ? saved.prices : {} };
+}
+
+function modelPrice(m: Model, saved: Prices): { in: number | null; out: number | null } {
+  return { in: saved[m.id]?.in ?? m.in ?? null, out: saved[m.id]?.out ?? m.out ?? null };
+}
+
+function price(v: unknown): number | undefined {
+  return typeof v === "number" && isFinite(v) && v >= 0 && v < 100000 ? v : undefined;
+}
+
+async function saveAiSettings(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => null)) as Partial<AiSettings> | null;
+  const now = await aiSettings(env);
+  const list = models(env);
+  if (typeof body?.defaultModel === "string") {
+    if (!list.some((m) => m.id === body.defaultModel)) throw new HttpError(400, "没有这个模型");
+    now.defaultModel = body.defaultModel;
+  }
+  if (body?.prices && typeof body.prices === "object") {
+    for (const m of list) {
+      const p = (body.prices as Prices)[m.id];
+      if (p === undefined) continue;
+      const cleaned = { in: price(p?.in), out: price(p?.out) };
+      if (cleaned.in === undefined && cleaned.out === undefined) delete now.prices[m.id];
+      else now.prices[m.id] = cleaned;
+    }
+  }
+  await env.DB.prepare("INSERT INTO settings (user_id, key, value) VALUES (?, 'ai', ?) ON CONFLICT (user_id, key) DO UPDATE SET value = excluded.value")
+    .bind(USER_ID, JSON.stringify(now))
+    .run();
+  return aiInfo(env);
+}
+
+type UsageRow = { video_id: string; kind: string; model: string; input_tokens: number; output_tokens: number; cost_usd: number | null; created_at: string };
+const usageJson = (u: UsageRow) => ({
+  kind: u.kind, model: u.model, inputTokens: u.input_tokens, outputTokens: u.output_tokens, costUsd: u.cost_usd, at: u.created_at,
+});
+
+// 设置页：能选哪些模型、默认模型、单价、累计用量
+async function aiInfo(env: Env): Promise<Response> {
+  const settings = await aiSettings(env);
+  const totals = await env.DB.prepare(
+    `SELECT model, COUNT(*) AS calls, SUM(input_tokens) AS input, SUM(output_tokens) AS output, SUM(cost_usd) AS cost,
+            SUM(cost_usd IS NULL) AS unpriced, MIN(created_at) AS since
+     FROM ai_usage WHERE user_id = ? GROUP BY model ORDER BY calls DESC`,
+  )
+    .bind(USER_ID)
+    .all<{ model: string; calls: number; input: number; output: number; cost: number | null; unpriced: number; since: string }>();
+  return json({
+    available: Boolean(aiKey(env)),
+    models: models(env).map((m) => ({ id: m.id, label: m.label, priceIn: modelPrice(m, settings.prices).in, priceOut: modelPrice(m, settings.prices).out })),
+    defaultModel: settings.defaultModel,
+    usage: totals.results.map((t) => ({
+      model: t.model, calls: t.calls, inputTokens: t.input, outputTokens: t.output, costUsd: t.cost, unpricedCalls: t.unpriced, since: t.since,
+    })),
+  });
 }
 
 async function resultText(env: Env, id: string, name: string): Promise<string | null> {
@@ -452,7 +581,7 @@ async function saveResultText(env: Env, id: string, name: string, text: string):
 }
 
 async function reviewRequest(env: Env, id: string): Promise<ReviewRequest> {
-  if (!aiConfig(env)) throw new HttpError(503, "网站还没有配置模型的 API key（AI_API_KEY），出不了 AI 报告");
+  if (!aiKey(env)) throw new HttpError(503, "网站还没有配置模型的 API key（AI_API_KEY），出不了 AI 报告");
   const text = await resultText(env, id, "review.request.json");
   let r: ReviewRequest | null = null;
   try {
@@ -463,40 +592,38 @@ async function reviewRequest(env: Env, id: string): Promise<ReviewRequest> {
   return r;
 }
 
-type Message = { role: "user" | "assistant"; content: string };
-
-interface AiConfig {
-  format: "anthropic" | "openai";
-  url: string;
-  key: string;
-  model: string;
+async function pickModel(env: Env, wanted: unknown): Promise<Model> {
+  const list = models(env);
+  const id = typeof wanted === "string" && wanted ? wanted : (await aiSettings(env)).defaultModel;
+  const m = list.find((x) => x.id === id);
+  if (!m) throw new HttpError(400, "没有这个模型：" + String(id).slice(0, 60));
+  return m;
 }
 
-function aiConfig(env: Env, r?: ReviewRequest): AiConfig | null {
-  const key = env.AI_API_KEY || env.ANTHROPIC_API_KEY;
-  if (!key) return null;
-  const format = env.AI_FORMAT === "openai" ? "openai" : "anthropic";
-  const base = (env.AI_ENDPOINT || "https://api.anthropic.com").replace(/\/+$/, "");
-  const tail = format === "openai" ? "/chat/completions" : "/v1/messages";
-  // 地址可以直接写到接口为止（Azure 旧式地址带 ?api-version=），否则补上接口路径
-  const url = /\/(chat\/completions|messages)(\?|$)/.test(base) ? base : base + tail;
-  return { format, url, key, model: env.AI_MODEL || r?.model || "" };
+type Message = { role: "user" | "assistant"; content: string };
+interface Answer {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
 }
 
 // 流式读取：长回答不会因为连接长时间没有数据被掐断
-async function askModel(env: Env, r: ReviewRequest, messages: Message[]): Promise<{ text: string; model: string }> {
-  const ai = aiConfig(env, r)!;
+async function askModel(env: Env, m: Model, r: ReviewRequest, messages: Message[]): Promise<Answer> {
+  const key = aiKey(env);
   const maxTokens = Math.min(Math.max(Number(r.max_tokens) || 8000, 256), 16000);
-  const openai = ai.format === "openai";
-  const res = await fetch(ai.url, {
+  const openai = m.format === "openai";
+  const res = await fetch(modelUrl(env, m), {
     method: "POST",
     headers: openai
-      ? { "content-type": "application/json", "api-key": ai.key, authorization: "Bearer " + ai.key }
-      : { "content-type": "application/json", "x-api-key": ai.key, "anthropic-version": "2023-06-01" },
+      ? { "content-type": "application/json", "api-key": key, authorization: "Bearer " + key }
+      : { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
     body: JSON.stringify(
       openai
-        ? { model: ai.model, max_completion_tokens: maxTokens, stream: true, messages: [{ role: "system", content: r.system }, ...messages] }
-        : { model: ai.model, max_tokens: maxTokens, system: r.system, messages, stream: true },
+        ? {
+            model: m.id, max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true },
+            messages: [{ role: "system", content: r.system }, ...messages],
+          }
+        : { model: m.id, max_tokens: maxTokens, system: r.system, messages, stream: true },
     ),
   });
   if (!res.ok || !res.body) {
@@ -504,12 +631,14 @@ async function askModel(env: Env, r: ReviewRequest, messages: Message[]): Promis
     try {
       detail = ((await res.json()) as { error?: { message?: string } }).error?.message ?? "";
     } catch {}
-    throw new HttpError(502, `调用模型失败（${res.status}）${detail ? "：" + detail.slice(0, 300) : ""}`);
+    throw new HttpError(502, `调用 ${m.label} 失败（${res.status}）${detail ? "：" + detail.slice(0, 300) : ""}`);
   }
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
   let text = "";
   let stop = "";
+  let input = 0;
+  let output = 0;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -524,38 +653,64 @@ async function askModel(env: Env, r: ReviewRequest, messages: Message[]): Promis
       } catch {
         continue; // 包括 OpenAI 格式结尾的 [DONE]
       }
-      if (ev.error) throw new HttpError(502, "模型出错：" + String(ev.error?.message ?? "").slice(0, 300));
+      if (ev.error) throw new HttpError(502, `${m.label} 出错：` + String(ev.error?.message ?? "").slice(0, 300));
       if (openai) {
         const choice = ev.choices?.[0];
         if (typeof choice?.delta?.content === "string") text += choice.delta.content;
         if (choice?.finish_reason) stop = choice.finish_reason;
-      } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
-      else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+        if (ev.usage) {
+          input = Number(ev.usage.prompt_tokens) || 0;
+          // 有的模型把思考用的 token 只算在 total 里，不算在 completion 里；计费是按 total 的
+          output = Math.max(Number(ev.usage.completion_tokens) || 0, (Number(ev.usage.total_tokens) || 0) - input);
+        }
+      } else if (ev.type === "message_start") input = Number(ev.message?.usage?.input_tokens) || 0;
+      else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
+      else if (ev.type === "message_delta") {
+        if (ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+        if (ev.usage?.output_tokens != null) output = Number(ev.usage.output_tokens) || 0;
+        if (ev.usage?.input_tokens != null) input = Number(ev.usage.input_tokens) || input;
+      }
     }
   }
   text = text.trim();
   if (stop === "refusal" || stop === "content_filter") throw new HttpError(502, "模型拒绝回答这个请求");
   if (!text) throw new HttpError(502, "模型没有返回文字");
   if (stop === "max_tokens" || stop === "length") text += "\n\n（回答到长度上限被截断）";
-  return { text, model: ai.model };
+  return { text, inputTokens: input, outputTokens: output };
 }
 
-async function makeReview(env: Env, id: string): Promise<Response> {
+async function recordUsage(env: Env, id: string, kind: "report" | "ask", m: Model, a: Answer): Promise<UsageRow> {
+  const p = modelPrice(m, (await aiSettings(env)).prices);
+  const cost = p.in !== null && p.out !== null ? (a.inputTokens * p.in + a.outputTokens * p.out) / 1e6 : null;
+  const row: UsageRow = {
+    video_id: id, kind, model: m.id, input_tokens: a.inputTokens, output_tokens: a.outputTokens, cost_usd: cost, created_at: new Date().toISOString(),
+  };
+  await env.DB.prepare("INSERT INTO ai_usage (user_id, video_id, kind, model, input_tokens, output_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(USER_ID, id, kind, m.id, a.inputTokens, a.outputTokens, cost, row.created_at)
+    .run();
+  return row;
+}
+
+async function makeReview(req: Request, env: Env, id: string): Promise<Response> {
   await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { model?: unknown } | null;
   const r = await reviewRequest(env, id);
-  const { text: body, model } = await askModel(env, r, [{ role: "user", content: r.user }]);
-  const note = `> 由 ${model} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
-  await saveResultText(env, id, "review.md", `${body}\n\n${note}\n`);
+  const m = await pickModel(env, body?.model);
+  const answer = await askModel(env, m, r, [{ role: "user", content: r.user }]);
+  await recordUsage(env, id, "report", m, answer);
+  const note = `> 由 ${m.label} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
+  await saveResultText(env, id, "review.md", `${answer.text}\n\n${note}\n`);
   await deleteResult(env, id, "review.qa.md"); // 追问是接着旧报告问的，报告换了就不再对得上
   return json(await describe(env, await getVideo(env, id)));
 }
 
 async function askReview(req: Request, env: Env, id: string): Promise<Response> {
   await getVideo(env, id);
-  const body = (await req.json().catch(() => null)) as { question?: unknown } | null;
+  const body = (await req.json().catch(() => null)) as { question?: unknown; model?: unknown } | null;
   const question = typeof body?.question === "string" ? body.question.trim().slice(0, 1000) : "";
   if (!question) throw new HttpError(400, "请写下要问的问题");
   const r = await reviewRequest(env, id);
+  const m = await pickModel(env, body?.model);
   const report = await resultText(env, id, "review.md");
   const earlier = (await resultText(env, id, "review.qa.md")) ?? "";
   const messages: Message[] = [{ role: "user", content: r.user }];
@@ -564,14 +719,15 @@ async function askReview(req: Request, env: Env, id: string): Promise<Response> 
   if (!report) messages.push({ role: "assistant", content: "好的，请问。" });
   const ask = (q: string) => (r.ask || "追问：{question}").replace("{question}", q);
   // 之前的问答也带上，这样可以接着上一个问题问
-  for (const m of earlier.matchAll(/^## 问：(.*)\n\n([\s\S]*?)(?=\n\n## 问：|\s*$)/gm)) {
-    messages.push({ role: "user", content: ask(m[1]) }, { role: "assistant", content: m[2].trim() });
+  for (const qa of earlier.matchAll(/^## 问：(.*)\n\n([\s\S]*?)(?=\n\n## 问：|\s*$)/gm)) {
+    messages.push({ role: "user", content: ask(qa[1]) }, { role: "assistant", content: qa[2].trim() });
   }
   messages.push({ role: "user", content: ask(question) });
-  const { text: answer } = await askModel(env, r, messages);
+  const answer = await askModel(env, m, r, messages);
+  await recordUsage(env, id, "ask", m, answer);
   const oneLine = question.replace(/\s+/g, " ");
-  await saveResultText(env, id, "review.qa.md", `${earlier}## 问：${oneLine}\n\n${answer.replace(/^## /gm, "### ")}\n\n`);
-  return json({ answer, video: await describe(env, await getVideo(env, id)) });
+  await saveResultText(env, id, "review.qa.md", `${earlier}## 问：${oneLine}\n\n${answer.text.replace(/^## /gm, "### ")}\n\n`);
+  return json({ answer: answer.text, video: await describe(env, await getVideo(env, id)) });
 }
 
 async function deleteResult(env: Env, id: string, name: string): Promise<void> {
@@ -622,11 +778,12 @@ async function listVideos(env: Env): Promise<Response> {
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {
   if (!(await authorized(req, env))) throw new HttpError(401, "口令不对");
   const m = req.method;
-  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiConfig(env)) });
+  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiKey(env)) });
   if (path === "/videos" && m === "POST") return createVideo(req, env);
   if (path === "/videos" && m === "GET") return listVideos(env);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
   if (match && m === "GET") return json(await describe(env, await getVideo(env, match[1])));
+  if (match && m === "PATCH") return renameVideo(req, env, match[1]);
   if (match && m === "DELETE") return deleteVideo(env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/parts\/(\d{1,5})$/);
   if (match && m === "PUT") return uploadPart(req, env, match[1], Number(match[2]));
@@ -635,13 +792,15 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/file$/);
   if (match && m === "GET") return downloadVideo(req, env, match[1]);
   if (path === "/session" && m === "POST") return startSession(req, env);
+  if (path === "/ai" && m === "GET") return aiInfo(env);
+  if (path === "/ai/settings" && m === "PUT") return saveAiSettings(req, env);
   if (path === "/node/claim" && m === "POST") return claimJob(req, env);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job$/);
   if (match && m === "POST") return updateJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job\/retry$/);
   if (match && m === "POST") return retryJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review$/);
-  if (match && m === "POST") return makeReview(env, match[1]);
+  if (match && m === "POST") return makeReview(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review\/ask$/);
   if (match && m === "POST") return askReview(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/original\/release$/);

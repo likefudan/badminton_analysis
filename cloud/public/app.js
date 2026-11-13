@@ -66,7 +66,9 @@ async function tryLogin() {
     await api("/session", { method: "POST" }); // 图片和视频靠 cookie 读取
     $("login").hidden = true;
     $("app").hidden = false;
+    route();
     refreshList();
+    loadAi();
   } catch (e) {
     showLogin(e.status === 401 ? "口令不对" : "连不上服务器：" + e.message);
   }
@@ -146,6 +148,8 @@ $("file").onchange = async (e) => {
   file = f;
   $("info").hidden = false;
   $("progress").hidden = true;
+  $("upDone").hidden = true;
+  $("upTitle").value = "";
   $("iName").textContent = f.name;
   $("iSize").textContent = fmtBytes(f.size);
   $("iRes").textContent = $("iFps").textContent = $("iDur").textContent = $("iRate").textContent = "读取中";
@@ -301,7 +305,7 @@ async function startUpload() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        filename: file.name, size: file.size, contentType: file.type, meta,
+        filename: file.name, size: file.size, contentType: file.type, meta, title: $("upTitle").value.trim(),
         options: { mode: document.querySelector('input[name="mode"]:checked').value },
       }),
     });
@@ -379,7 +383,8 @@ async function startUpload() {
     const secs = (Date.now() - r.startedAt) / 1000;
     r.finished = true;
     try { localStorage.removeItem(key); } catch {}
-    $("pTitle").textContent = "上传完成";
+    $("pTitle").textContent = "上传完成，已经排队等 Mac 处理";
+    $("upDone").hidden = false;
     log(`完成：${fmtBytes(result.size)}，本次用时 ${fmtDur(secs)}，平均 ${fmtSpeed(r.sentThisRun / Math.max(secs, 1))}，重试 ${r.retries} 次，进入后台 ${hiddenCount} 次`);
     refreshList();
   } catch (e) {
@@ -426,11 +431,14 @@ $("pauseBtn").onclick = () => { if (run) { run.paused = true; run.controller.abo
 // ---------- 录像列表和结果 ----------
 
 let videos = [];
-let openId = null;     // 正在看哪一局
+let openId = null;     // 正在看哪一段
 let shownKey = "";     // 结果区已经画过的内容，没变化就不重画（不然视频会被打断）
 let pollTimer = null;
 let node = null;       // Mac 处理节点：{ name, seenAt }
 let clockSkew = 0;     // 服务器时间 - 手机时间（毫秒），时间差都按服务器时间算
+let filter = "all";
+let tab = "overview";
+let ai = null;         // GET /ai：能选的模型、默认模型、单价、累计用量
 const serverNow = () => Date.now() + clockSkew;
 const NODE_ONLINE_MS = 90 * 1000; // 节点空闲时每 15 秒来问一次任务，处理中每 20 秒汇报一次
 
@@ -438,6 +446,22 @@ const NODE_ONLINE_MS = 90 * 1000; // 节点空闲时每 15 秒来问一次任务
 const sinceReport = (j) => (j && j.updatedAt ? Math.max(0, (serverNow() - new Date(j.updatedAt)) / 1000) : 0);
 const fmtAbout = (s) => (s < 50 ? `约 ${Math.max(5, Math.round(s / 5) * 5)} 秒` : `约 ${Math.max(1, Math.round(s / 60))} 分钟`);
 const nodeOnline = () => node && serverNow() - new Date(node.seenAt) < NODE_ONLINE_MS;
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+};
+const titleOf = (v) => v.title || v.filename;
+const resultUrl = (v, name) => `${API}/videos/${v.id}/results/${encodeURIComponent(name)}`;
+// 录像是什么时候拍的：手机上文件的时间，没有就用上传时间
+const shotAt = (v) => new Date((v.meta && v.meta.lastModified) || v.createdAt);
+const fmtDate = (d) => d.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const fmtClock = (s) => {
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+};
 
 function queueText(v) {
   const ahead = videos.filter((x) => x.id !== v.id && x.status === "uploaded" && x.job &&
@@ -462,56 +486,117 @@ function statusText(v) {
 }
 const busy = (v) => v.status === "uploaded" && v.job && (v.job.status === "queued" || v.job.status === "processing");
 
+
+// 卡片右下角的小标签：一眼看出这段录像到哪一步了
+function badgeOf(v) {
+  if (v.status !== "uploaded") {
+    const mine = run && !run.finished && run.video.id === v.id;
+    return [mine ? "busy" : "warn", mine ? `上传中 ${(v.uploadedBytes / v.size * 100).toFixed(0)}%` : `没传完 ${(v.uploadedBytes / v.size * 100).toFixed(0)}%`];
+  }
+  const j = v.job || {};
+  if (j.status === "queued") return ["busy", "排队中"];
+  if (j.status === "processing") return ["busy", "处理中" + (j.progress && j.progress.etaSeconds != null ? `，${fmtAbout(Math.max(0, j.progress.etaSeconds - sinceReport(j))).replace("约", "约剩")}` : "")];
+  if (j.status === "done") return ["done", "已完成"];
+  if (j.status === "failed") return ["failed", "处理失败"];
+  if (j.status === "archived") return ["", "云端结果已清理"];
+  return ["", "已上传"];
+}
+const FILTERS = [
+  ["all", "全部", () => true],
+  ["busy", "进行中", (v) => v.status !== "uploaded" || busy(v)],
+  ["done", "已完成", (v) => v.status === "uploaded" && v.job && v.job.status === "done"],
+  ["failed", "失败", (v) => v.status === "uploaded" && v.job && v.job.status === "failed"],
+];
+
+function coverOf(v) {
+  const have = new Set(v.results.map((r) => r.name));
+  for (const name of ["cover.jpg", "players.jpg", "court.jpg", "court.rejected.jpg"]) if (have.has(name)) return resultUrl(v, name);
+  return null;
+}
+
+// 整段处理的进度（0–100），画在封面底部
+function overallPercent(v) {
+  if (v.status !== "uploaded") return v.uploadedBytes / v.size * 100;
+  const p = v.job && v.job.status === "processing" && v.job.progress;
+  if (!p || !Array.isArray(p.steps) || !p.steps.length) return null;
+  const done = p.steps.filter((s) => s.status === "done" || s.status === "skipped").length;
+  const running = p.steps.find((s) => s.status === "running");
+  return (done + (running && running.percent ? running.percent / 100 : 0)) / p.steps.length * 100;
+}
+
+function renderList() {
+  const chips = $("filters");
+  chips.textContent = "";
+  for (const [key, label, test] of FILTERS) {
+    const n = videos.filter(test).length;
+    if (key !== "all" && !n) continue;
+    const b = el("button", key === filter ? "on" : "", label);
+    b.append(el("span", "n", String(n)));
+    b.onclick = () => { filter = key; renderList(); };
+    chips.append(b);
+  }
+  chips.hidden = videos.length < 2;
+  const box = $("list");
+  box.textContent = "";
+  const test = (FILTERS.find((f) => f[0] === filter) || FILTERS[0])[2];
+  const shown = videos.filter(test);
+  if (!videos.length) box.append(el("div", "empty", "还没有录像。点上面的「上传录像」，传完后家里的 Mac 会自动分析。"));
+  else if (!shown.length) box.append(el("div", "empty", "这一类里没有录像"));
+  for (const v of shown) {
+    const card = el("div", "vcard");
+    const cover = el("div", "cover");
+    const src = coverOf(v);
+    if (src) cover.style.backgroundImage = `url("${src}")`;
+    else cover.append(el("div", "ph", v.status !== "uploaded" ? "上传中" : busy(v) ? "等待处理" : "没有封面"));
+    if (v.meta && v.meta.duration) cover.append(el("span", "len", fmtClock(v.meta.duration)));
+    const pct = overallPercent(v);
+    if (pct != null) {
+      const bar = el("div", "pbar");
+      const fill = el("div");
+      fill.style.width = pct.toFixed(1) + "%";
+      bar.append(fill);
+      cover.append(bar);
+    }
+    const body = el("div", "body");
+    body.append(el("div", "name", titleOf(v)));
+    body.append(el("div", "sub", `${fmtDate(shotAt(v))} · ${v.options && v.options.mode === "doubles" ? "双打" : "单打"} · ${fmtBytes(v.size)}`));
+    const [cls, text] = badgeOf(v);
+    body.append(el("span", "badge " + cls, text));
+    card.append(cover, body);
+    card.onclick = () => { location.hash = "#/v/" + v.id; };
+    box.append(card);
+  }
+  renderNodeLine();
+}
+
 async function refreshList() {
-  const ul = $("list");
   try {
     const data = await api("/videos");
     videos = data.videos;
     node = data.node;
     if (data.now) clockSkew = new Date(data.now) - Date.now();
   } catch (e) {
-    ul.innerHTML = '<li class="quiet">读取失败</li>';
+    $("list").textContent = "";
+    $("list").append(el("div", "empty", "读取失败：" + e.message));
     return;
   }
-  ul.textContent = "";
-  if (!videos.length) ul.innerHTML = '<li class="quiet">还没有录像</li>';
-  for (const v of videos) {
-    const li = document.createElement("li");
-    li.className = "video";
-    const left = document.createElement("span");
-    const name = document.createElement("div");
-    name.className = "name";
-    name.textContent = v.filename;
-    const sub = document.createElement("div");
-    sub.className = "quiet";
-    sub.textContent = `${new Date(v.createdAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${fmtBytes(v.size)} · ${statusText(v)}`;
-    if (v.job && v.job.status === "failed") sub.classList.add("bad");
-    if (v.job && v.job.status === "done") sub.classList.add("ok");
-    left.append(name, sub);
-    const chev = document.createElement("span");
-    chev.className = "chev";
-    chev.textContent = "›";
-    li.append(left, chev);
-    li.onclick = () => openDetail(v.id);
-    ul.append(li);
-  }
-  renderNodeLine();
+  renderList();
   if (openId) renderDetail();
   clearTimeout(pollTimer);
-  if (videos.some(busy)) pollTimer = setTimeout(refreshList, 3000);
+  if (videos.some(busy) || (run && !run.finished)) pollTimer = setTimeout(refreshList, 3000);
 }
 
 function renderNodeLine() {
-  const el = $("nodeLine");
-  el.textContent = "";
-  const dot = document.createElement("span");
-  dot.className = "dot " + (node ? (nodeOnline() ? "on" : "off") : "");
-  let text = "Mac 上的处理程序还没连接过";
+  let text = "家里的 Mac 还没有连接过";
   if (node) {
     const ago = Math.max(0, (serverNow() - new Date(node.seenAt)) / 1000);
-    text = nodeOnline() ? `Mac 在线（${node.name}）` : `Mac 离线（${node.name}），最后在线是 ${fmtDur(ago)}前`;
+    text = nodeOnline() ? `家里的 Mac 在线（${node.name}），传完的录像会自动处理` : `家里的 Mac 离线（${node.name}），最后在线是 ${fmtDur(ago)}前；上线后自动继续`;
   }
-  el.append(dot, text);
+  for (const id of ["nodeLine", "nodeLine2"]) {
+    const line = $(id);
+    line.textContent = "";
+    line.append(el("span", "dot " + (node ? (nodeOnline() ? "on" : "off") : "")), text);
+  }
 }
 
 const STEP_ICON = { done: "✓", running: "●", pending: "○", skipped: "–", failed: "✕" };
@@ -582,47 +667,85 @@ setInterval(() => {
   if (v && busy(v)) renderProgress(v);
 }, 1000);
 
+
+// ---------- 页面切换：#/ 首页，#/upload 上传，#/v/<id> 一段录像，#/settings 设置 ----------
+
+function route() {
+  const h = location.hash || "#/";
+  const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
+  const name = m ? "vDetail" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
+  for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
+  if (m) openDetail(m[1]);
+  else closeDetail();
+  if (name === "vUpload" && !$("upDone").hidden) {
+    // 上一段已经传完：回到空白的上传页，方便接着传下一段
+    file = null;
+    $("file").value = "";
+    $("info").hidden = $("progress").hidden = $("upDone").hidden = true;
+  }
+  if (name === "vSettings") loadAi();
+  if (name === "vHome") refreshList();
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", () => { if (token && !$("app").hidden) route(); });
+
 function openDetail(id) {
+  if (openId === id) return;
   openId = id;
   shownKey = "";
   reviewKey = "";
   reviewError = "";
-  $("dBody").textContent = "";
-  $("dReview").textContent = "";
-  $("detail").hidden = false;
-  $("listCard").hidden = true;
-  $("dDelete").textContent = "删除这局";
+  for (const pane of ["dStats", "dReview", "tVideos", "tCards"]) $(pane).textContent = "";
+  $("dRenameBox").hidden = true;
+  $("dDelete").textContent = "删除这段录像";
   delete $("dDelete").dataset.armed;
-  renderDetail();
-  $("detail").scrollIntoView({ block: "start" });
+  const v = videos.find((x) => x.id === id);
+  // 还在处理或者失败了：先看处理情况；有结果了：先看概览
+  setTab(v && v.job && v.job.status === "done" ? "overview" : v ? "process" : "overview");
+  if (v) renderDetail();
+  else refreshList();
 }
 function closeDetail() {
   openId = null;
-  $("dBody").textContent = ""; // 停掉正在放的视频
-  $("detail").hidden = true;
-  $("listCard").hidden = false;
+  for (const pane of ["tVideos", "tCards"]) $(pane).textContent = ""; // 停掉正在放的视频
 }
-$("dBack").onclick = closeDetail;
 
+const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", process: "tProcess" };
+function setTab(name) {
+  tab = name;
+  for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
+  for (const [key, id] of Object.entries(TABS)) $(id).hidden = key !== name;
+  if (name !== "videos") for (const v of $("tVideos").querySelectorAll("video")) v.pause();
+}
+for (const b of $("tabs").children) b.onclick = () => setTab(b.dataset.tab);
+
+// 结果文件放在哪个标签里、叫什么
 const RESULT_ORDER = [
-  [/^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
-  [/^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
-  [/^combined\.mp4$/, () => "羽毛球轨迹 + 骨架视频"],
-  [/^longest\.mp4$/, () => "最长的几个回合"],
-  [/^rallies\.mp4$/, () => "只有回合的精简视频"],
-  [/^skeleton\.mp4$/, () => "骨架视频"],
-  [/^players\.(png|jpg)$/, () => "球员编号"],
-  [/^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
-  [/^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
+  ["videos", /^combined\.mp4$/, () => "羽毛球轨迹 + 骨架"],
+  ["videos", /^skeleton\.mp4$/, () => "骨架视频"],
+  ["videos", /^rallies\.mp4$/, () => "只有回合的精简版"],
+  ["videos", /^longest\.mp4$/, () => "最长的几个回合"],
+  ["cards", /^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
+  ["cards", /^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
+  ["cards", /^players\.(png|jpg)$/, () => "球员编号"],
+  ["cards", /^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
+  ["cards", /^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
 ];
 
 async function renderDetail() {
   const v = videos.find((x) => x.id === openId);
-  if (!v) return closeDetail();
-  $("dTitle").textContent = v.filename;
+  if (!v) { location.hash = "#/"; return; }
+  $("dTitle").textContent = titleOf(v);
+  const m = v.meta || {};
+  $("dMeta").textContent = [
+    v.title ? v.filename : "", fmtDate(shotAt(v)), m.duration ? fmtDur(m.duration) : "",
+    m.width ? `${m.width}×${m.height}${m.fps ? ` ${Math.round(m.fps)} 帧` : ""}` : "", fmtBytes(v.size),
+    v.options && v.options.mode === "doubles" ? "双打" : "单打",
+  ].filter(Boolean).join(" · ");
   const st = $("dStatus");
-  st.textContent = statusText(v) + (v.options && v.options.mode === "doubles" ? " · 双打" : " · 单打");
+  st.textContent = statusText(v);
   st.className = v.job && v.job.status === "failed" ? "bad" : v.job && v.job.status === "done" ? "ok" : "quiet";
+  st.hidden = Boolean(v.job && v.job.status === "done");
   renderProgress(v);
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
@@ -632,47 +755,69 @@ async function renderDetail() {
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   renderReview(v);
-  const key = v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
+  const key = v.id + "|" + v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
   shownKey = key;
-  const body = $("dBody");
-  body.textContent = "";
-  const url = (name) => `${API}/videos/${v.id}/results/${encodeURIComponent(name)}`;
   const have = new Set(v.results.map((r) => r.name));
-
+  const stats = $("dStats");
+  stats.textContent = "";
   let names = {};
   if (have.has("movement.json")) {
     try {
-      const mv = await (await fetch(url("movement.json"))).json();
-      if (openId !== v.id) return;
-      body.append(statsTable(mv));
+      const mv = await (await fetch(resultUrl(v, "movement.json"))).json();
+      if (openId !== v.id || key !== shownKey) return;
+      stats.append(statsTable(mv));
       for (const p of mv.players || []) if (p.name) names[p.id] = p.name;
     } catch {}
   }
-  for (const [pattern, title] of RESULT_ORDER) {
+  const panes = { videos: $("tVideos"), cards: $("tCards") };
+  for (const pane of Object.values(panes)) pane.textContent = "";
+  for (const [where, pattern, title] of RESULT_ORDER) {
     for (const r of v.results) {
-      const m = r.name.match(pattern);
-      if (!m) continue;
-      const h = document.createElement("h3");
-      h.textContent = title(m, names);
-      body.append(h);
+      const match = r.name.match(pattern);
+      if (!match) continue;
+      const h = el("h3", "", title(match, names));
+      panes[where].append(h);
       if (r.name.endsWith(".mp4")) {
-        const el = document.createElement("video");
-        el.controls = true;
-        el.playsInline = true;
-        el.preload = "metadata";
-        el.src = url(r.name);
-        body.append(el);
+        const video = document.createElement("video");
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = "metadata";
+        video.src = resultUrl(v, r.name);
+        panes[where].append(video);
       } else {
-        const el = document.createElement("img");
-        el.loading = "lazy";
-        el.alt = h.textContent;
-        el.src = url(r.name);
-        body.append(el);
+        const img = document.createElement("img");
+        img.loading = "lazy";
+        img.alt = h.textContent;
+        img.src = resultUrl(v, r.name);
+        panes[where].append(img);
       }
     }
   }
+  const waiting = v.job && v.job.status === "archived" ? "云端只保留最近约 10 GB 的结果，这一段的结果已经清理，Mac 上还有。点「处理」里的「重新处理」可以重新生成。"
+    : "处理完成后，结果会出现在这里。进度在「处理」里。";
+  for (const pane of Object.values(panes)) if (!pane.children.length) pane.append(el("p", "empty", waiting));
+  const empty = $("dOverviewEmpty");
+  empty.hidden = have.has("movement.json") || have.has("review.md") || have.has("review.request.json");
+  empty.textContent = waiting;
 }
+
+// 改标题
+$("dRename").onclick = () => {
+  const v = videos.find((x) => x.id === openId);
+  if (!v) return;
+  $("dRenameBox").hidden = !$("dRenameBox").hidden;
+  $("dTitleInput").value = v.title || "";
+  $("dTitleInput").placeholder = v.filename;
+  if (!$("dRenameBox").hidden) $("dTitleInput").focus();
+};
+$("dTitleSave").onclick = async () => {
+  try {
+    await api("/videos/" + openId, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: $("dTitleInput").value }) });
+    $("dRenameBox").hidden = true;
+  } catch (e) { log("改标题失败：" + e.message); }
+  refreshList();
+};
 
 // ---------- AI 报告 ----------
 
@@ -730,54 +875,88 @@ function renderMarkdown(md) {
   return root;
 }
 
+
 let reviewKey = "";    // AI 报告区已经画过的内容
-let reviewBusy = "";   // 正在生成报告或回答追问的那一局
+let reviewBusy = "";   // 正在生成报告或回答追问的那一段
 let reviewError = "";
+let reviewModel = "";  // 这次想用的模型；空着就是默认模型
+
+const fmtTokens = (n) => (n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(n));
+function fmtCost(usd) {
+  if (usd == null) return "价格未知（没有单价）";
+  return usd < 0.01 ? `约 $${usd.toFixed(4)}` : `约 $${usd.toFixed(2)}`;
+}
+const modelLabel = (id) => ((ai && ai.models.find((m) => m.id === id)) || { label: id }).label;
+function usageLine(u) {
+  return `${modelLabel(u.model)} · 输入 ${fmtTokens(u.inputTokens)} + 输出 ${fmtTokens(u.outputTokens)} token · ${fmtCost(u.costUsd)}`;
+}
+
+function modelSelect() {
+  const sel = document.createElement("select");
+  for (const m of (ai && ai.models) || []) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    const price = m.priceIn != null && m.priceOut != null ? `（$${m.priceIn} / $${m.priceOut} 每百万 token）` : "（没有单价）";
+    o.textContent = m.label + (ai.defaultModel === m.id ? " · 默认" : "") + price;
+    sel.append(o);
+  }
+  sel.value = reviewModel || (ai && ai.defaultModel) || "";
+  sel.onchange = () => { reviewModel = sel.value; };
+  return sel;
+}
 
 async function renderReview(v, force) {
   const box = $("dReview");
   const find = (name) => v.results.find((r) => r.name === name);
   const md = find("review.md"), qa = find("review.qa.md"), can = find("review.request.json");
-  const busy = reviewBusy === v.id;
-  const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busy, reviewError].join("|");
+  const busyNow = reviewBusy === v.id;
+  const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busyNow, reviewError, (v.ai || []).length, ai && ai.defaultModel, ai && ai.available].join("|");
   if (!force && key === reviewKey) return;
   reviewKey = key;
   if (!md && !can) { box.textContent = ""; return; }
   const text = async (name) => {
-    try { return await (await fetch(`${API}/videos/${v.id}/results/${name}?t=${Date.now()}`)).text(); } catch { return ""; }
+    try { return await (await fetch(`${resultUrl(v, name)}?t=${Date.now()}`)).text(); } catch { return ""; }
   };
   const [report, answers] = await Promise.all([md ? text("review.md") : "", qa ? text("review.qa.md") : ""]);
   if (openId !== v.id || key !== reviewKey) return;
   const draft = box.querySelector("textarea") ? box.querySelector("textarea").value : "";
   box.textContent = "";
-  const h = document.createElement("h3");
-  h.textContent = "AI 报告";
-  box.append(h);
-  if (report) box.append(renderMarkdown(report));
-  if (answers) {
-    const h2 = document.createElement("h3");
-    h2.textContent = "追问";
-    box.append(h2, renderMarkdown(answers));
+  box.append(el("h3", "", "AI 报告"));
+  const usage = v.ai || [];
+  const lastReport = [...usage].reverse().find((u) => u.kind === "report");
+  if (report) {
+    box.append(renderMarkdown(report));
+    if (lastReport) box.append(el("p", "usage", usageLine(lastReport)));
   }
-  const note = document.createElement("p");
-  note.className = reviewError ? "bad" : "quiet";
-  note.textContent = reviewError || (busy ? "正在请大模型写，大约需要一分钟，请不要关闭页面……"
-    : report ? "" : "这局还没有 AI 报告。它只根据上面这些统计数字写，不看视频。");
+  if (answers) {
+    box.append(el("h3", "", "追问"), renderMarkdown(answers));
+    // 这份报告之后的追问用量
+    const asks = usage.slice(lastReport ? usage.lastIndexOf(lastReport) + 1 : 0).filter((u) => u.kind === "ask");
+    for (const [i, u] of asks.entries()) box.append(el("p", "usage", `第 ${i + 1} 问：${usageLine(u)}`));
+  }
+  if (usage.length > 1) {
+    const total = usage.reduce((t, u) => t + (u.costUsd || 0), 0);
+    const unknown = usage.some((u) => u.costUsd == null);
+    box.append(el("p", "usage", `这段录像一共调用模型 ${usage.length} 次，合计${fmtCost(total)}${unknown ? "（不含没有单价的）" : ""}`));
+  }
+  const available = !ai || ai.available;
+  const note = el("p", reviewError ? "bad" : "quiet",
+    reviewError || (busyNow ? "正在请大模型写，大约需要一分钟，请不要关闭页面……"
+      : !available ? "网站还没有配置模型的 API key，暂时出不了 AI 报告。"
+      : report ? "" : "这段录像还没有 AI 报告。它只根据上面这些统计数字写，不看视频。"));
   if (note.textContent) box.append(note);
-  if (!can || busy) return;
-  const row = document.createElement("div");
-  row.className = "row";
-  const make = document.createElement("button");
-  make.className = "plain";
-  make.textContent = report ? "重新生成报告" : "生成 AI 报告";
+  if (!can || busyNow || !available) return;
+  const field = el("div", "field");
+  field.append(el("label", "", "用哪个模型"), modelSelect());
+  box.append(field);
+  const row = el("div", "row");
+  const make = el("button", "plain", report ? "重新生成报告" : "生成 AI 报告");
   make.onclick = () => runReview(v.id, "/review", {});
   if (report) {
     const input = document.createElement("textarea");
     input.placeholder = "追问，例如：我下次最该先练哪一项？";
     input.value = draft;
-    const ask = document.createElement("button");
-    ask.className = "plain";
-    ask.textContent = "追问";
+    const ask = el("button", "plain", "追问");
     ask.onclick = () => {
       const question = input.value.trim();
       if (!question) return;
@@ -798,7 +977,10 @@ async function runReview(id, path, body) {
   const again = () => { const v = videos.find((x) => x.id === id); if (v && openId === id) renderReview(v); };
   again();
   try {
-    await api(`/videos/${id}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    await api(`/videos/${id}${path}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, ...(reviewModel ? { model: reviewModel } : {}) }),
+    });
   } catch (e) {
     reviewError = "AI 报告没有成功：" + e.message;
     log(reviewError);
@@ -808,20 +990,20 @@ async function runReview(id, path, body) {
   again();
 }
 
+// 概览顶部的几个大数字和球员表
 function statsTable(mv) {
   const wrap = document.createElement("div");
-  const p = document.createElement("p");
-  p.className = "quiet";
   const rallies = (mv.rallies || []).length;
-  p.textContent = `共 ${fmtDur(mv.duration_s || 0)}，${rallies} 个回合，回合内 ${fmtDur(mv.in_play_s || 0)}`;
-  wrap.append(p);
+  const kpis = el("div", "kpis");
+  for (const [value, label] of [[fmtDur(mv.duration_s || 0), "录像时长"], [String(rallies), "回合"], [fmtDur(mv.in_play_s || 0), "回合内时间"]]) {
+    const k = el("div");
+    k.append(el("b", "", value), el("span", "", label));
+    kpis.append(k);
+  }
+  wrap.append(kpis);
   const table = document.createElement("table");
   const head = table.insertRow();
-  for (const t of ["球员", "跑动", "平均速度", "最快"]) {
-    const th = document.createElement("th");
-    th.textContent = t;
-    head.append(th);
-  }
+  for (const t of ["球员", "跑动", "平均速度", "最快"]) head.append(el("th", "", t));
   for (const pl of mv.players || []) {
     const row = table.insertRow();
     const cells = [
@@ -835,6 +1017,91 @@ function statsTable(mv) {
   wrap.append(table);
   return wrap;
 }
+
+// ---------- 设置：默认模型、单价、累计用量 ----------
+
+async function loadAi() {
+  try { ai = await api("/ai"); } catch (e) { $("aiState").textContent = "读取失败：" + e.message; return; }
+  renderAi();
+  const v = openId && videos.find((x) => x.id === openId);
+  if (v) renderReview(v);
+}
+
+function renderAi() {
+  $("aiState").textContent = ai.available ? "每段录像处理完会自动出一份报告。模型只读程序算出的统计数字，不看视频。"
+    : "网站还没有配置模型的 API key，暂时出不了 AI 报告。";
+  const sel = $("aiDefault");
+  sel.textContent = "";
+  for (const m of ai.models) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.label;
+    sel.append(o);
+  }
+  sel.value = ai.defaultModel;
+  const usage = $("aiUsage");
+  usage.textContent = "";
+  if (!ai.usage.length) usage.textContent = "还没有调用过模型。";
+  else {
+    const table = document.createElement("table");
+    const head = table.insertRow();
+    for (const t of ["模型", "次数", "输入", "输出", "估算"]) head.append(el("th", "", t));
+    let calls = 0, cost = 0, unknown = false;
+    for (const u of ai.usage) {
+      const row = table.insertRow();
+      for (const c of [modelLabel(u.model), u.calls, fmtTokens(u.inputTokens), fmtTokens(u.outputTokens), u.costUsd != null ? "$" + u.costUsd.toFixed(u.costUsd < 0.1 ? 4 : 2) : "—"]) row.insertCell().textContent = c;
+      calls += u.calls;
+      cost += u.costUsd || 0;
+      unknown = unknown || u.unpricedCalls > 0;
+    }
+    const sum = table.insertRow();
+    for (const c of ["合计", calls, "", "", "$" + cost.toFixed(cost < 0.1 ? 4 : 2)]) sum.insertCell().textContent = c;
+    usage.append(table);
+    const since = ai.usage.map((u) => u.since).sort()[0];
+    usage.append(el("p", "quiet", `从 ${new Date(since).toLocaleDateString("zh-CN")} 起${unknown ? "；有些调用当时没有单价，没算进合计" : ""}`));
+  }
+  const prices = $("prices");
+  prices.textContent = "";
+  const head = prices.insertRow();
+  for (const t of ["模型", "输入", "输出"]) head.append(el("th", "", t));
+  for (const m of ai.models) {
+    const row = prices.insertRow();
+    row.insertCell().textContent = m.label;
+    for (const [field, value] of [["in", m.priceIn], ["out", m.priceOut]]) {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "0";
+      input.step = "0.01";
+      input.inputMode = "decimal";
+      input.placeholder = "未知";
+      input.value = value != null ? value : "";
+      input.dataset.model = m.id;
+      input.dataset.field = field;
+      row.insertCell().append(input);
+    }
+  }
+}
+
+async function saveAi(body, done) {
+  try {
+    ai = await api("/ai/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    renderAi();
+    log(done);
+  } catch (e) { log("保存设置失败：" + e.message); $("aiState").textContent = "保存失败：" + e.message; }
+}
+$("aiDefault").onchange = () => saveAi({ defaultModel: $("aiDefault").value }, "默认模型已改成 " + modelLabel($("aiDefault").value));
+$("aiSave").onclick = () => {
+  const prices = {};
+  for (const input of $("prices").querySelectorAll("input")) {
+    const p = (prices[input.dataset.model] = prices[input.dataset.model] || {});
+    if (input.value !== "") p[input.dataset.field] = Number(input.value);
+  }
+  $("aiSave").textContent = "已保存";
+  setTimeout(() => { $("aiSave").textContent = "保存设置"; }, 1500);
+  saveAi({ prices }, "单价已保存");
+};
+
+// ---------- 处理：重新处理、改单打双打、删除 ----------
 
 $("dRetry").onclick = async () => {
   try {
@@ -862,8 +1129,7 @@ $("dDelete").onclick = async () => {
   const v = videos.find((x) => x.id === openId);
   await api("/videos/" + openId, { method: "DELETE" }).catch((e) => log("删除失败：" + e.message));
   if (v) log("已从云端删除 " + v.filename);
-  closeDetail();
-  refreshList();
+  location.hash = "#/";
 };
 document.addEventListener("visibilitychange", () => { if (!document.hidden && token && !$("app").hidden) refreshList(); });
 
