@@ -33,6 +33,8 @@ PART_SIZE = 16 * 1024 * 1024
 DOWNLOAD_CHUNK = 4 * 1024 * 1024
 WEB_HEIGHT = 1080                      # result videos are re-encoded for the phone
 WEB_BITRATE = "6M"
+WEB_IMAGE_BYTES = 1_500_000            # pictures larger than this (4K frames) are shrunk for the phone
+WEB_IMAGE_WIDTH = 1920
 
 
 class ApiError(RuntimeError):
@@ -195,6 +197,7 @@ STEPS = [
     ("label", "球员编号"),
     ("stats", "跑动和站位统计"),
     ("cut", "剪辑回合视频"),
+    ("shuttle", "羽毛球追踪"),
     ("upload", "转码并上传结果"),
 ]
 HISTORY_KEEP = 8
@@ -417,6 +420,17 @@ def web_video(src: Path, dst: Path) -> Path:
     return dst if done.returncode == 0 and dst.exists() and dst.stat().st_size else src
 
 
+def web_image(src: Path, dst: Path) -> Path:
+    """A 4K frame saved as PNG is 8-9 MB; the phone gets a 1920-wide JPEG instead. Cards stay as they are."""
+    if src.stat().st_size <= WEB_IMAGE_BYTES or not shutil.which("ffmpeg"):
+        return src
+    done = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+         "-vf", f"scale='min({WEB_IMAGE_WIDTH},iw)':-2", "-q:v", "3", str(dst)],
+        capture_output=True, text=True)
+    return dst if done.returncode == 0 and dst.exists() and dst.stat().st_size else src
+
+
 CALIBRATION_FRACTIONS = (0.5, 0.25, 0.75, 0.1, 0.9)  # where in the recording to look for a clear view of the court
 GOOD_CONFIDENCE = 85                                 # stop looking once a fit is this good (percent)
 _CONFIDENCE = re.compile(r"置信度 (\d+)%")
@@ -469,6 +483,48 @@ def auto_calibrate_video(work: Path, court: Path, duration: float, progress: Pro
 
 # `badminton analyze` announces its stages with lines like "== 2/4 骨架 =="
 _ANALYZE_STAGES = (("== 2/4", "skeleton"), ("== 3/4", "label"), ("== 4/4", "stats"), ("== 剪掉死球时间", "cut"))
+
+
+_SEEN = re.compile(r"(\d+) 帧有球（([\d.]+)%）")
+
+
+def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, log: list[str], run=None) -> Path | None:
+    """Shuttle track drawn on the skeleton video. Returns the combined video, or None when it could not be
+    made: the shuttle model is the least reliable part, so a failure here does not fail the whole job."""
+    run = run or run_step
+    skeleton = out_dir / f"{work.stem}.skeleton.mp4"
+    csv = out_dir / f"{work.stem}.shuttle.csv"
+    combined = out_dir / f"{work.stem}.combined.mp4"
+    if not skeleton.exists():
+        progress.skip("shuttle", "没有骨架视频，画不了球的轨迹")
+        return None
+    if combined.exists() and csv.exists() and combined.stat().st_mtime >= skeleton.stat().st_mtime:
+        progress.skip("shuttle", "沿用上次的结果")
+        return combined
+    progress.start("shuttle", "逐帧找球")
+    seen = ""
+
+    def on_line(line: str) -> None:
+        nonlocal seen
+        m = _SEEN.search(line)
+        if m:
+            seen = f"{m.group(2)}% 的画面里找到了球"
+
+    def on_frames(done: int, total: int, minutes_left: float | None) -> None:
+        progress.update("shuttle", percent=done * 80 // total, detail=f"逐帧找球 {done}/{total} 帧")
+
+    mark = len(log)
+    ok = run(["shuttle", str(work), "--court", str(court), "-o", str(csv)], log, on_line, on_frames) == 0 and csv.exists()
+    if ok:
+        progress.update("shuttle", percent=80, detail="把球的轨迹画到骨架视频上")
+        ok = run(["overlay", str(skeleton), "--shuttle", str(csv), "-o", str(combined)], log, None, None) == 0
+    if not ok or not combined.exists():
+        reason = log[-1] if len(log) > mark else "没有输出"
+        print(f"  羽毛球追踪没有成功：{reason}")
+        progress.skip("shuttle", f"这次没有成功，其它结果不受影响（{reason[:120]}）")
+        return None
+    progress.done("shuttle", seen or None)
+    return combined
 
 
 def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str]) -> list[Path]:
@@ -527,7 +583,12 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
     for key in ("skeleton", "label", "stats", "cut"):  # anything analyze did not announce
         if progress.steps[key]["status"] == "pending":
             progress.skip(key, "这次没有运行")
+    combined = track_shuttle(work, court, out_dir, progress, log)
     files = sorted(p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in RESULT_SUFFIXES)
+    if combined:  # the combined video is the skeleton video plus the shuttle: no need to send both
+        files = [p for p in files if p.name != f"{work.stem}.skeleton.mp4"]
+    else:
+        files = [p for p in files if p.name != f"{work.stem}.combined.mp4"]
     return extra + files
 
 
@@ -594,8 +655,11 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         try:
             files = analyse_fn(local, out_dir, options, progress, log)
         except StepFailedWithFiles as e:
+            (job_dir / "web").mkdir(exist_ok=True)
             for f in e.files:
-                api.upload_result(vid, f, result_name(f, local.stem))
+                name = result_name(f, local.stem)
+                small = web_image(f, job_dir / "web" / (name[:-4] + ".jpg"))
+                api.upload_result(vid, small, name[:-4] + small.suffix.lower())
             raise
         web_dir = job_dir / "web"
         web_dir.mkdir(exist_ok=True)
@@ -605,6 +669,9 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
             progress.update("upload", percent=(i - 1) * 100 // len(files), detail=f"第 {i}/{len(files)} 个：{name}")
             if f.suffix.lower() == ".mp4":
                 f = web_video(f, web_dir / name)
+            elif f.suffix.lower() == ".png":
+                f = web_image(f, web_dir / (name[:-4] + ".jpg"))
+                name = name[:-4] + f.suffix.lower()
             print(f"  上传 {name}（{f.stat().st_size / 1e6:.1f} MB）")
             api.upload_result(vid, f, name)
         progress.done("upload", f"{len(files)} 个文件")
@@ -635,6 +702,10 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
     except ApiError as e:
         raise SystemExit("口令不对，连不上 " + cfg.url if e.status == 401 else f"连不上 {cfg.url}：{e}") from None
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
+    try:  # when the output goes to a log file, write each line at once instead of in 8 KB blocks
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     print(f"处理节点 {cfg.name} 已连接 {cfg.url}，原片和结果放在 {cfg.work_dir}。Ctrl+C 退出。")
     while True:
         try:

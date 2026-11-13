@@ -262,13 +262,13 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     first = p.to_json()
     assert first["etaSeconds"] is None and first["elapsedSeconds"] == 10
     assert first["steps"][0]["seconds"] == 10 and "estimateSeconds" not in first["steps"][3]
-    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("upload", 12)):
+    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("upload", 12)):
         p.start(key)          # starting the next step finishes the one before
         clock.t += seconds
     p.done("upload")
     done = p.to_json()
-    assert [s["status"] for s in done["steps"]] == ["done"] * 8
-    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 12]
+    assert [s["status"] for s in done["steps"]] == ["done"] * 9
+    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 12]
     assert done["etaSeconds"] == 0
 
     # second recording, twice as long and twice as big: estimates scale with it
@@ -280,10 +280,81 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     j = p2.to_json()
     assert j["steps"][0]["etaSeconds"] == 12
     assert j["steps"][3]["estimateSeconds"] == 80           # skeleton: 40 s for 20 s of video -> 80 s for 40 s
-    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 24
+    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 24
     p2.start("sdr")
     clock.t += 6
     assert p2.to_json()["steps"][1]["etaSeconds"] == 10     # 16 s expected, 6 s gone
     assert p2.stage_text() == "HDR 转 SDR"
     p2.fail()
     assert p2.to_json()["steps"][1]["status"] == "failed"
+
+
+def test_big_pictures_are_shrunk_for_the_phone_and_cards_are_not(cloud, tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("needs ffmpeg")
+    monkeypatch.setattr(node, "WEB_IMAGE_BYTES", 20_000)
+    frame = tmp_path / "frame.png"   # noise does not compress: a "4K frame"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "nullsrc=s=2560x1440,geq=random(1)*255:128:128",
+                    "-frames:v", "1", str(frame)], check=True)
+    card = tmp_path / "card.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=navy:s=900x1200",
+                    "-frames:v", "1", str(card)], check=True)
+
+    def pictures(video, out_dir, options, progress, log):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(frame, out_dir / f"{video.stem}.players.png")
+        shutil.copy(card, out_dir / f"{video.stem}.movement.1.png")
+        return sorted(out_dir.iterdir())
+
+    node.run(config(cloud, tmp_path), once=True, analyse_fn=pictures)
+    assert set(cloud.results) == {"players.jpg", "movement.1.png"}
+    assert cloud.results["players.jpg"][:2] == b"\xff\xd8"                 # a JPEG
+    assert cloud.results["movement.1.png"] == card.read_bytes()             # untouched
+    out = tmp_path / "work" / cloud.video["id"] / "web" / "players.jpg"
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width", "-of", "csv=p=0", str(out)],
+                           capture_output=True, text=True)
+    assert probe.stdout.strip() == "1920"
+
+
+def shuttle_runner(fail: str | None = None):
+    calls = []
+
+    def run(args, log, on_line=None, on_frames=None):
+        calls.append(args[0])
+        if args[0] == fail:
+            log.append("找不到模型")
+            return 1
+        out = Path(args[args.index("-o") + 1])
+        out.write_bytes(b"x")
+        if args[0] == "shuttle":
+            on_frames(50, 100, 0.1)
+            on_line(f"已写入 {out}：100 帧，70 帧有球（70.0%），其中 3 帧是插值补出来的（Source 列）")
+        return 0
+
+    return run, calls
+
+
+def test_shuttle_track_is_drawn_on_the_skeleton_video(tmp_path):
+    (tmp_path / "v.skeleton.mp4").write_bytes(b"s")
+    run, calls = shuttle_runner()
+    progress = quiet_progress()
+    out = node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run)
+    assert calls == ["shuttle", "overlay"] and out == tmp_path / "v.combined.mp4"
+    step = progress.steps["shuttle"]
+    assert step["status"] == "done" and step["detail"] == "70.0% 的画面里找到了球"
+    # a second run of the same recording does not track again
+    assert node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run) == out
+    assert calls == ["shuttle", "overlay"]
+
+
+@pytest.mark.parametrize("fail", ["shuttle", "overlay"])
+def test_shuttle_failure_does_not_fail_the_job(tmp_path, fail):
+    (tmp_path / "v.skeleton.mp4").write_bytes(b"s")
+    run, _ = shuttle_runner(fail)
+    progress = quiet_progress()
+    assert node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run) is None
+    step = progress.steps["shuttle"]
+    assert step["status"] == "skipped" and "找不到模型" in step["detail"]

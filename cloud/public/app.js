@@ -604,12 +604,13 @@ $("dBack").onclick = closeDetail;
 const RESULT_ORDER = [
   [/^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
   [/^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
+  [/^combined\.mp4$/, () => "羽毛球轨迹 + 骨架视频"],
   [/^longest\.mp4$/, () => "最长的几个回合"],
   [/^rallies\.mp4$/, () => "只有回合的精简视频"],
   [/^skeleton\.mp4$/, () => "骨架视频"],
-  [/^players\.png$/, () => "球员编号"],
-  [/^court\.png$/, () => "球场标定（绿线应该压在白线上）"],
-  [/^court\.rejected\.png$/, () => "自动标定找到的最好结果（红线，没有采用）"],
+  [/^players\.(png|jpg)$/, () => "球员编号"],
+  [/^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
+  [/^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
 ];
 
 async function renderDetail() {
