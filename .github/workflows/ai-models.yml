@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: 部署名：填了就用它试发一句话；不填只列出模型
+        description: 部署名（可以用逗号隔开多个）：填了就用它试发一句话；不填只列出模型
         required: false
         default: ""
 
@@ -52,13 +52,43 @@ jobs:
           show "services.ai /models" "$RESOURCE.services.ai.azure.com/models?api-version=2024-05-01-preview"
           show "项目里的部署" "$RESOURCE.services.ai.azure.com/api/projects/proj-happy-badminton-jay-main-1/deployments?api-version=v1"
 
-      - name: 用指定的部署试发一句话
+      - name: 用指定的部署试发一句话（每种接口都试，看哪种能通）
         if: ${{ inputs.model != '' }}
         run: |
           [ -n "$KEY" ] || { echo "没有 AI_API_KEY / AZURE_API_KEY"; exit 1; }
-          body="$(python3 -c 'import json,os; print(json.dumps({"model": os.environ["MODEL"], "max_completion_tokens": 2000, "messages": [{"role": "system", "content": "你是羽毛球教练。"}, {"role": "user", "content": "用一句中文说明双打前后站位和左右站位各自在什么时候用。"}]}))')"
-          code="$(curl -sS -o out.json -w '%{http_code}' -H "api-key: $KEY" -H 'content-type: application/json' \
-            -d "$body" "$RESOURCE.openai.azure.com/openai/v1/chat/completions" || true)"
-          echo "HTTP $code"
-          python3 -c 'import json; d=json.load(open("out.json")); print(json.dumps({"model": d.get("model"), "choices": [c.get("message", {}).get("content") for c in d.get("choices", [])], "finish": [c.get("finish_reason") for c in d.get("choices", [])], "usage": d.get("usage"), "error": d.get("error")}, ensure_ascii=False, indent=1))'
-          [ "$code" = 200 ]
+          cat > try.py <<'PY'
+          import json, os, subprocess, sys
+          key, res = os.environ["KEY"], os.environ["RESOURCE"]
+          q = "用一句中文说明双打前后站位和左右站位各自在什么时候用。"
+          oai = lambda m: {"model": m, "max_completion_tokens": 2000, "messages": [{"role": "system", "content": "你是羽毛球教练。"}, {"role": "user", "content": q}]}
+          ant = lambda m: {"model": m, "max_tokens": 2000, "system": "你是羽毛球教练。", "messages": [{"role": "user", "content": q}]}
+          routes = [
+              ("openai  openai.azure.com/openai/v1", res + ".openai.azure.com/openai/v1/chat/completions", "api-key", oai),
+              ("openai  services.ai/openai/v1", res + ".services.ai.azure.com/openai/v1/chat/completions", "api-key", oai),
+              ("openai  services.ai/models", res + ".services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview", "api-key", oai),
+              ("anthropic  services.ai/anthropic (x-api-key)", res + ".services.ai.azure.com/anthropic/v1/messages", "x-api-key", ant),
+              ("anthropic  services.ai/anthropic (api-key)", res + ".services.ai.azure.com/anthropic/v1/messages", "api-key", ant),
+          ]
+          ok_any = True
+          for model in [m.strip() for m in os.environ["MODEL"].split(",") if m.strip()]:
+              print("=====", model)
+              ok = False
+              for name, url, header, body in routes:
+                  out = subprocess.run(["curl", "-sS", "-m", "90", "-w", "\n%{http_code}", "-H", f"{header}: {key}", "-H", "content-type: application/json",
+                                        "-H", "anthropic-version: 2023-06-01", "-d", json.dumps(body(model)), url], capture_output=True, text=True).stdout
+                  text, _, code = out.rpartition("\n")
+                  try:
+                      d = json.loads(text)
+                  except ValueError:
+                      d = {"raw": text[:200]}
+                  if code == "200":
+                      answer = (d.get("choices") or [{}])[0].get("message", {}).get("content") if "choices" in d else "".join(b.get("text", "") for b in d.get("content", []))
+                      print(f"  OK   {name} | model={d.get('model')} | usage={json.dumps(d.get('usage'))} | {str(answer)[:80]!r}")
+                      ok = True
+                      break
+                  err = d.get("error") if isinstance(d.get("error"), dict) else d
+                  print(f"  {code}  {name} | {json.dumps(err, ensure_ascii=False)[:200]}")
+              ok_any = ok_any and ok
+          sys.exit(0 if ok_any else 1)
+          PY
+          python3 try.py
