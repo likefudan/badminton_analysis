@@ -43,3 +43,45 @@ def test_overlay_command_writes_video(tmp_path):
     csv.write_text("Frame,Visibility,X,Y\n" + "".join(f"{i},1,{10 + 5 * i},100\n" for i in range(20)))
     assert main(["overlay", str(vid), "--shuttle", str(csv)]) == 0
     assert (tmp_path / "clip.combined.mp4").exists()
+
+
+def test_speed_unit_and_frame_step():
+    from badminton.shuttle_path import rows_from_candidates, speed_unit
+
+    assert speed_unit(1920, 29.97) == 1.0
+    assert speed_unit(3840, 59.94) == 1.0  # twice the pixels, half the time
+    assert speed_unit(3840, 59.94, frame_step=2) == 2.0
+
+    # 150 video px between processed frames: too fast to follow by the 1080p/30 fps rule,
+    # normal when the frames are every second one of a 4K 60 fps video
+    cands = [np.array([[20 + 20 * f, 100, 0.9, 9, 9]], np.float32) for f in range(24)]
+    assert sum(r[1] for r in rows_from_candidates(cands, (3840, 2160), fps=59.94)) == 0
+    rows = rows_from_candidates(cands, (3840, 2160), fps=59.94, frame_step=2, n_frames=47)
+    assert [r[0] for r in rows] == list(range(47)) and all(r[1] for r in rows)
+    assert rows[1][2] == round((20 * 7.5 + 40 * 7.5) / 2)  # skipped frame: halfway
+
+
+def test_far_roi_is_the_far_part_of_the_court():
+    from badminton.camera import Camera
+    from badminton.court import LENGTH, WIDTH, CourtCalibration
+    from badminton.shuttle_path import far_roi
+
+    # a 4K camera 2 m behind the baseline, 2.5 m up, looking down the court; focal 1400 px (0.5x phone lens)
+    w, h, f = 3840, 2160, 1400.0
+    K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]])
+    tilt = np.radians(12)
+    R = np.array([[1, 0, 0], [0, -np.sin(tilt), -np.cos(tilt)], [0, np.cos(tilt), -np.sin(tilt)]])  # world -> camera
+    cam = Camera(K, R, -R @ np.array([WIDTH / 2, -2.0, 2.5]), (w, h))
+    corners = {"near_left_corner": (0, 0), "near_right_corner": (WIDTH, 0), "far_left_corner": (0, LENGTH),
+               "far_right_corner": (WIDTH, LENGTH)}
+    pts = {k: tuple(cam.project([x, y, 0.0])[0]) for k, (x, y) in corners.items()}
+    calib = CourtCalibration(pts, (w, h))
+    roi = far_roi(calib, (w, h))
+    x0, y0, x1, y1 = roi
+    # shuttle smaller than 2 model px beyond 1400 * 0.065 / (2 * 7.5) = 6.1 m: the far half and more, but
+    # not the floor at the camera's feet, and narrower than the frame
+    assert y0 == 0 and y1 < h * 0.8 and x0 > w * 0.1 and x1 < w * 0.9
+    far_net = cam.project([WIDTH / 2, LENGTH, 1.5])[0]
+    assert x0 < far_net[0] < x1 and y0 < far_net[1] < y1
+    # with a long lens the shuttle is large everywhere: nothing to tile
+    assert far_roi(calib, (w, h), min_px=0.2) is None

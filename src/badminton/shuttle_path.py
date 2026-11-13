@@ -31,8 +31,9 @@ STATIC_FRAC = 0.05
 STATIC_CELL = 8  # heatmap pixels
 MIN_SCORE = 0.3
 MAX_GAP = 5  # frames the path may skip between two candidates
-FREE_SPEED = 40.0  # px/frame (video pixels) moved without penalty
-MAX_SPEED = 260.0  # px/frame: anything faster is another object
+# speeds in px/frame as tuned on 1080p at 30 fps; choose_path scales them with `speed_unit`
+FREE_SPEED = 40.0  # moved without penalty
+MAX_SPEED = 260.0  # anything faster is another object
 SPEED_SCALE = 60.0
 GAP_COST = 0.15
 REWARD_OFFSET = 0.25  # a candidate is worth (score - offset)
@@ -90,11 +91,20 @@ def airspace_mask_for_camera(cam, margin_m: float = 1.0, height_m: float = AIR_H
     return mask.astype(bool)
 
 
+def speed_unit(frame_width: int, fps: float | None, frame_step: int = 1) -> float:
+    """How many times further (in video pixels) the same shot moves between two
+    processed frames than in 1080p at 30 fps: 4K has twice the pixels, 60 fps half
+    the time, taking every second frame doubles it again."""
+    rate = round(fps) / frame_step if fps else 30.0
+    return (frame_width / 1920) * (30.0 / rate)
+
+
 def choose_path(candidates: list, scale: tuple[float, float], static: np.ndarray | None = None,
-                mask: np.ndarray | None = None, cell: int = STATIC_CELL) -> np.ndarray:
+                mask: np.ndarray | None = None, cell: int = STATIC_CELL, speed_unit: float = 1.0) -> np.ndarray:
     """candidates: per frame an array of (x, y, peak, ...) in heatmap pixels.
     Returns (F, 3): visibility, x, y in video pixels."""
     sx, sy = scale
+    free_speed, max_speed, speed_scale = FREE_SPEED * speed_unit, MAX_SPEED * speed_unit, SPEED_SCALE * speed_unit
     F = len(candidates)
     nodes = []  # (frame, x, y, reward)
     for f, c in enumerate(candidates):
@@ -132,10 +142,10 @@ def choose_path(candidates: list, scale: tuple[float, float], static: np.ndarray
             continue
         g = (f - fr[j]).astype(float)
         speed = np.hypot(*(xy[i] - xy[j]).T) / g
-        ok = speed <= MAX_SPEED
+        ok = speed <= max_speed
         if not ok.any():
             continue
-        cost = (np.maximum(0, speed - FREE_SPEED) / SPEED_SCALE) ** 2 + GAP_COST * (g - 1)
+        cost = (np.maximum(0, speed - free_speed) / speed_scale) ** 2 + GAP_COST * (g - 1)
         val = np.where(ok, best[j] - cost + rew[i], -np.inf)
         k = int(np.argmax(val))
         if val[k] > best[i]:
@@ -177,17 +187,63 @@ def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
 
 
 def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
-                         measured: list | None = None) -> list:
+                         measured: list | None = None, fps: float | None = None, frame_step: int = 1,
+                         n_frames: int | None = None) -> list:
     """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, short gaps.
 
+    candidates: one array per processed frame (every `frame_step`-th video frame);
+    the rows cover every video frame (skipped ones interpolated, at most `n_frames`).
+    fps: the video's frame rate; with the frame width and frame_step it scales the
+    speed limits, which were tuned on 1080p at 30 fps (None: taken as 30).
+
     If `measured` is a list it is filled with one bool per row: True where the
-    position is a blob TrackNet found in that frame, False where the row is a
-    short gap filled by interpolation (or has no shuttle)."""
+    position is a blob TrackNet found in that frame, False where the row is
+    filled by interpolation (a short gap, a skipped frame) or has no shuttle."""
     w, h = frame_size
     static = static_map(candidates)
     mask = airspace_mask(calib) if calib is not None else None
-    chosen = choose_path(candidates, (w / 512, h / 288), static, mask)
+    chosen = choose_path(candidates, (w / 512, h / 288), static, mask, speed_unit=speed_unit(w, fps, frame_step))
     path = fill_short_gaps(chosen)
+    if frame_step > 1:
+        from .shuttle import expand_rows
+
+        rows = expand_rows(np.rint(path[:, 1]), np.rint(path[:, 2]), path[:, 0], frame_step,
+                           n_frames if n_frames is not None else len(path) * frame_step)
+    else:
+        rows = [(f, int(v), int(round(x)), int(round(y))) for f, (v, x, y) in enumerate(path)]
     if measured is not None:
-        measured[:] = [bool(v) for v in chosen[:, 0] > 0]
-    return [(f + start_frame, int(v), int(round(x)), int(round(y))) for f, (v, x, y) in enumerate(path)]
+        seen = chosen[:, 0] > 0
+        measured[:] = [f % frame_step == 0 and bool(seen[f // frame_step]) for f, *_ in rows]
+    return [(f + start_frame, v, x, y) for f, v, x, y in rows]
+
+
+SHUTTLE_SIZE_M = 0.065  # across the feathers
+MIN_SHUTTLE_PX = 2.0  # model pixels: a shuttle smaller than this in the full frame needs a magnified tile
+
+
+def far_roi(calib, frame_size: tuple[int, int], margin_m: float = 1.0, height_m: float = AIR_HEIGHT_M,
+            min_px: float = MIN_SHUTTLE_PX) -> tuple[int, int, int, int] | None:
+    """Bounding box (x0, y0, x1, y1) of the part of the picture where this court's
+    shuttle is smaller than `min_px` model pixels once the full frame is shrunk to
+    512 wide: the image of the airspace further from the camera than
+    focal length x shuttle size / (min_px x frame width / 512). Only that part needs
+    tiles (shuttle.tile_views). None if the shuttle is large enough everywhere."""
+    from .camera import camera_from_calibration
+    from .court import LENGTH, WIDTH
+
+    w, h = frame_size
+    cam = camera_from_calibration(calib)
+    far = cam.focal_px * SHUTTLE_SIZE_M / (min_px * w / 512)  # metres along the optical axis
+    g = np.stack(np.meshgrid(np.linspace(-margin_m, WIDTH + margin_m, 17),
+                             np.linspace(-margin_m - 1, LENGTH + margin_m + 1, 49),
+                             np.linspace(0.0, height_m, 19)), -1).reshape(-1, 3)
+    g = g[cam.depth(g) > max(far, 0.5)]
+    if len(g) == 0:
+        return None
+    uv = cam.project(g)
+    uv = uv[(uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)]
+    if len(uv) == 0:
+        return None
+    x0, y0 = np.floor(uv.min(0)).astype(int)
+    x1, y1 = np.ceil(uv.max(0)).astype(int) + 1
+    return int(x0), int(y0), int(min(w, x1)), int(min(h, y1))
