@@ -23,7 +23,12 @@ So instead:
      skips have no shuttle;
   4. still runs (with a calibration): stretches of that path that stay within a few pixels for
      8 frames or more, at a pixel that can be on the floor, are dropped (a shuttle lying on a
-     neighbouring court, a shoe). Still stretches above the horizon are kept: the top of a lob.
+     neighbouring court, a shoe). Still stretches above the horizon are kept: the top of a lob;
+  5. other courts (with a calibration): at the top of a flight the shuttle falls with g and nothing
+     else (its drag is horizontal there), so how fast it curves down in the picture tells how far
+     from the camera it is. A flight whose top is clearly nearer or further than this court's
+     airspace along that pixel's ray belongs to another court: it is dropped and the path is
+     chosen again without it.
 """
 
 from __future__ import annotations
@@ -45,6 +50,14 @@ STILL_EXTENT = 0.005  # of the frame width: a stretch of the path that stays wit
 STILL_SECONDS = 0.13  # ... for at least this long (and at least STILL_FRAMES processed frames)
 STILL_FRAMES = 8
 GROUND_MAX_M = 50.0   # a still spot is "on the floor" if its pixel, read as a floor point, is this close to the camera
+GRAVITY = 9.81
+APEX_SECONDS = 0.2    # half of the stretch of path around a top of flight that a parabola is fitted to
+APEX_FIT = 0.0015     # of the frame width: rms distance the path may keep from that parabola
+AWAY_RATIO = 1.3      # distance from gravity vs the ray's stretch through this court's airspace (with margins)
+AWAY_MARGIN_M = 1.0
+AWAY_ROUNDS = 3
+AWAY_RADIUS = 0.004   # of the frame width: candidates this close to a dropped point go with it
+FLIGHT_TOL = 0.006    # of the frame width: a flight goes on while each point is this close to where it was heading
 
 
 def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, frac: float = STATIC_FRAC) -> np.ndarray:
@@ -237,6 +250,140 @@ def floor_test(calib, max_m: float = GROUND_MAX_M):
     return on_floor
 
 
+def _ray_box(c, d, lo, hi):
+    """Distances along the ray c + s d where it is inside the box lo..hi, or None."""
+    d = np.where(np.abs(d) < 1e-12, 1e-12, d)
+    a, b = (lo - c) / d, (hi - c) / d
+    a, b = np.minimum(a, b), np.maximum(a, b)
+    s0, s1 = max(0.0, float(a.max())), float(b.min())
+    return (s0, s1) if s1 > s0 else None
+
+
+class CourtDistance:
+    """How far along a pixel's ray the shuttle is, judged from gravity, and where that ray crosses this
+    court's airspace."""
+
+    def __init__(self, calib, margin_m: float = AWAY_MARGIN_M, height_m: float = AIR_HEIGHT_M):
+        from .camera import camera_from_calibration
+        from .court import LENGTH, WIDTH
+
+        self.calib, self.cam = calib, camera_from_calibration(calib)
+        self.Kinv = np.linalg.inv(self.cam.K)
+        self.lo = np.array([-margin_m, -margin_m - 1, 0.0])
+        self.hi = np.array([WIDTH + margin_m, LENGTH + margin_m + 1, height_m])
+
+    def ray(self, xy) -> np.ndarray:
+        u, v = self.calib.undistort(np.asarray([xy], float))[0]
+        d = self.cam.R.T @ (self.Kinv @ np.array([u, v, 1.0]))
+        return d / np.linalg.norm(d)
+
+    def airspace(self, xy):
+        """(nearest, furthest) distance from the camera where the ray of pixel xy is above this court."""
+        return _ray_box(np.asarray(self.cam.center, float), self.ray(xy), self.lo, self.hi)
+
+    def from_gravity(self, xy, acc) -> float | None:
+        """Distance from the camera along the ray of pixel xy at which falling with g curves the path by
+        `acc` (px/s^2, picture axes). None if the path does not curve downwards."""
+        c, d = np.asarray(self.cam.center, float), self.ray(xy)
+
+        def pull(s):  # picture acceleration of a point at distance s falling with g
+            p = c + s * d
+            return (self.cam.project(p - [0, 0, 0.005])[0] - self.cam.project(p)[0]) / 0.005 * GRAVITY
+
+        g = pull(1.0)
+        down = g / np.linalg.norm(g)
+        a = float(np.dot(acc, down))
+        if a <= 0:
+            return None
+        lo, hi = 0.05, 1000.0  # the pull falls off roughly as 1 / s
+        if np.dot(pull(lo), down) < a or np.dot(pull(hi), down) > a:
+            return None
+        for _ in range(50):
+            mid = np.sqrt(lo * hi)
+            lo, hi = (mid, hi) if np.dot(pull(mid), down) > a else (lo, mid)
+        return float(np.sqrt(lo * hi))
+
+
+def _chains(path, max_gap: int = MAX_GAP) -> list:
+    seen = np.flatnonzero(path[:, 0] > 0)
+    if len(seen) == 0:
+        return []
+    return np.split(seen, np.flatnonzero(np.diff(seen) > max_gap + 1) + 1)
+
+
+def flight_tops(path, rate: float, width: int):
+    """Tops of flight in the chosen path: (frame, xy, acceleration px/s^2) where the path is highest in the
+    picture over +-APEX_SECONDS and a parabola fits it within APEX_FIT of the frame width."""
+    W = max(3, int(round(APEX_SECONDS * rate)))
+    out = []
+    for ch in _chains(path):
+        inside = set(ch.tolist())
+        best = None
+        for k in ch:
+            if k - W < ch[0] or k + W > ch[-1]:
+                continue
+            win = [f for f in range(k - W, k + W + 1) if f in inside]
+            if len(win) < 1.5 * W or path[k, 2] > path[win, 2].min():
+                continue
+            t = (np.array(win) - k) / rate
+            cx, cy = np.polyfit(t, path[win, 1], 2), np.polyfit(t, path[win, 2], 2)
+            res = np.sqrt(np.mean((path[win, 1] - np.polyval(cx, t)) ** 2 + (path[win, 2] - np.polyval(cy, t)) ** 2))
+            if res > APEX_FIT * width:
+                continue
+            top = (k, path[k, 1:3].copy(), np.array([2 * cx[0], 2 * cy[0]]), res)
+            if best is not None and k - best[0] <= W:  # the same top seen from a neighbouring frame
+                if res < best[3]:
+                    best = top
+                continue
+            if best is not None:
+                out.append(best[:3])
+            best = top
+        if best is not None:
+            out.append(best[:3])
+    return out
+
+
+def flight_around(path, k: int, width: int, max_gap: int = MAX_GAP) -> list:
+    """Frames of the chosen path that belong to the same flight as frame k: going out from k, each next
+    point must be within FLIGHT_TOL of the frame width (plus a share of the step) of where the last few
+    points were heading. A hit or a switch to another object ends the flight."""
+    seen = np.flatnonzero(path[:, 0] > 0)
+    i0 = int(np.searchsorted(seen, k))
+    frames = [k]
+    for step in (1, -1):
+        got = [k]
+        i = i0 + step
+        while 0 <= i < len(seen) and abs(seen[i] - got[-1]) <= max_gap + 1:
+            f = seen[i]
+            recent = got[-6:]
+            t = np.array(recent, float)
+            deg = min(2, len(recent) - 1)
+            if deg >= 1:
+                pred = np.array([np.polyval(np.polyfit(t, path[recent, j], deg), f) for j in (1, 2)])
+                move = np.hypot(*(path[recent[-1], 1:3] - pred))
+                if np.hypot(*(path[f, 1:3] - pred)) > FLIGHT_TOL * width + 0.5 * move:
+                    break
+            got.append(f)
+            i += step
+        frames += got[1:]
+    return sorted(frames)
+
+
+def other_court_flights(path, calib, rate: float, width: int, dist: CourtDistance | None = None) -> list:
+    """Flights of the chosen path whose top is clearly not above this court: list of
+    (frames, top frame, distance from gravity, (nearest, furthest) of this court along that ray)."""
+    dist = dist or CourtDistance(calib)
+    out = []
+    for k, xy, acc in flight_tops(path, rate, width):
+        span = dist.airspace(xy)
+        s = dist.from_gravity(xy, acc)
+        if span is None or s is None:
+            continue
+        if s > span[1] * AWAY_RATIO or s < span[0] / AWAY_RATIO:
+            out.append((flight_around(path, k, width), k, s, span))
+    return out
+
+
 def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
     """Linear interpolation over gaps of up to `max_gap` frames inside the chosen path."""
     out = path.copy()
@@ -252,7 +399,8 @@ def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
 def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
                          measured: list | None = None, fps: float | None = None, frame_step: int = 1,
                          n_frames: int | None = None) -> list:
-    """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, short gaps.
+    """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, still runs and flights over
+    other courts (with a calibration), short gaps.
 
     candidates: one array per processed frame (every `frame_step`-th video frame);
     the rows cover every video frame (skipped ones interpolated, at most `n_frames`).
@@ -265,11 +413,28 @@ def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=No
     w, h = frame_size
     static = static_map(candidates)
     mask = airspace_mask(calib) if calib is not None else None
-    chosen = choose_path(candidates, (w / 512, h / 288), static, mask, speed_unit=speed_unit(w, fps, frame_step))
+    scale = (w / 512, h / 288)
+    chosen = choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step))
     if calib is not None:  # without the camera a still shuttle in the air cannot be told from one on the floor
         rate = (round(fps) if fps else 30.0) / frame_step
-        chosen = drop_still_runs(chosen, STILL_EXTENT * w, max(STILL_FRAMES, round(STILL_SECONDS * rate)),
-                                 on_floor=floor_test(calib))
+        on_floor = floor_test(calib)
+
+        def still(p):
+            return drop_still_runs(p, STILL_EXTENT * w, max(STILL_FRAMES, round(STILL_SECONDS * rate)), on_floor=on_floor)
+
+        chosen = still(chosen)
+        dist = CourtDistance(calib)
+        candidates = list(candidates)
+        for _ in range(AWAY_ROUNDS):  # take out flights over other courts and choose again without them
+            away = other_court_flights(chosen, calib, rate, w, dist)
+            if not away:
+                break
+            for frames, *_ in away:
+                for f in frames:
+                    c = candidates[f]
+                    near = np.hypot(c[:, 0] * scale[0] - chosen[f, 1], c[:, 1] * scale[1] - chosen[f, 2]) < AWAY_RADIUS * w
+                    candidates[f] = c[~near]
+            chosen = still(choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step)))
     path = fill_short_gaps(chosen)
     if frame_step > 1:
         from .shuttle import expand_rows

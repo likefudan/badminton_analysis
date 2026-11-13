@@ -498,7 +498,7 @@ def auto_calibrate_video(work: Path, court: Path, duration: float, progress: Pro
 _ANALYZE_STAGES = (("== 2/4", "skeleton"), ("== 3/4", "label"), ("== 4/4", "stats"), ("== 剪掉死球时间", "cut"))
 
 
-SHUTTLE_VERSION = "2"  # raise when shuttle tracking changes, so recordings already on this Mac are tracked again
+SHUTTLE_VERSION = "3"  # raise when shuttle tracking changes, so recordings already on this Mac are tracked again
 _SEEN = re.compile(r"(\d+) 帧有球（([\d.]+)%）")
 
 
