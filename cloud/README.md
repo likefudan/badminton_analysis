@@ -44,7 +44,7 @@ badminton node            # 常驻：每 15 秒查一次有没有新录像
 badminton node --once     # 处理完排队中的就退出
 ```
 
-原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`）→ `badminton analyze` → 结果视频转成手机能放的 1080p H.264 → 上传。
+原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 结果视频转成手机能放的 1080p H.264 → 上传。
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
 
 ## 本地运行
