@@ -183,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和第一个输入同目录")
 
+    s = sub.add_parser("node", help="处理节点：从 ba.llmat.dev 取手机上传的录像，在本机分析，把结果传回去")
+    s.add_argument("--url", help="网站地址，默认 https://ba.llmat.dev")
+    s.add_argument("--work-dir", help="原片和结果放在哪，默认 ~/badminton_uploads")
+    s.add_argument("--once", action="store_true", help="处理完排队中的录像就退出，不常驻")
+    s.add_argument("--interval", type=float, default=15.0, help="没有任务时每隔多少秒查一次，默认 15")
+
     s = sub.add_parser("hits", help="击球时刻和击球人（球轨迹转折 + 手腕速度），输出带数据来源标记的事件 JSON")
     s.add_argument("video")
     s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
@@ -201,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze,
-            "review": cmd_review, "cut": cmd_cut}[a.cmd](a)
+            "review": cmd_review, "cut": cmd_cut, "node": cmd_node}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -1023,6 +1029,12 @@ def cmd_annotate_export(a) -> int:
         print("注意：里面有没人看过的机器预标注，只能用来试流程，不要拿来训练")
     print(f"已导出到 {a.out_dir}（清单 manifest.json）；微调步骤见 docs/tracknet_finetune.md")
     return 0
+
+
+def cmd_node(a) -> int:
+    from . import node
+
+    return node.run(node.Config.load(a.url, a.work_dir), once=a.once, interval=a.interval)
 
 
 def cmd_review(a) -> int:

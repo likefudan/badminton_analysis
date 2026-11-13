@@ -1,4 +1,4 @@
-// 上传测试页：把录像切片传到 /api/v1，可断点续传，并记录速度、中断和后台情况。
+// 手机网页：把录像切片传到 /api/v1（可断点续传），看每一局的处理状态和分析结果。
 "use strict";
 
 const API = "/api/v1";
@@ -63,6 +63,7 @@ async function tryLogin() {
   if (!token) return showLogin("");
   try {
     await api("/me");
+    await api("/session", { method: "POST" }); // 图片和视频靠 cookie 读取
     $("login").hidden = true;
     $("app").hidden = false;
     refreshList();
@@ -299,7 +300,10 @@ async function startUpload() {
     video = await api("/videos", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ filename: file.name, size: file.size, contentType: file.type, meta }),
+      body: JSON.stringify({
+        filename: file.name, size: file.size, contentType: file.type, meta,
+        options: { mode: document.querySelector('input[name="mode"]:checked').value },
+      }),
     });
     try { localStorage.setItem(key, video.id); } catch {}
     log(`新建上传，共 ${video.partCount} 片，每片 ${fmtBytes(video.partSize)}`);
@@ -419,34 +423,188 @@ function render() {
 $("startBtn").onclick = () => startUpload().catch((e) => log("出错：" + e.message));
 $("pauseBtn").onclick = () => { if (run) { run.paused = true; run.controller.abort(); } };
 
-// ---------- 云端列表 ----------
+// ---------- 录像列表和结果 ----------
+
+let videos = [];
+let openId = null;     // 正在看哪一局
+let shownKey = "";     // 结果区已经画过的内容，没变化就不重画（不然视频会被打断）
+let pollTimer = null;
+
+function statusText(v) {
+  if (v.status !== "uploaded") return `上传中 ${(v.uploadedBytes / v.size * 100).toFixed(0)}%`;
+  const j = v.job || {};
+  if (j.status === "queued") return "排队中，等 Mac 处理";
+  if (j.status === "processing") return "处理中：" + (j.stage || "");
+  if (j.status === "done") return "已完成";
+  if (j.status === "failed") return "处理失败";
+  if (j.status === "archived") return "云端结果已清理，Mac 上还有";
+  return "已上传";
+}
+const busy = (v) => v.status === "uploaded" && v.job && (v.job.status === "queued" || v.job.status === "processing");
 
 async function refreshList() {
   const ul = $("list");
   try {
-    const { videos } = await api("/videos");
-    ul.textContent = "";
-    if (!videos.length) { ul.innerHTML = '<li class="quiet">还没有录像</li>'; return; }
-    for (const v of videos) {
-      const li = document.createElement("li");
-      const left = document.createElement("span");
-      const state = v.status === "uploaded" ? "已传完" : `传了 ${(v.uploadedBytes / v.size * 100).toFixed(0)}%`;
-      left.textContent = `${v.filename} · ${fmtBytes(v.size)} · ${state}`;
-      const del = document.createElement("a");
-      del.textContent = "删除";
-      del.onclick = async () => {
-        if (del.dataset.armed !== "1") { del.dataset.armed = "1"; del.textContent = "再点一次确认"; return; }
-        await api("/videos/" + v.id, { method: "DELETE" }).catch((e) => log("删除失败：" + e.message));
-        log("已从云端删除 " + v.filename);
-        refreshList();
-      };
-      li.append(left, del);
-      ul.append(li);
-    }
+    videos = (await api("/videos")).videos;
   } catch (e) {
     ul.innerHTML = '<li class="quiet">读取失败</li>';
+    return;
+  }
+  ul.textContent = "";
+  if (!videos.length) ul.innerHTML = '<li class="quiet">还没有录像</li>';
+  for (const v of videos) {
+    const li = document.createElement("li");
+    li.className = "video";
+    const left = document.createElement("span");
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = v.filename;
+    const sub = document.createElement("div");
+    sub.className = "quiet";
+    sub.textContent = `${new Date(v.createdAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${fmtBytes(v.size)} · ${statusText(v)}`;
+    if (v.job && v.job.status === "failed") sub.classList.add("bad");
+    if (v.job && v.job.status === "done") sub.classList.add("ok");
+    left.append(name, sub);
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    chev.textContent = "›";
+    li.append(left, chev);
+    li.onclick = () => openDetail(v.id);
+    ul.append(li);
+  }
+  if (openId) renderDetail();
+  clearTimeout(pollTimer);
+  if (videos.some(busy)) pollTimer = setTimeout(refreshList, 5000);
+}
+
+function openDetail(id) {
+  openId = id;
+  shownKey = "";
+  $("dBody").textContent = "";
+  $("detail").hidden = false;
+  $("listCard").hidden = true;
+  $("dDelete").textContent = "删除这局";
+  delete $("dDelete").dataset.armed;
+  renderDetail();
+  $("detail").scrollIntoView({ block: "start" });
+}
+function closeDetail() {
+  openId = null;
+  $("dBody").textContent = ""; // 停掉正在放的视频
+  $("detail").hidden = true;
+  $("listCard").hidden = false;
+}
+$("dBack").onclick = closeDetail;
+
+const RESULT_ORDER = [
+  [/^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
+  [/^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
+  [/^longest\.mp4$/, () => "最长的几个回合"],
+  [/^rallies\.mp4$/, () => "只有回合的精简视频"],
+  [/^skeleton\.mp4$/, () => "骨架视频"],
+  [/^players\.png$/, () => "球员编号"],
+  [/^court\.png$/, () => "球场标定（绿线应该压在白线上）"],
+  [/^court\.rejected\.png$/, () => "自动标定找到的最好结果（红线，没有采用）"],
+];
+
+async function renderDetail() {
+  const v = videos.find((x) => x.id === openId);
+  if (!v) return closeDetail();
+  $("dTitle").textContent = v.filename;
+  const st = $("dStatus");
+  st.textContent = statusText(v) + (v.options && v.options.mode === "doubles" ? " · 双打" : " · 单打");
+  st.className = v.job && v.job.status === "failed" ? "bad" : v.job && v.job.status === "done" ? "ok" : "quiet";
+  $("dError").hidden = !(v.job && v.job.error);
+  $("dError").textContent = (v.job && v.job.error) || "";
+  $("dRetry").hidden = !(v.status === "uploaded" && v.job && (v.job.status === "failed" || v.job.status === "done"));
+
+  const key = v.results.map((r) => r.name + ":" + r.size).join("|");
+  if (key === shownKey) return;
+  shownKey = key;
+  const body = $("dBody");
+  body.textContent = "";
+  const url = (name) => `${API}/videos/${v.id}/results/${encodeURIComponent(name)}`;
+  const have = new Set(v.results.map((r) => r.name));
+
+  let names = {};
+  if (have.has("movement.json")) {
+    try {
+      const mv = await (await fetch(url("movement.json"))).json();
+      if (openId !== v.id) return;
+      body.append(statsTable(mv));
+      for (const p of mv.players || []) if (p.name) names[p.id] = p.name;
+    } catch {}
+  }
+  for (const [pattern, title] of RESULT_ORDER) {
+    for (const r of v.results) {
+      const m = r.name.match(pattern);
+      if (!m) continue;
+      const h = document.createElement("h3");
+      h.textContent = title(m, names);
+      body.append(h);
+      if (r.name.endsWith(".mp4")) {
+        const el = document.createElement("video");
+        el.controls = true;
+        el.playsInline = true;
+        el.preload = "metadata";
+        el.src = url(r.name);
+        body.append(el);
+      } else {
+        const el = document.createElement("img");
+        el.loading = "lazy";
+        el.alt = h.textContent;
+        el.src = url(r.name);
+        body.append(el);
+      }
+    }
   }
 }
+
+function statsTable(mv) {
+  const wrap = document.createElement("div");
+  const p = document.createElement("p");
+  p.className = "quiet";
+  const rallies = (mv.rallies || []).length;
+  p.textContent = `共 ${fmtDur(mv.duration_s || 0)}，${rallies} 个回合，回合内 ${fmtDur(mv.in_play_s || 0)}`;
+  wrap.append(p);
+  const table = document.createElement("table");
+  const head = table.insertRow();
+  for (const t of ["球员", "跑动", "平均速度", "最快"]) {
+    const th = document.createElement("th");
+    th.textContent = t;
+    head.append(th);
+  }
+  for (const pl of mv.players || []) {
+    const row = table.insertRow();
+    const cells = [
+      pl.name || pl.id + " 号",
+      pl.distance_m != null ? Math.round(pl.distance_m) + " 米" : "—",
+      pl.mean_speed_mps != null ? pl.mean_speed_mps.toFixed(1) + " 米/秒" : "—",
+      pl.max_speed_mps != null ? pl.max_speed_mps.toFixed(1) + " 米/秒" : "—",
+    ];
+    for (const c of cells) row.insertCell().textContent = c;
+  }
+  wrap.append(table);
+  return wrap;
+}
+
+$("dRetry").onclick = async () => {
+  try {
+    await api(`/videos/${openId}/job/retry`, { method: "POST" });
+    log("已重新排队");
+  } catch (e) { log("重新处理失败：" + e.message); }
+  refreshList();
+};
+$("dDelete").onclick = async () => {
+  const btn = $("dDelete");
+  if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次确认删除"; return; }
+  const v = videos.find((x) => x.id === openId);
+  await api("/videos/" + openId, { method: "DELETE" }).catch((e) => log("删除失败：" + e.message));
+  if (v) log("已从云端删除 " + v.filename);
+  closeDetail();
+  refreshList();
+};
+document.addEventListener("visibilitychange", () => { if (!document.hidden && token && !$("app").hidden) refreshList(); });
 
 $("copyLog").onclick = async () => {
   try { await navigator.clipboard.writeText($("log").textContent); log("记录已复制"); }

@@ -3,11 +3,7 @@
 手机上传录像、Mac 处理、手机看报告这条线的云端部分，跑在 Cloudflare 上（Worker + D1 + R2）。
 设计见方案文档《手机上传录像、手机看报告：可复用的后端方案》。
 
-现在是**阶段 0**：只有分片上传和一个上传测试页，用来在 iPhone 上实测三件事：
-
-1. 从相册或“文件”里选 4K60 录像时，网页拿到的是不是原片（页面会显示分辨率、估计帧率、每分钟大小）。
-2. 实际上传速度。
-3. 切到后台、锁屏、断网之后能不能接着传（页面会记录进入后台的次数和时长）。
+流程：手机网页上传录像（分片、可断点续传）→ 家里的 Mac 上常驻的处理节点（`badminton node`）取走原片，云端立刻删掉原片 → Mac 跑分析，把跑动卡片、统计、精简视频传回云端 → 手机网页上点开这一局看结果。云端只留最近约 10 GB 的结果，更早的只在 Mac 上。
 
 ## 目录
 
@@ -26,7 +22,26 @@
 | `GET /videos/{id}` | 查状态和已传的片（续传用） |
 | `POST /videos/{id}/complete` | 合并，核对总大小 |
 | `GET /videos/{id}/file` | 下载原片，支持 Range（以后 Mac 处理节点用） |
-| `GET /videos`、`DELETE /videos/{id}` | 列表、删除 |
+| `GET /videos`、`DELETE /videos/{id}` | 列表、删除（结果一起删） |
+| `POST /session` | 发一个只读 cookie，网页里的图片和视频靠它读取 |
+| `POST /node/claim` | 处理节点领取一个排队中的录像（节点失联 10 分钟后可被重新领取） |
+| `POST /videos/{id}/job` | 节点汇报进度，或以 `done` / `failed` 结束 |
+| `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打 |
+| `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
+| `PUT /videos/{id}/results/{name}` | 传一个结果文件；大文件用 `.../multipart` 分片传 |
+| `GET /videos/{id}/results/{name}` | 读结果，支持 Range |
+
+## Mac 上的处理节点
+
+```bash
+mkdir -p ~/.config/badminton
+echo '{"token": "网站的登录口令"}' > ~/.config/badminton/node.json && chmod 600 ~/.config/badminton/node.json
+badminton node            # 常驻：每 15 秒查一次有没有新录像
+badminton node --once     # 处理完排队中的就退出
+```
+
+原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`）→ `badminton analyze` → 结果视频转成手机能放的 1080p H.264 → 上传。
+自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
 
 ## 本地运行
 
