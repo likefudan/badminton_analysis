@@ -43,6 +43,8 @@ type VideoRow = {
   job_updated_at: string | null;
   options: string;
   original_deleted_at: string | null;
+  job_progress: string;
+  job_started_at: string | null;
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -135,6 +137,8 @@ async function describe(env: Env, v: VideoRow) {
       error: v.job_error,
       node: v.job_node,
       updatedAt: v.job_updated_at,
+      startedAt: v.job_started_at,
+      progress: v.job_progress ? JSON.parse(v.job_progress) : null,
     },
     options: JSON.parse(v.options),
     originalDeleted: v.original_deleted_at !== null,
@@ -278,21 +282,32 @@ function cleanOptions(raw: unknown): Record<string, unknown> {
   return out;
 }
 
+// 节点每次来问任务或汇报进度都记一笔，网页据此显示“Mac 在线 / 离线”。
+async function nodeSeen(env: Env, name: string, now: Date): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO nodes (user_id, name, seen_at) VALUES (?, ?, ?) ON CONFLICT (user_id, name) DO UPDATE SET seen_at = excluded.seen_at",
+  )
+    .bind(USER_ID, name, now.toISOString())
+    .run();
+}
+
 // 处理节点领取一个任务：排队中的，或者领取后节点失联（租约过期）的。一条语句完成，不会被两个节点同时领到。
 async function claimJob(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const node = typeof body?.node === "string" ? body.node.slice(0, 80) : "node";
   const now = new Date();
   const row = await env.DB.prepare(
-    `UPDATE videos SET job_status = 'processing', job_stage = '已领取', job_error = '', job_node = ?, job_lease_until = ?, job_updated_at = ?
+    `UPDATE videos SET job_status = 'processing', job_stage = '已领取', job_error = '', job_progress = '', job_node = ?,
+       job_lease_until = ?, job_updated_at = ?, job_started_at = ?
      WHERE id = (
        SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
          AND (job_status = 'queued' OR (job_status = 'processing' AND job_lease_until < ?))
        ORDER BY completed_at LIMIT 1)
      RETURNING *`,
   )
-    .bind(node, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), USER_ID, now.toISOString())
+    .bind(node, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), now.toISOString(), USER_ID, now.toISOString())
     .first<VideoRow>();
+  await nodeSeen(env, node, now);
   return json({ video: row ? await describe(env, row) : null });
 }
 
@@ -305,12 +320,19 @@ async function updateJob(req: Request, env: Env, id: string): Promise<Response> 
   if (v.job_status !== "processing") throw new HttpError(409, "这个任务现在不在处理中");
   const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.job_stage;
   const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
+  // 步骤进度原样保存（节点写、网页读），只限制大小
+  let progress = v.job_progress;
+  if (body?.progress && typeof body.progress === "object") {
+    const text = JSON.stringify(body.progress);
+    if (text.length <= 16000) progress = text;
+  }
   const now = new Date();
   await env.DB.prepare(
-    "UPDATE videos SET job_status = ?, job_stage = ?, job_error = ?, job_lease_until = ?, job_updated_at = ? WHERE id = ?",
+    "UPDATE videos SET job_status = ?, job_stage = ?, job_error = ?, job_progress = ?, job_lease_until = ?, job_updated_at = ? WHERE id = ?",
   )
-    .bind(status, stage, error, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), id)
+    .bind(status, stage, error, progress, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), id)
     .run();
+  if (v.job_node) await nodeSeen(env, v.job_node, now);
   if (status === "done") await enforceRetention(env);
   return json(await describe(env, await getVideo(env, id)));
 }
@@ -323,7 +345,7 @@ async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   const options = body?.options ? JSON.stringify(cleanOptions(body.options)) : v.options;
   await deleteResults(env, id); // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错
   await env.DB.prepare(
-    "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
+    "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
   )
     .bind(options, new Date().toISOString(), id)
     .run();
@@ -430,7 +452,14 @@ async function listVideos(env: Env): Promise<Response> {
   const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .bind(USER_ID)
     .all<VideoRow>();
-  return json({ videos: await Promise.all(rows.results.map((v) => describe(env, v))) });
+  const node = await env.DB.prepare("SELECT name, seen_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 1")
+    .bind(USER_ID)
+    .first<{ name: string; seen_at: string }>();
+  return json({
+    videos: await Promise.all(rows.results.map((v) => describe(env, v))),
+    node: node ? { name: node.name, seenAt: node.seen_at } : null,
+    now: new Date().toISOString(), // 手机时钟可能不准，时间差都按服务器时间算
+  });
 }
 
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {

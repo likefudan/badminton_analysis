@@ -107,9 +107,15 @@ def config(cloud, tmp_path):
     return node.Config(url=cloud.url, token="secret", work_dir=tmp_path / "work", name="test-mac")
 
 
-def fake_analyse(video: Path, out_dir: Path, options, on_stage, log):
+def fake_analyse(video: Path, out_dir: Path, options, progress, log):
     out_dir.mkdir(parents=True, exist_ok=True)
-    on_stage("骨架 50%")
+    progress.video_seconds = 20.0
+    progress.skip("sdr", "不是 HDR，不需要")
+    progress.skip("calibrate", "沿用已有的标定")
+    progress.start("skeleton")
+    progress.update("skeleton", percent=50, detail="600/1200 帧", eta_seconds=30)
+    progress.start("stats")
+    progress.finish_current()
     (out_dir / f"{video.stem}.movement.json").write_text(json.dumps({"mode": options.get("mode")}))
     (out_dir / f"{video.stem}.card.P1.png").write_bytes(b"png")
     (out_dir / f"{video.stem}.skeleton.npz").write_bytes(b"not uploaded")
@@ -124,12 +130,21 @@ def test_downloads_releases_uploads_and_finishes(cloud, tmp_path):
     assert cloud.released                                # the cloud copy is deleted once the Mac has it
     assert set(cloud.results) == {"movement.json", "card.P1.png"}   # stem stripped, .npz stays local
     assert json.loads(cloud.results["movement.json"]) == {"mode": "singles"}
-    assert cloud.jobs[-1] == {"status": "done", "stage": "完成"}
-    assert any(j.get("stage") == "下载原片" for j in cloud.jobs)
+    last = cloud.jobs[-1]
+    assert (last["status"], last["stage"]) == ("done", "完成")
+    steps = {s["key"]: s for s in last["progress"]["steps"]}
+    assert [s["key"] for s in last["progress"]["steps"]] == [k for k, _ in node.STEPS]
+    assert steps["download"]["status"] == "done" and steps["download"]["percent"] == 100
+    assert steps["sdr"]["status"] == "skipped" and steps["skeleton"]["status"] == "done"
+    assert steps["upload"]["detail"] == "2 个文件"
+    assert any(j["stage"].startswith("下载原片") for j in cloud.jobs)
+    # every report carries the whole step list, so the page can draw it from any one of them
+    assert all(len(j["progress"]["steps"]) == len(node.STEPS) for j in cloud.jobs)
 
 
 def test_failure_is_reported_with_the_log_tail(cloud, tmp_path):
-    def broken(video, out_dir, options, on_stage, log):
+    def broken(video, out_dir, options, progress, log):
+        progress.start("calibrate")
         log.append("自动标定失败：只找到 3 条线")
         raise node.StepFailed("自动标定球场失败")
 
@@ -137,6 +152,9 @@ def test_failure_is_reported_with_the_log_tail(cloud, tmp_path):
     last = cloud.jobs[-1]
     assert last["status"] == "failed"
     assert "自动标定球场失败" in last["error"] and "只找到 3 条线" in last["error"]
+    assert last["stage"] == "标定球场"
+    steps = {s["key"]: s["status"] for s in last["progress"]["steps"]}
+    assert steps["calibrate"] == "failed" and steps["skeleton"] == "pending"
     assert not cloud.results
 
 
@@ -146,7 +164,7 @@ def test_large_results_go_up_in_parts(cloud, tmp_path, monkeypatch):
     monkeypatch.setattr(node, "web_video", lambda src, dst: src)
     payload = bytes(range(256)) * 5  # 1280 bytes: 4 parts
 
-    def big(video, out_dir, options, on_stage, log):
+    def big(video, out_dir, options, progress, log):
         out_dir.mkdir(parents=True, exist_ok=True)
         f = out_dir / f"{video.stem}.rallies.mp4"
         f.write_bytes(payload)
@@ -171,11 +189,15 @@ def test_result_names_drop_the_recording_stem():
     assert node.result_name(Path("别的 文件.png"), "IMG_1") == "_____.png"
 
 
+def quiet_progress(history=None, megabytes=100.0, clock=None):
+    return node.Progress(lambda stage, data: None, history or node.History(None), megabytes, **({"clock": clock} if clock else {}))
+
+
 def calib_runner(outcomes):
     """Stand-in for run_step: outcomes[i] is a confidence in percent (success) or None (failure)."""
     calls = []
 
-    def run(args, on_stage, label, log):
+    def run(args, log):
         t, out = float(args[args.index("--time") + 1]), Path(args[args.index("-o") + 1])
         result = outcomes[len(calls)]
         calls.append(t)
@@ -195,24 +217,73 @@ def test_calibration_tries_several_moments_and_keeps_the_best(tmp_path):
     court = tmp_path / "IMG_sdr.court.json"
     run, calls = calib_runner([None, 73, None, 78, None, 71])
     log = []
-    node.auto_calibrate_video(tmp_path / "IMG_sdr.mp4", court, 20.0, lambda s: None, log, run=run)
+    progress = quiet_progress()
+    progress.start("calibrate")
+    chosen = node.auto_calibrate_video(tmp_path / "IMG_sdr.mp4", court, 20.0, progress, log, run=run)
     assert calls == [1.0, 10.0, 5.0, 15.0, 18.0]            # 10% of 20 s is too close to the start
     assert json.loads(court.read_text()) == {"confidence": 78}
     assert court.with_suffix(".png").read_bytes() == b"green 78"
-    assert "15.0 秒" in log[-1] and "78%" in log[-1]
+    assert chosen == "采用第 15 秒的画面，线条重合度 78%" and chosen in log[-1]
+    assert progress.steps["calibrate"]["detail"] == "第 5/5 次，用第 18 秒的画面；目前最好 78%"
 
 
 def test_calibration_stops_at_a_good_fit(tmp_path):
     run, calls = calib_runner([90])
-    node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 600.0, lambda s: None, [], run=run)
+    node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 600.0, quiet_progress(), [], run=run)
     assert calls == [1.0]
 
 
 def test_calibration_failure_names_the_reason_and_keeps_the_rejected_picture(tmp_path):
     run, calls = calib_runner([None] * 6)
     with pytest.raises(node.StepFailedWithFiles) as e:
-        node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 60.0, lambda s: None, [], run=run)
+        node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 60.0, quiet_progress(), [], run=run)
     assert len(calls) == 6
     assert "只对上 6/12 条线" in str(e.value)
     assert [node.result_name(f, "v") for f in e.value.files] == ["court.rejected.png"]
     assert not (tmp_path / "v.court.json").exists()
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path):
+    clock = Clock()
+    history = node.History(tmp_path / "timings.json")
+    # first recording on this machine: nothing to estimate from
+    p = quiet_progress(history, megabytes=200.0, clock=clock)
+    p.video_seconds = 20.0
+    p.start("download")
+    clock.t += 10
+    first = p.to_json()
+    assert first["etaSeconds"] is None and first["elapsedSeconds"] == 10
+    assert first["steps"][0]["seconds"] == 10 and "estimateSeconds" not in first["steps"][3]
+    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("upload", 12)):
+        p.start(key)          # starting the next step finishes the one before
+        clock.t += seconds
+    p.done("upload")
+    done = p.to_json()
+    assert [s["status"] for s in done["steps"]] == ["done"] * 8
+    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 12]
+    assert done["etaSeconds"] == 0
+
+    # second recording, twice as long and twice as big: estimates scale with it
+    p2 = quiet_progress(node.History(tmp_path / "timings.json"), megabytes=400.0, clock=clock)
+    p2.video_seconds = 40.0
+    p2.start("download")
+    clock.t += 5
+    p2.update("download", percent=30, eta_seconds=12)       # the step's own estimate wins over history
+    j = p2.to_json()
+    assert j["steps"][0]["etaSeconds"] == 12
+    assert j["steps"][3]["estimateSeconds"] == 80           # skeleton: 40 s for 20 s of video -> 80 s for 40 s
+    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 24
+    p2.start("sdr")
+    clock.t += 6
+    assert p2.to_json()["steps"][1]["etaSeconds"] == 10     # 16 s expected, 6 s gone
+    assert p2.stage_text() == "HDR 转 SDR"
+    p2.fail()
+    assert p2.to_json()["steps"][1]["status"] == "failed"

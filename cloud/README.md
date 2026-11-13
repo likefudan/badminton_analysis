@@ -25,7 +25,7 @@
 | `GET /videos`、`DELETE /videos/{id}` | 列表、删除（结果一起删） |
 | `POST /session` | 发一个只读 cookie，网页里的图片和视频靠它读取 |
 | `POST /node/claim` | 处理节点领取一个排队中的录像（节点失联 10 分钟后可被重新领取） |
-| `POST /videos/{id}/job` | 节点汇报进度，或以 `done` / `failed` 结束 |
+| `POST /videos/{id}/job` | 节点汇报进度（`stage` 文字加 `progress` 步骤列表：每步状态、用时、百分比、预计剩余），或以 `done` / `failed` 结束 |
 | `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打 |
 | `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
 | `PUT /videos/{id}/results/{name}` | 传一个结果文件；大文件用 `.../multipart` 分片传 |
@@ -45,6 +45,8 @@ badminton node --once     # 处理完排队中的就退出
 ```
 
 原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 结果视频转成手机能放的 1080p H.264 → 上传。
+网页上能看到每一步的状态、用时和预计剩余时间。预计时间来自这台 Mac 之前处理的记录（`~/badminton_uploads/timings.json`，按录像时长折算），第一次处理时只有下载和骨架识别这两步有预计。网页还显示 Mac 是否在线（节点最后一次联系的时间）和排队位置。
+
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
 
 ## 本地运行
