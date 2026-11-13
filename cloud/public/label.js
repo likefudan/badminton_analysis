@@ -13,6 +13,8 @@ const Label = (() => {
   const FINE = 0.3;           // 拖动时点移动的比例：手指走 10 像素，点走 3 像素
   const LOUPE_ZOOM = 4;       // 放大镜相对屏幕上画面的倍数
   const TRAIL = 6;            // 画出前面几帧的轨迹
+  const SIDE_PX = 165;        // 手机横屏时右边按钮栏的宽度
+  const PHONE_LANDSCAPE = window.matchMedia("(orientation: landscape) and (max-height: 540px)");
 
   let L = null;               // 当前在标的录像
   const $l = (id) => document.getElementById(id);
@@ -22,7 +24,7 @@ const Label = (() => {
   async function open(id) {
     if (L && L.id === id) { draw(); return; }
     close();
-    L = { id, state: null, labels: new Map(), r: 0, i: 0, pending: null, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
+    L = { id, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
           queue: new Map(), saving: false, saveError: "", armed: false, msg: "" };
     $l("lMsg").textContent = "读取中";
     $l("lStage").hidden = true;
@@ -221,9 +223,15 @@ const Label = (() => {
 
   function layout() {
     const cv = $l("lCanvas"), [vw, vh] = L.state.video.size;
-    const landscape = window.innerWidth > window.innerHeight;
-    let w = cv.parentElement.clientWidth;
-    if (landscape) w = Math.min(w, (window.innerHeight - 24) * vw / vh);
+    let w;
+    if (PHONE_LANDSCAPE.matches) {
+      // 手机横屏：高度占满，右边留一栏放按钮
+      w = Math.min(window.innerWidth - SIDE_PX, window.innerHeight * vw / vh);
+    } else {
+      w = cv.parentElement.clientWidth;
+      if (window.innerWidth > window.innerHeight) w = Math.min(w, (window.innerHeight - 24) * vw / vh);
+    }
+    w = Math.max(160, w);
     const h = w * vh / vw;
     const dpr = window.devicePixelRatio || 1;
     if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
@@ -275,7 +283,8 @@ const Label = (() => {
     const lab = L.labels.get(f);
     if (L.pending) cross(g, L.pending.x * s, L.pending.y * s, "#2f81f7");
     else if (done(lab) && lab[0]) cross(g, lab[1] * s, lab[2] * s, lab[3] === "bulk" ? "#7ee787" : "#3fb950");
-    if (L.pending) loupe(L.pending, s);
+    pad(s);
+    if (L.pending) loupe(L.pending, s, h);
     else $l("lLoupe").hidden = true;
     renderInfo();
   }
@@ -298,10 +307,12 @@ const Label = (() => {
   }
 
   // 放大镜：点附近的一小块放大显示，放在离点远的那一角
-  function loupe(pt, s) {
+  function loupe(pt, s, h) {
     const lc = $l("lLoupe");
     if (!L.bitmap) { lc.hidden = true; return; }
-    const size = 150, dpr = window.devicePixelRatio || 1;
+    // 放大镜在上、方向键在下，画面矮（手机竖屏）时放大镜缩小一点，两个不重叠
+    const padH = $l("lPad").hidden ? 0 : $l("lPad").offsetHeight;
+    const size = Math.round(Math.max(60, Math.min(150, h - padH - 18))), dpr = window.devicePixelRatio || 1;
     lc.hidden = false;
     lc.width = lc.height = size * dpr;
     lc.style.width = lc.style.height = size + "px";
@@ -321,13 +332,39 @@ const Label = (() => {
     cross(g, size / 2, size / 2, "#2f81f7");
   }
 
+  // 悬浮方向键：放在离点远的那一侧（和放大镜同侧），有点可以挪时才显示
+  function basePoint() {
+    if (L.pending) return L.pending;
+    const lab = L.labels.get(frameOf(L.r, L.i)), p = rally().pred[L.i];
+    if (done(lab) && lab[0]) return { x: lab[1], y: lab[2] };
+    return p[0] ? { x: p[1], y: p[2] } : null;
+  }
+  function pad(s) {
+    const el = $l("lPad"), pt = basePoint();
+    el.hidden = !pt;
+    if (!pt) return;
+    const right = pt.x * s <= $l("lCanvas").clientWidth / 2;
+    el.style.left = right ? "" : "6px";
+    el.style.right = right ? "6px" : "";
+    $l("lStep").textContent = L.step === 1 ? "1" : String(L.step);
+  }
+  // 挪 1 步 = 图片上 1 个像素（4K 视频里约 3 个像素）；切到 5 就是 5 倍
+  function nudge(dx, dy) {
+    const pt = basePoint();
+    if (!pt) return;
+    const [vw, vh] = L.state.video.size, unit = vw / (L.bitmap ? L.bitmap.width : vw) * (L.step || 1);
+    L.pending = { x: clamp(pt.x + dx * unit, 0, vw), y: clamp(pt.y + dy * unit, 0, vh) };
+    L.msg = "";
+    draw();
+  }
+
   function renderInfo() {
     const R = rally(), f = frameOf(L.r, L.i), lab = L.labels.get(f), p = R.pred[L.i];
     const n = R.offsets.length, fps = L.state.video.fps || 30;
     const doneN = countDone(L.r);
     $l("lWhere").textContent = `回合 ${L.r + 1}/${L.state.rallies.length} · 第 ${L.i + 1}/${n} 帧 · ${((f) / fps).toFixed(2)} 秒 · 这回合已标 ${doneN}/${n}`;
     const unsure = R.unc[L.i] >= L.state.doubtful ? "，模型很没把握" : R.unc[L.i] >= L.state.confident ? "，模型不太有把握" : "";
-    const what = L.pending ? "你点的位置（蓝色）：点「对」保存，拖动可以微调"
+    const what = L.pending ? "蓝色十字：点「对」保存，用方向键或拖动微调"
       : done(lab) ? (lab[3] === "skip" ? "已标：看不清" : lab[0] ? `已标：有球（${lab[3] === "bulk" ? "一键接受的" : "绿色十字"}）` : "已标：没有球")
       : p[0] ? `模型猜的位置是橙色圈${unsure}` : `模型没找到球${unsure}`;
     $l("lWhat").textContent = L.msg || what;
@@ -465,6 +502,28 @@ const Label = (() => {
     $l("lNext").onclick = () => { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); };
     $l("lClear").onclick = () => clearFrame();
     $l("lBulk").onclick = () => acceptConfident();
+    // 方向键：按一下挪一步，按住不放 0.35 秒后连续挪
+    let hold = null;
+    const stop = () => { if (hold) { clearTimeout(hold.t); clearInterval(hold.i); hold.b.classList.remove("held"); hold = null; } };
+    for (const b of $l("lPad").querySelectorAll("button[data-dx]")) {
+      b.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        if (!L || !L.state) return;
+        stop();
+        const dx = Number(b.dataset.dx), dy = Number(b.dataset.dy);
+        nudge(dx, dy);
+        b.classList.add("held");
+        hold = { b, t: setTimeout(() => { if (hold) hold.i = setInterval(() => nudge(dx, dy), 70); }, 350), i: 0 };
+      });
+      for (const ev of ["pointerup", "pointercancel", "pointerleave"]) b.addEventListener(ev, stop);
+      b.addEventListener("contextmenu", (e) => e.preventDefault());
+    }
+    $l("lStep").addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      if (!L) return;
+      L.step = L.step === 5 ? 1 : 5;
+      draw();
+    });
     window.addEventListener("resize", () => { if (L && L.state && !$l("vLabel").hidden) draw(); });
     // 电脑上也能用键盘：空格/回车 = 对，n = 没有球，s = 看不清，左右方向键 = 上一帧/下一帧，Backspace = 清除
     window.addEventListener("keydown", (e) => {
@@ -473,6 +532,7 @@ const Label = (() => {
       if (k === " " || k === "Enter") confirm();
       else if (k === "n" || k === "N") noShuttle();
       else if (k === "s" || k === "S") cantTell();
+      else if (e.shiftKey && k.startsWith("Arrow")) nudge(k === "ArrowLeft" ? -1 : k === "ArrowRight" ? 1 : 0, k === "ArrowUp" ? -1 : k === "ArrowDown" ? 1 : 0);
       else if (k === "ArrowLeft") go(L.r, L.i - 1);
       else if (k === "ArrowRight") { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); }
       else if (k === "Backspace") clearFrame();
