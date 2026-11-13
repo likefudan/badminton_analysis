@@ -356,6 +356,10 @@ def test_shuttle_track_is_drawn_on_the_skeleton_video(tmp_path):
     # a second run of the same recording does not track again
     assert node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run) == out
     assert calls == ["shuttle", "overlay"]
+    # ... unless the tracking code has changed since
+    (tmp_path / "v.shuttle.version").write_text("0")
+    node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run)
+    assert calls == ["shuttle", "overlay"] * 2
 
 
 @pytest.mark.parametrize("fail", ["shuttle", "overlay"])

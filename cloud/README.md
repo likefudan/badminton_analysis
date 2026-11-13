@@ -95,9 +95,18 @@ npx wrangler r2 bucket lifecycle add ba-files abort-stale-uploads --abort-multip
 
 ## AI 报告
 
-Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton review` 写的统计摘要和提示词，只有数字和文字，没有视频和图片）。网站（Worker）用自己的 `ANTHROPIC_API_KEY` 调 Anthropic API：
+Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton review` 写的统计摘要和提示词，只有数字和文字，没有视频和图片）。网站（Worker）用自己的 key 调模型：
 
 - `POST /api/v1/videos/{id}/review`：生成报告，存成结果 `review.md`。节点上传完会自动调一次，结果页也有「生成 / 重新生成」按钮。
 - `POST /api/v1/videos/{id}/review/ask`，请求体 `{"question": "…"}`：追问，带上摘要、报告和之前的问答，回答追加到 `review.qa.md`。
 
-key 放在仓库的 Actions secret `ANTHROPIC_API_KEY` 里，部署时写进 Worker；没有这个 secret 时网站照常工作，只是不出报告（处理步骤里「AI 报告」显示跳过）。报告在网页上只按标题、列表、引用、粗体、行内代码渲染，里面的 HTML 不会被执行。
+用哪个模型由这几项决定：
+
+| 名字 | 放在哪 | 含义 |
+|---|---|---|
+| `AI_API_KEY` | 仓库的 Actions secret，部署时写进 Worker | 模型的 API key。没有就不出报告（处理步骤里「AI 报告」显示跳过），网站其它功能照常 |
+| `AI_FORMAT` | `wrangler.toml` 的 `[vars]` | `anthropic`（默认，Messages 接口，头 `x-api-key`）或 `openai`（Chat Completions 接口，头 `api-key` 和 `Authorization: Bearer`） |
+| `AI_ENDPOINT` | `[vars]` | 默认 `https://api.anthropic.com`。可以只写到资源地址（会补上 `/v1/messages` 或 `/chat/completions`），也可以直接写完整的接口地址（比如带 `?api-version=` 的 Azure 地址） |
+| `AI_MODEL` | `[vars]` | 模型或部署名；不填就用摘要里写的（`claude-sonnet-5-5`） |
+
+报告在网页上只按标题、列表、引用、粗体、行内代码渲染，里面的 HTML 不会被执行。

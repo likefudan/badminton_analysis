@@ -7,8 +7,12 @@ export interface Env {
   ASSETS: Fetcher;
   ACCESS_TOKEN: string;
   NODE_TOKEN?: string; // Mac 处理节点自己的钥匙，和登录口令分开；没设置就只认登录口令
-  ANTHROPIC_API_KEY?: string; // AI 报告用；没设置就不出报告
-  ANTHROPIC_BASE_URL?: string; // 只在测试里改
+  // AI 报告用的模型。只有 key 是秘密（secret），其余写在 wrangler.toml 的 [vars] 里。没有 key 就不出报告。
+  AI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string; // 旧名字，等同于 AI_API_KEY
+  AI_FORMAT?: string; // "anthropic"（默认，Messages 接口）或 "openai"（Chat Completions 接口）
+  AI_ENDPOINT?: string; // 默认 https://api.anthropic.com；Azure AI Foundry 填资源的地址
+  AI_MODEL?: string; // 模型或部署名；不填就用节点摘要里写的
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -448,38 +452,59 @@ async function saveResultText(env: Env, id: string, name: string, text: string):
 }
 
 async function reviewRequest(env: Env, id: string): Promise<ReviewRequest> {
-  if (!env.ANTHROPIC_API_KEY) throw new HttpError(503, "网站还没有配置 ANTHROPIC_API_KEY，出不了 AI 报告");
+  if (!aiConfig(env)) throw new HttpError(503, "网站还没有配置模型的 API key（AI_API_KEY），出不了 AI 报告");
   const text = await resultText(env, id, "review.request.json");
   let r: ReviewRequest | null = null;
   try {
     r = text ? (JSON.parse(text) as ReviewRequest) : null;
   } catch {}
-  if (!r || typeof r.system !== "string" || typeof r.user !== "string" || typeof r.model !== "string")
+  if (!r || typeof r.system !== "string" || typeof r.user !== "string")
     throw new HttpError(409, "这局还没有 AI 报告要用的统计摘要，请先重新处理");
   return r;
 }
 
 type Message = { role: "user" | "assistant"; content: string };
 
+interface AiConfig {
+  format: "anthropic" | "openai";
+  url: string;
+  key: string;
+  model: string;
+}
+
+function aiConfig(env: Env, r?: ReviewRequest): AiConfig | null {
+  const key = env.AI_API_KEY || env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  const format = env.AI_FORMAT === "openai" ? "openai" : "anthropic";
+  const base = (env.AI_ENDPOINT || "https://api.anthropic.com").replace(/\/+$/, "");
+  const tail = format === "openai" ? "/chat/completions" : "/v1/messages";
+  // 地址可以直接写到接口为止（Azure 旧式地址带 ?api-version=），否则补上接口路径
+  const url = /\/(chat\/completions|messages)(\?|$)/.test(base) ? base : base + tail;
+  return { format, url, key, model: env.AI_MODEL || r?.model || "" };
+}
+
 // 流式读取：长回答不会因为连接长时间没有数据被掐断
-async function askClaude(env: Env, r: ReviewRequest, messages: Message[]): Promise<string> {
-  const res = await fetch((env.ANTHROPIC_BASE_URL || "https://api.anthropic.com") + "/v1/messages", {
+async function askModel(env: Env, r: ReviewRequest, messages: Message[]): Promise<{ text: string; model: string }> {
+  const ai = aiConfig(env, r)!;
+  const maxTokens = Math.min(Math.max(Number(r.max_tokens) || 8000, 256), 16000);
+  const openai = ai.format === "openai";
+  const res = await fetch(ai.url, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY!, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: r.model,
-      max_tokens: Math.min(Math.max(Number(r.max_tokens) || 8000, 256), 16000),
-      system: r.system,
-      messages,
-      stream: true,
-    }),
+    headers: openai
+      ? { "content-type": "application/json", "api-key": ai.key, authorization: "Bearer " + ai.key }
+      : { "content-type": "application/json", "x-api-key": ai.key, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify(
+      openai
+        ? { model: ai.model, max_completion_tokens: maxTokens, stream: true, messages: [{ role: "system", content: r.system }, ...messages] }
+        : { model: ai.model, max_tokens: maxTokens, system: r.system, messages, stream: true },
+    ),
   });
   if (!res.ok || !res.body) {
     let detail = "";
     try {
       detail = ((await res.json()) as { error?: { message?: string } }).error?.message ?? "";
     } catch {}
-    throw new HttpError(502, `调用 Anthropic API 失败（${res.status}）${detail ? "：" + detail.slice(0, 300) : ""}`);
+    throw new HttpError(502, `调用模型失败（${res.status}）${detail ? "：" + detail.slice(0, 300) : ""}`);
   }
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
@@ -497,25 +522,29 @@ async function askClaude(env: Env, r: ReviewRequest, messages: Message[]): Promi
       try {
         ev = JSON.parse(line.slice(5));
       } catch {
-        continue;
+        continue; // 包括 OpenAI 格式结尾的 [DONE]
       }
-      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
+      if (ev.error) throw new HttpError(502, "模型出错：" + String(ev.error?.message ?? "").slice(0, 300));
+      if (openai) {
+        const choice = ev.choices?.[0];
+        if (typeof choice?.delta?.content === "string") text += choice.delta.content;
+        if (choice?.finish_reason) stop = choice.finish_reason;
+      } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
       else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
-      else if (ev.type === "error") throw new HttpError(502, "Anthropic API 出错：" + String(ev.error?.message ?? "").slice(0, 300));
     }
   }
   text = text.trim();
-  if (stop === "refusal") throw new HttpError(502, "模型拒绝回答这个请求");
+  if (stop === "refusal" || stop === "content_filter") throw new HttpError(502, "模型拒绝回答这个请求");
   if (!text) throw new HttpError(502, "模型没有返回文字");
-  if (stop === "max_tokens") text += "\n\n（回答到长度上限被截断）";
-  return text;
+  if (stop === "max_tokens" || stop === "length") text += "\n\n（回答到长度上限被截断）";
+  return { text, model: ai.model };
 }
 
 async function makeReview(env: Env, id: string): Promise<Response> {
   await getVideo(env, id);
   const r = await reviewRequest(env, id);
-  const body = await askClaude(env, r, [{ role: "user", content: r.user }]);
-  const note = `> 由 ${r.model} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
+  const { text: body, model } = await askModel(env, r, [{ role: "user", content: r.user }]);
+  const note = `> 由 ${model} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
   await saveResultText(env, id, "review.md", `${body}\n\n${note}\n`);
   await deleteResult(env, id, "review.qa.md"); // 追问是接着旧报告问的，报告换了就不再对得上
   return json(await describe(env, await getVideo(env, id)));
@@ -539,7 +568,7 @@ async function askReview(req: Request, env: Env, id: string): Promise<Response> 
     messages.push({ role: "user", content: ask(m[1]) }, { role: "assistant", content: m[2].trim() });
   }
   messages.push({ role: "user", content: ask(question) });
-  const answer = await askClaude(env, r, messages);
+  const { text: answer } = await askModel(env, r, messages);
   const oneLine = question.replace(/\s+/g, " ");
   await saveResultText(env, id, "review.qa.md", `${earlier}## 问：${oneLine}\n\n${answer.replace(/^## /gm, "### ")}\n\n`);
   return json({ answer, video: await describe(env, await getVideo(env, id)) });
@@ -593,7 +622,7 @@ async function listVideos(env: Env): Promise<Response> {
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {
   if (!(await authorized(req, env))) throw new HttpError(401, "口令不对");
   const m = req.method;
-  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(env.ANTHROPIC_API_KEY) });
+  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiConfig(env)) });
   if (path === "/videos" && m === "POST") return createVideo(req, env);
   if (path === "/videos" && m === "GET") return listVideos(env);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);

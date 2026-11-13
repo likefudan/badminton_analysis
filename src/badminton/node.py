@@ -486,6 +486,7 @@ def auto_calibrate_video(work: Path, court: Path, duration: float, progress: Pro
 _ANALYZE_STAGES = (("== 2/4", "skeleton"), ("== 3/4", "label"), ("== 4/4", "stats"), ("== 剪掉死球时间", "cut"))
 
 
+SHUTTLE_VERSION = "2"  # raise when shuttle tracking changes, so recordings already on this Mac are tracked again
 _SEEN = re.compile(r"(\d+) 帧有球（([\d.]+)%）")
 
 
@@ -499,7 +500,9 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     if not skeleton.exists():
         progress.skip("shuttle", "没有骨架视频，画不了球的轨迹")
         return None
-    if combined.exists() and csv.exists() and combined.stat().st_mtime >= skeleton.stat().st_mtime:
+    stamp = out_dir / f"{work.stem}.shuttle.version"  # which tracking code made the files: a re-run after an update tracks again
+    fresh = stamp.exists() and stamp.read_text().strip() == SHUTTLE_VERSION
+    if fresh and combined.exists() and csv.exists() and combined.stat().st_mtime >= skeleton.stat().st_mtime:
         progress.skip("shuttle", "沿用上次的结果")
         return combined
     progress.start("shuttle", "逐帧找球")
@@ -524,6 +527,7 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
         print(f"  羽毛球追踪没有成功：{reason}")
         progress.skip("shuttle", f"这次没有成功，其它结果不受影响（{reason[:120]}）")
         return None
+    stamp.write_text(SHUTTLE_VERSION)
     progress.done("shuttle", seen or None)
     return combined
 
