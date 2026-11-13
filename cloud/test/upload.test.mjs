@@ -49,7 +49,7 @@ before(async () => {
   });
   server = spawn("npx", ["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", state,
     "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key",
-    "--var", "ANTHROPIC_API_KEY:test-ai-key", "--var", `ANTHROPIC_BASE_URL:http://127.0.0.1:${AI_PORT}`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+    "--var", "AI_API_KEY:test-ai-key", "--var", `AI_ENDPOINT:http://127.0.0.1:${AI_PORT}`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(BASE + "/me")).status === 401) return; } catch {}
     await new Promise((r) => setTimeout(r, 500));

@@ -7,7 +7,7 @@ name: 部署 ba.llmat.dev
 #   CLOUDFLARE_ACCOUNT_ID
 #   BA_ACCESS_TOKEN        网站登录口令（自己定）
 #   BA_NODE_TOKEN          可选：Mac 处理节点的钥匙（和 ~/.config/badminton/node.json 里的一致）
-#   ANTHROPIC_API_KEY      可选：AI 报告用的 Anthropic API key；没有就不出报告
+#   AI_API_KEY             可选：AI 报告用的模型的 API key（地址和模型名在 cloud/wrangler.toml 的 [vars]）；没有就不出报告
 on:
   push:
     branches: [main]
@@ -123,12 +123,12 @@ jobs:
 
       - name: 设置 AI 报告的 API key（有才设）
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
         run: |
-          if [ -n "$ANTHROPIC_API_KEY" ]; then
-            printf '%s' "$ANTHROPIC_API_KEY" | npx wrangler secret put ANTHROPIC_API_KEY
+          if [ -n "$AI_API_KEY" ]; then
+            printf '%s' "$AI_API_KEY" | npx wrangler secret put AI_API_KEY
           else
-            echo "没有 ANTHROPIC_API_KEY，跳过（网站不出 AI 报告）"
+            echo "没有 AI_API_KEY，跳过（网站不出 AI 报告）"
           fi
 
       - name: 线上检查
