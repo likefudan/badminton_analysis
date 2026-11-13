@@ -1,0 +1,64 @@
+# 查 Azure AI Foundry 上部署了哪些模型，或者用某个部署试发一句话。只手动运行。
+# key 来自 secret（AI_API_KEY 或 AZURE_API_KEY），不会打印；日志里只有模型名和回答。
+name: 查询 AI 模型
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 部署名：填了就用它试发一句话；不填只列出模型
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEY: ${{ secrets.AI_API_KEY || secrets.AZURE_API_KEY }}
+      RESOURCE: https://happy-badminton-jay-main-1
+      MODEL: ${{ inputs.model }}
+    steps:
+      - name: 列出模型和部署
+        if: ${{ inputs.model == '' }}
+        run: |
+          [ -n "$KEY" ] || { echo "没有 AI_API_KEY / AZURE_API_KEY"; exit 1; }
+          show() { # 名称 地址：只打印状态码和每一项的名字、能力，不打印别的
+            echo "== $1"
+            code="$(curl -sS -o out.json -w '%{http_code}' -H "api-key: $KEY" "$2" || true)"
+            echo "HTTP $code"
+            python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open("out.json"))
+          except Exception as e:
+              print("不是 JSON：", open("out.json", errors="replace").read()[:300]); raise SystemExit
+          items = d.get("data") or d.get("value") or []
+          if not items:
+              print(json.dumps(d, ensure_ascii=False)[:600])
+          for m in items:
+              caps = m.get("capabilities") or {}
+              model = m.get("model") if isinstance(m.get("model"), (str, dict)) else None
+              props = m.get("properties") or {}
+              print(" ", m.get("id") or m.get("name"), "|", model or props.get("model") or "", "|",
+                    m.get("status") or props.get("provisioningState") or "", "|",
+                    ",".join(k for k, v in caps.items() if v in (True, "true")) if isinstance(caps, dict) else "")
+          PY
+          }
+          show "openai/v1/models" "$RESOURCE.openai.azure.com/openai/v1/models"
+          show "openai/deployments（旧接口）" "$RESOURCE.openai.azure.com/openai/deployments?api-version=2023-03-15-preview"
+          show "services.ai /openai/v1/models" "$RESOURCE.services.ai.azure.com/openai/v1/models"
+          show "services.ai /models" "$RESOURCE.services.ai.azure.com/models?api-version=2024-05-01-preview"
+          show "项目里的部署" "$RESOURCE.services.ai.azure.com/api/projects/proj-happy-badminton-jay-main-1/deployments?api-version=v1"
+
+      - name: 用指定的部署试发一句话
+        if: ${{ inputs.model != '' }}
+        run: |
+          [ -n "$KEY" ] || { echo "没有 AI_API_KEY / AZURE_API_KEY"; exit 1; }
+          body="$(python3 -c 'import json,os; print(json.dumps({"model": os.environ["MODEL"], "max_completion_tokens": 2000, "messages": [{"role": "system", "content": "你是羽毛球教练。"}, {"role": "user", "content": "用一句中文说明双打前后站位和左右站位各自在什么时候用。"}]}))')"
+          code="$(curl -sS -o out.json -w '%{http_code}' -H "api-key: $KEY" -H 'content-type: application/json' \
+            -d "$body" "$RESOURCE.openai.azure.com/openai/v1/chat/completions" || true)"
+          echo "HTTP $code"
+          python3 -c 'import json; d=json.load(open("out.json")); print(json.dumps({"model": d.get("model"), "choices": [c.get("message", {}).get("content") for c in d.get("choices", [])], "finish": [c.get("finish_reason") for c in d.get("choices", [])], "usage": d.get("usage"), "error": d.get("error")}, ensure_ascii=False, indent=1))'
+          [ "$code" = 200 ]

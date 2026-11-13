@@ -22,3 +22,9 @@ database_id = "d6bf17a9-b0f3-4dd1-80b2-1bba2d6a5ee1"
 migrations_dir = "migrations"
 
 # 口令用 `wrangler secret put ACCESS_TOKEN` 设置，本地开发写在 .dev.vars
+
+# AI 报告用的模型：Azure AI Foundry 上的部署，OpenAI 格式的接口。key 是 secret AI_API_KEY（部署流程从仓库的
+# AI_API_KEY 或 AZURE_API_KEY 写进来）。AI_MODEL 是部署名；不填时用摘要里写的模型名。
+[vars]
+AI_FORMAT = "openai"
+AI_ENDPOINT = "https://happy-badminton-jay-main-1.openai.azure.com/openai/v1"
