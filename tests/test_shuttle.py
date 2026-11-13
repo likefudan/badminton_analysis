@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 
 from badminton.shuttle import _WindowEnsemble, ensemble_weight, inpaint_mask, largest_blob_center
@@ -63,3 +64,11 @@ def test_expand_rows_interpolates_skipped_frames():
     assert rows[1] == (1, 1, 15, 105)  # between two seen frames
     assert rows[3] == (3, 0, 0, 0) and rows[5] == (5, 0, 0, 0)  # next to a frame without shuttle
     assert rows[6] == (6, 1, 40, 130)
+
+
+def test_load_models_from_a_folder_without_models(tmp_path):
+    pytest.importorskip("coremltools")
+    from badminton.shuttle import load_models
+
+    with pytest.raises(SystemExit, match="tracknetv3_tracknet"):
+        load_models(model_dir=tmp_path)
