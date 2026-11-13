@@ -321,6 +321,7 @@ async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const options = body?.options ? JSON.stringify(cleanOptions(body.options)) : v.options;
+  await deleteResults(env, id); // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错
   await env.DB.prepare(
     "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
   )

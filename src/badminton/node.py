@@ -324,9 +324,11 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         if not video.get("originalDeleted"):
             api.retrying(lambda: api.json("POST", f"/videos/{vid}/original/release"), "删除云端原片")
             print("  云端原片已删除，本地保留在 " + str(local))
-        out_dir = job_dir / "analysis"
+        # one folder per mode: the skeleton data of a singles run (one player per side) is no use for doubles
+        options = video.get("options") or {}
+        out_dir = job_dir / ("analysis-doubles" if options.get("mode") == "doubles" else "analysis")
         try:
-            files = analyse_fn(local, out_dir, video.get("options") or {}, on_stage, log)
+            files = analyse_fn(local, out_dir, options, on_stage, log)
         except StepFailedWithFiles as e:
             for f in e.files:
                 api.upload_result(vid, f, result_name(f, local.stem))

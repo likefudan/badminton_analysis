@@ -517,6 +517,8 @@ async function renderDetail() {
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
   $("dRetry").hidden = !(v.status === "uploaded" && v.job && (v.job.status === "failed" || v.job.status === "done"));
+  $("dMode").hidden = $("dRetry").hidden;
+  $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   const key = v.results.map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
@@ -592,6 +594,19 @@ $("dRetry").onclick = async () => {
   try {
     await api(`/videos/${openId}/job/retry`, { method: "POST" });
     log("已重新排队");
+  } catch (e) { log("重新处理失败：" + e.message); }
+  refreshList();
+};
+$("dMode").onclick = async () => {
+  const v = videos.find((x) => x.id === openId);
+  if (!v) return;
+  const mode = v.options && v.options.mode === "doubles" ? "singles" : "doubles";
+  try {
+    await api(`/videos/${openId}/job/retry`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ options: { ...v.options, mode } }),
+    });
+    log(`已改成${mode === "doubles" ? "双打" : "单打"}并重新排队`);
   } catch (e) { log("重新处理失败：" + e.message); }
   refreshList();
 };
