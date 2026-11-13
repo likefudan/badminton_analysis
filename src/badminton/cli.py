@@ -178,8 +178,20 @@ def main(argv: list[str] | None = None) -> int:
                    help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和第一个输入同目录")
 
+    s = sub.add_parser("hits", help="击球时刻和击球人（球轨迹转折 + 手腕速度），输出带数据来源标记的事件 JSON")
+    s.add_argument("video")
+    s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+    s.add_argument("--shuttle", help="badminton shuttle 输出的 CSV，默认 <视频名>.shuttle.csv")
+    s.add_argument("--data", help="skeleton 生成的 .npz（建议 --stride 1 逐帧跑），默认 <视频名>.skeleton.npz")
+    s.add_argument("--players", help="球员名字文件，默认 <视频名>.players.json")
+    s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+    s.add_argument("--no-wrist", action="store_true", help="只用球轨迹，不用手腕速度（对比用）")
+    s.add_argument("--labels", help="人工标注的击球 CSV（Frame, Player, Note），给了就报告准确率、召回率和 F1")
+    s.add_argument("--manual", help="人工核对过的击球 CSV：不做识别，直接写成来源为「人工」的击球文件")
+
     a = p.parse_args(argv)
-    return {"info": cmd_info, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
+    return {"info": cmd_info, "hits": cmd_hits, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
@@ -792,7 +804,7 @@ def cmd_stabilize(a) -> int:
 
 def cmd_shuttle(a) -> int:
     from .pipeline import print_progress
-    from .shuttle import track_shuttle, write_csv
+    from .shuttle import row_sources, track_shuttle, write_csv
 
     from .video import probe
 
@@ -807,18 +819,22 @@ def cmd_shuttle(a) -> int:
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
                              frame_step=a.frame_step, debug=debug, model_dir=a.model_dir)
+    measured = list(tm.measured)
     if a.raw_output:
-        write_csv(rows, a.raw_output)
+        write_csv(rows, a.raw_output, row_sources(rows, measured))
     if a.court:
         from .court import CourtCalibration
         from .shuttle_path import rows_from_candidates
 
         if a.frame_step != 1:
             raise SystemExit("--court 目前只支持 --frame-step 1")
-        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), CourtCalibration.load(a.court))
-    write_csv(rows, out)
+        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), CourtCalibration.load(a.court),
+                                    measured=measured)
+    write_csv(rows, out, row_sources(rows, measured))
     seen = sum(r[1] for r in rows)
-    print(f"已写入 {out}：{len(rows)} 帧，{seen} 帧有球（{100 * seen / max(1, len(rows)):.1f}%）")
+    filled = seen - sum(1 for r, m in zip(rows, measured) if r[1] and m)
+    print(f"已写入 {out}：{len(rows)} 帧，{seen} 帧有球（{100 * seen / max(1, len(rows)):.1f}%），"
+          f"其中 {filled} 帧是插值补出来的（Source 列）")
     print(tm.summary())
     if a.overlay:
         from .render import draw_shuttle_video
@@ -827,6 +843,64 @@ def cmd_shuttle(a) -> int:
         draw_shuttle_video(video, rows, ov)
         print(f"轨迹视频 {ov}")
     return 0
+
+
+def cmd_hits(a) -> int:
+    from . import hits as H
+    from .court import CourtCalibration
+
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    data_path = Path(a.data) if a.data else video.with_suffix(".skeleton.npz")
+    shuttle_path = Path(a.shuttle) if a.shuttle else video.with_suffix(".shuttle.csv")
+    for path, how in ((data_path, "badminton skeleton --stride 1"), (shuttle_path, "badminton shuttle --court")):
+        if not path.exists():
+            raise SystemExit(f"找不到 {path}：先运行 {how}")
+    names_path = Path(a.players) if a.players else video.with_suffix(".players.json")
+    names = json.loads(names_path.read_text()) if names_path.exists() else {}
+    per_side = 1 if a.singles else _players_per_side(data_path)
+    hits, ctx = H.run(shuttle_path, data_path, CourtCalibration.load(a.court), per_side,
+                      H.Options(use_wrist=not a.no_wrist), names)
+    fps = ctx["fps"]
+    if ctx["stride"] > 1:
+        print(f"注意：骨架数据是每 {ctx['stride']} 帧一次，手腕速度不准；建议用 badminton skeleton --stride 1 重跑")
+    if a.labels:
+        labels = H.load_labels(a.labels)
+        n = sum(l["note"] != "ignore" for l in labels)
+        print(f"对照 {a.labels}（{n} 拍）：")
+        for tol_s in (0.1, 0.2):
+            r = H.score_hits(hits, labels, int(round(tol_s * fps)))
+            who = f"，击球人 {r['hitter_right']}/{r['hitter_checked']} 正确" if r["hitter_checked"] else ""
+            print(f"  误差 ±{tol_s} 秒内算对：准确率 {100 * r['precision']:.1f}%，召回率 {100 * r['recall']:.1f}%，"
+                  f"F1 {100 * r['f1']:.1f}%（对 {r['tp']}，多 {r['fp']}，漏 {r['fn']}）{who}")
+    if a.manual:
+        side_of = {p.id: ("near", "far")[p.side] for p in ctx["players"]}
+        hits = H.manual_hits(H.load_labels(a.manual), side_of)
+    doc = H.hits_json(hits, fps, str(video), {"shuttle": str(shuttle_path), "skeleton": str(data_path),
+                                              "manual": a.manual or None}, names)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{video.stem}.hits.json"
+    H.save(out, doc)
+    H.write_csv(hits, fps, out.with_suffix(".csv"))
+    H.review_page(doc, out.with_suffix(".html"), names)
+    by_player: dict = {}
+    for h in hits:
+        by_player[h.get("player_id")] = by_player.get(h.get("player_id"), 0) + 1
+    who = "，".join(f"{names.get(str(k), f'球员 {k}')} {v} 拍" for k, v in sorted(by_player.items(), key=lambda t: str(t[0])))
+    print(f"{'人工核对的' if a.manual else '识别出'} {len(hits)} 次击球（{who}）")
+    print(f"已写入 {out}（每个数值带来源标记）、{out.with_suffix('.csv').name}、"
+          f"{out.with_suffix('.html').name}（用浏览器打开可逐拍核对并导出标注）")
+    return 0
+
+
+def _players_per_side(data_path: Path) -> int:
+    import numpy as np
+
+    from .tracking import load_npz
+
+    data = load_npz(data_path)
+    counts = [max(((data["side"][i] == s) & data["valid"][i]).sum() for s in (0, 1)) for i in range(len(data["valid"]))]
+    return min(2, max(1, int(np.percentile(counts, 90)))) if counts else 2
 
 
 def cmd_annotate(a) -> int:

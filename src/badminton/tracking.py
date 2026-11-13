@@ -70,6 +70,18 @@ class Tracking:
         return next(t for t in self.tracks if t.id == tid)
 
 
+def position_sources(track: Track) -> np.ndarray:
+    """(F,) source tag of each floor position in track.xy (see provenance.py):
+    "measured" where the player was detected standing on the floor in that frame,
+    "interpolated" where the position was bridged (airborne, missed, glitch), ""
+    where there is none."""
+    from .provenance import INTERPOLATED, MEASURED
+
+    have = np.isfinite(track.xy).all(1)
+    measured = have & track.seen & ~track.airborne
+    return np.where(measured, MEASURED, np.where(have, INTERPOLATED, "")).astype(object)
+
+
 def load_npz(path: str | Path) -> dict:
     with np.load(path) as z:
         return {k: z[k] for k in z.files}

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>击球核对</title>
+<style>
+  body { font: 14px/1.5 -apple-system, "PingFang SC", sans-serif; margin: 0; display: flex; height: 100vh; color: #222; background: #fafafa; }
+  #left { flex: 1; display: flex; flex-direction: column; padding: 12px; min-width: 0; }
+  #right { width: 300px; border-left: 1px solid #ddd; overflow-y: auto; background: #fff; }
+  video { width: 100%; max-height: 70vh; background: #000; }
+  #bar { margin: 8px 0; font-size: 16px; }
+  #help { color: #555; font-size: 13px; }
+  kbd { border: 1px solid #aaa; border-radius: 3px; padding: 0 4px; background: #f3f3f3; font: 12px ui-monospace, monospace; }
+  .item { padding: 4px 10px; border-bottom: 1px solid #eee; cursor: pointer; display: flex; justify-content: space-between; }
+  .item.cur { background: #e7f0ff; }
+  .item.ok .st { color: #1a7f37; } .item.del { color: #aaa; text-decoration: line-through; } .item.add .st { color: #9a6700; }
+  button { font: inherit; padding: 4px 10px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <div><input type="file" id="file" accept="video/*"> <span id="vname"></span>
+    <button id="save">导出 CSV（S）</button> <span id="count"></span></div>
+  <video id="v" muted playsinline></video>
+  <div id="bar">先选视频文件</div>
+  <div id="help">
+    <kbd>空格</kbd> 慢放这一拍前后 &nbsp; <kbd>回车</kbd> 确认并下一个 &nbsp; <kbd>X</kbd> 不是击球并下一个 &nbsp;
+    <kbd>←</kbd><kbd>→</kbd> 把时刻挪一帧 &nbsp; <kbd>1</kbd>–<kbd>4</kbd> 改击球人 &nbsp;
+    <kbd>J</kbd><kbd>K</kbd> 上一个 / 下一个 &nbsp; <kbd>,</kbd><kbd>.</kbd> 画面退 / 进一帧（不改标注） &nbsp;
+    <kbd>A</kbd> 在当前画面加一拍（漏掉的）<br>
+    导出的 CSV（Frame, Player, Note）可以交给 <code>badminton hits --labels</code> 算准确率，或 <code>--manual</code> 生成「人工」来源的击球文件。
+  </div>
+</div>
+<div id="right"></div>
+<script>
+const DOC = /*DOC*/{"fps": 30, "video": "", "hits": [], "players": {}}/*END*/;
+const fps = DOC.fps, v = document.getElementById('v'), bar = document.getElementById('bar'), right = document.getElementById('right');
+let items = DOC.hits.map(h => ({frame: h.frame.value, player: h.player.value, by: h.found_by, st: 'pending'}));
+let cur = 0, stopAt = null;
+document.getElementById('vname').textContent = DOC.video ? '（应选：' + DOC.video + '）' : '';
+document.getElementById('file').onchange = e => { v.src = URL.createObjectURL(e.target.files[0]); v.onloadeddata = () => go(0); };
+const frameNow = () => Math.floor(v.currentTime * fps + 1e-3);
+const seek = f => { v.pause(); stopAt = null; v.currentTime = (f + 0.5) / fps; };
+const name = p => p == null ? '?' : (DOC.players[p] || ('球员 ' + p));
+function render() {
+  items.sort((a, b) => a.frame - b.frame);
+  right.innerHTML = '';
+  items.forEach((it, i) => {
+    const d = document.createElement('div');
+    d.className = 'item ' + it.st + (i === cur ? ' cur' : '');
+    d.innerHTML = `<span>${it.frame}（${(it.frame / fps).toFixed(2)} 秒）${name(it.player)}</span><span class="st">${{pending: '', ok: '✓', del: '✗', add: '＋'}[it.st]}</span>`;
+    d.onclick = () => go(i);
+    right.appendChild(d);
+    if (i === cur) d.scrollIntoView({block: 'nearest'});
+  });
+  const done = items.filter(i => i.st !== 'pending').length;
+  document.getElementById('count').textContent = `已核对 ${done} / ${items.length}`;
+  const it = items[cur];
+  bar.textContent = it ? `第 ${cur + 1} 拍：第 ${it.frame} 帧，${name(it.player)}` + (it.by ? `（依据：${it.by}）` : '') : '没有击球';
+}
+function go(i) { if (!items.length) { render(); return; } cur = Math.max(0, Math.min(items.length - 1, i)); seek(items[cur].frame); render(); }
+function replay() { const it = items[cur]; if (!it) return; v.currentTime = Math.max(0, (it.frame - 0.6 * fps) / fps); v.playbackRate = 0.4; stopAt = (it.frame + 0.5 * fps) / fps; v.play(); }
+v.ontimeupdate = () => { if (stopAt !== null && v.currentTime >= stopAt) { const it = items[cur]; if (it) seek(it.frame); } };
+function mark(st) { const it = items[cur]; if (!it) return; it.st = st; go(cur + 1 < items.length ? cur + 1 : cur); }
+function nudge(d) { const it = items[cur]; if (!it) return; it.frame = Math.max(0, it.frame + d); if (it.st === 'pending') it.st = 'ok'; const keep = it; render(); cur = items.indexOf(keep); seek(it.frame); render(); }
+function add() { const it = {frame: frameNow(), player: null, by: '', st: 'add'}; items.push(it); render(); cur = items.indexOf(it); render(); }
+function save() {
+  const rows = items.filter(i => i.st !== 'del').map(i => `${i.frame},${i.player == null ? '' : i.player},${i.st === 'pending' ? 'unreviewed' : ''}`);
+  const blob = new Blob(['Frame,Player,Note\n' + rows.join('\n') + '\n'], {type: 'text/csv'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = (DOC.video || 'video').replace(/\.[^.]+$/, '') + '.hits.labels.csv'; a.click();
+}
+document.getElementById('save').onclick = save;
+document.onkeydown = e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') replay();
+  else if (k === 'enter' || k === 'y') mark(items[cur] && items[cur].st === 'add' ? 'add' : 'ok');
+  else if (k === 'x' || k === 'backspace' || k === 'delete') mark('del');
+  else if (k === 'arrowleft') nudge(-1);
+  else if (k === 'arrowright') nudge(1);
+  else if (k === 'j') go(cur - 1);
+  else if (k === 'k') go(cur + 1);
+  else if (k === ',') seek(Math.max(0, frameNow() - 1));
+  else if (k === '.') seek(frameNow() + 1);
+  else if (k === 'a') add();
+  else if (k === 's') save();
+  else if ('1234'.includes(k) && items[cur]) { items[cur].player = +k; if (items[cur].st === 'pending') items[cur].st = 'ok'; render(); }
+  else return;
+  e.preventDefault();
+};
+render();
+</script>
+</body>
+</html>
