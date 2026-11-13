@@ -130,8 +130,41 @@
   #lAcc table td:nth-child(2) { font-weight: 600; white-space: nowrap; }
   #lAcc table td:nth-child(3) { text-align: left; font-size: 12px; }
   #tAnnot code { font-size: 13px; }
-  @media (orientation: landscape) and (min-width: 600px) {
+  #lPad { position: absolute; bottom: 6px; display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px);
+    gap: 3px; grid-template-areas: ". u ." "l c r" ". d ."; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #lPad button { width: 40px; height: 40px; padding: 0; border-radius: 8px; background: rgba(20,20,20,.55); color: #fff;
+    border: 1px solid rgba(255,255,255,.45); font-size: 15px; font-weight: 600; touch-action: none; -webkit-touch-callout: none; }
+  #lPad button:active, #lPad button.held { background: rgba(47,129,247,.85); }
+  #lPad .u { grid-area: u; } #lPad .l { grid-area: l; } #lPad .c { grid-area: c; font-size: 13px; } #lPad .r { grid-area: r; } #lPad .d { grid-area: d; }
+  @media (orientation: portrait) {
+    #lPad { grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(3, 34px); gap: 2px; bottom: 4px; }
+    #lPad button { width: 34px; height: 34px; font-size: 13px; }
+  }
+  @media (orientation: landscape) and (min-width: 600px) and (min-height: 541px) {
     #lStage { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+  }
+  /* 手机横屏：画面占满整个高度，标题和按钮挤到右边一栏，右栏自己滚动 */
+  @media (orientation: landscape) and (max-height: 540px) {
+    body.labeling { padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+    body.labeling main { max-width: none; }
+    #vLabel { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: auto auto 1fr; height: 100vh; height: 100dvh; column-gap: 8px; }
+    #vLabel[hidden] { display: none; }
+    #lStage { display: contents; }
+    #lPic { grid-column: 1; grid-row: 1 / 4; align-self: center; }
+    #lCanvas { border-radius: 0; }
+    #vLabel .top { grid-column: 2; grid-row: 1; margin: 4px 0 0; min-height: 0; gap: 4px; }
+    #vLabel .top h1 { display: none; }
+    #vLabel .top a { padding: 4px 2px; font-size: 14px; }
+    #lMsg { grid-column: 2; grid-row: 2; margin: 0; }
+    #lSide { grid-column: 2; grid-row: 3; overflow-y: auto; min-height: 0; padding: 0 4px 8px 0; -webkit-overflow-scrolling: touch; }
+    #lWhere { font-size: 12px; margin: 0; }
+    #lWhat { font-size: 13px; margin: 2px 0 6px; min-height: 0; }
+    .lbtns { grid-template-columns: 1fr 1fr; gap: 6px; }
+    .lbtns button { padding: 9px 4px; font-size: 14px; }
+    .lbtns #lOk { grid-column: 1 / 3; order: -1; padding: 12px 4px; }
+    #lBulk { padding: 8px; font-size: 13px; }
+    #lRallies { margin: 8px 0; }
+    #lRallies button { padding: 4px 8px; font-size: 12px; }
   }
   [hidden] { display: none !important; }
 </style>
@@ -244,7 +277,15 @@
       <div class="top"><a id="lBack">‹ 返回</a><h1>标注球的位置</h1><span id="lSave" class="quiet"></span></div>
       <p class="quiet" id="lMsg"></p>
       <div id="lStage" hidden>
-        <div id="lPic"><canvas id="lCanvas"></canvas><canvas id="lLoupe" hidden></canvas></div>
+        <div id="lPic"><canvas id="lCanvas"></canvas><canvas id="lLoupe" hidden></canvas>
+          <div id="lPad" hidden>
+            <button class="u" data-dx="0" data-dy="-1" aria-label="上移">▲</button>
+            <button class="l" data-dx="-1" data-dy="0" aria-label="左移">◀</button>
+            <button class="c" id="lStep" aria-label="每次移动的距离">1</button>
+            <button class="r" data-dx="1" data-dy="0" aria-label="右移">▶</button>
+            <button class="d" data-dx="0" data-dy="1" aria-label="下移">▼</button>
+          </div>
+        </div>
         <div id="lSide">
           <p class="quiet" id="lWhere"></p>
           <p id="lWhat"></p>
@@ -261,8 +302,8 @@
           <h2 style="margin-top:14px">模型准不准</h2>
           <div id="lAcc" class="quiet"></div>
           <details class="quiet" style="margin-top:10px"><summary>怎么标</summary>
-            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去），再用手指在画面上拖动微调，左上或右上角的放大镜里看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。</p>
-            <p>「一键接受」把这回合里模型很有把握、你还没看过的帧直接按预测记下来（和电脑版一样记成“批量接受”），不算进上面的准确率。横过来拿手机画面更大。</p>
+            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去），再用画面角上的方向键微调（按一下挪 1 个像素，按住连续挪，中间的数字切换每次挪 1 或 5 个像素），也可以用手指在画面上拖动，放大镜里看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。</p>
+            <p>「一键接受」把这回合里模型很有把握、你还没看过的帧直接按预测记下来（和电脑版一样记成“批量接受”），不算进上面的准确率。横过来拿手机，画面铺满屏幕，按钮在右边。</p>
           </details>
         </div>
       </div>

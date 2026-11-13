@@ -678,6 +678,7 @@ function route() {
   const name = m ? "vDetail" : lm ? "vLabel" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
   document.querySelector("main").classList.toggle("wide", Boolean(lm));
+  document.body.classList.toggle("labeling", Boolean(lm));
   if (m) openDetail(m[1]);
   else closeDetail();
   if (lm) {
