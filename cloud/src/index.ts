@@ -8,7 +8,13 @@ export interface Env {
   ACCESS_TOKEN: string;
 }
 
-const PART_SIZE = 32 * 1024 * 1024; // R2 要求除最后一片外每片一样大；Worker 单个请求上限约 100 MB
+// 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
+// 所以默认 8 MiB，文件超过 80 GB 时按 8 MiB 的整数倍放大。Worker 单个请求上限约 100 MB。
+const PART_SIZE = 8 * 1024 * 1024;
+const MAX_PARTS = 10000;
+function partSizeFor(size: number): number {
+  return PART_SIZE * Math.max(1, Math.ceil(size / (PART_SIZE * MAX_PARTS)));
+}
 const MAX_SIZE = 200 * 1024 ** 3;
 const USER_ID = "owner"; // 第一版只有一个用户
 
@@ -111,7 +117,7 @@ async function createVideo(req: Request, env: Env): Promise<Response> {
     `INSERT INTO videos (id, user_id, filename, size, content_type, part_size, r2_key, upload_id, status, meta, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?)`,
   )
-    .bind(id, USER_ID, filename, size, contentType, PART_SIZE, key, upload.uploadId, meta, new Date().toISOString())
+    .bind(id, USER_ID, filename, size, contentType, partSizeFor(size), key, upload.uploadId, meta, new Date().toISOString())
     .run();
   return json(await describe(env, await getVideo(env, id)), 201);
 }

@@ -21,7 +21,7 @@
 | 接口 | 作用 |
 | --- | --- |
 | `GET /me` | 检查口令 |
-| `POST /videos` | 新建一个上传，返回编号、分片大小（32 MiB）和分片数 |
+| `POST /videos` | 新建一个上传，返回编号、分片大小（8 MiB，超大文件会按倍数放大）和分片数 |
 | `PUT /videos/{id}/parts/{n}` | 传第 n 片，可重复传 |
 | `GET /videos/{id}` | 查状态和已传的片（续传用） |
 | `POST /videos/{id}/complete` | 合并，核对总大小 |

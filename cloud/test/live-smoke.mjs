@@ -1,4 +1,4 @@
-// 对线上网站走一遍真实的分片上传：2 片（32 MiB + 1 MiB），合并、下载核对、删除。
+// 对线上网站走一遍真实的分片上传：3 片（8 + 8 + 1 MiB），合并、下载核对、删除。
 // 用法：SITE=https://ba.llmat.dev BA_ACCESS_TOKEN=口令 node test/live-smoke.mjs
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
@@ -14,14 +14,14 @@ async function expect(res, status, what) {
   return text ? JSON.parse(text) : null;
 }
 
-const data = randomBytes(33 * 1024 * 1024);
+const data = randomBytes(17 * 1024 * 1024);
 const created = await call("/videos", {
   method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ filename: "deploy-smoke.bin", size: data.length, contentType: "application/octet-stream", meta: {} }),
 });
 const video = await expect(created, 201, "新建上传");
 try {
-  assert.equal(video.partCount, 2);
+  assert.equal(video.partCount, 3);
   const started = Date.now();
   for (let n = 1; n <= video.partCount; n++) {
     const body = data.subarray((n - 1) * video.partSize, Math.min(n * video.partSize, data.length));
@@ -39,7 +39,7 @@ try {
   const ranged = await call(`/videos/${video.id}/file`, { headers: { range: "bytes=100-199" } });
   assert.equal(ranged.status, 206);
   assert.deepEqual(Buffer.from(await ranged.arrayBuffer()), data.subarray(100, 200));
-  console.log(`分片上传、合并、下载核对通过：33 MiB 上传用时 ${seconds.toFixed(1)} 秒`);
+  console.log(`分片上传、合并、下载核对通过：17 MiB 上传用时 ${seconds.toFixed(1)} 秒`);
 } finally {
   const del = await call(`/videos/${video.id}`, { method: "DELETE" });
   assert.equal(del.status, 200, "删除测试文件失败");
