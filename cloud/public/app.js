@@ -3,7 +3,9 @@
 
 const API = "/api/v1";
 const CONCURRENCY = 3;
-const MAX_TRIES = 8;
+const MAX_TRIES = 8;          // 服务器明确报错时最多试几次；网络问题会一直重试
+const STALL_MS = 30 * 1000;   // 一片这么久没有任何进展就算卡住，断开重传
+const HIDDEN_KICK_MS = 3000;  // 离开页面超过这么久，回来后把在途的请求断开重传
 const $ = (id) => document.getElementById(id);
 
 let token = "";
@@ -206,9 +208,19 @@ document.addEventListener("visibilitychange", () => {
     hiddenSince = 0;
     log(`页面回到前台，离开了 ${fmtDur(ms / 1000)}`);
     if (!run.paused) requestWakeLock();
+    // iOS 在后台会冻结或掐断连接，回来后旧请求常常既不成功也不报错
+    if (ms >= HIDDEN_KICK_MS) kick("离开过页面");
   }
   $("pHidden").textContent = `${hiddenCount} 次，共 ${fmtDur(hiddenTotalMs / 1000)}`;
 });
+
+// 把在途的请求断开，让它们马上重传（已确认的片不受影响）
+function kick(reason) {
+  if (!run || run.finished || run.paused) return;
+  for (const xhr of run.xhrs) { xhr.kickReason = reason; xhr.abort(); }
+}
+window.addEventListener("online", () => { if (run && !run.finished) { log("网络恢复"); kick("网络恢复"); } });
+window.addEventListener("offline", () => { if (run && !run.finished) log("网络断开，等恢复后自动继续"); });
 
 function putPart(video, n, signal, onProgress) {
   // 用 XMLHttpRequest 而不是 fetch，是为了拿到上传进度
@@ -219,7 +231,19 @@ function putPart(video, n, signal, onProgress) {
     xhr.open("PUT", `${API}/videos/${video.id}/parts/${n}`);
     xhr.setRequestHeader("authorization", "Bearer " + token);
     xhr.setRequestHeader("content-type", "application/octet-stream");
-    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    // 卡住检测：没有新的进度就断开。字节发完后等服务器回应，多给一倍时间
+    let lastMove = Date.now(), lastLoaded = -1, allSent = false;
+    const watchdog = setInterval(() => {
+      if (document.hidden) { lastMove = Date.now(); return; } // 后台时计时器不准，回前台时统一处理
+      if (Date.now() - lastMove > (allSent ? STALL_MS * 2 : STALL_MS)) { xhr.kickReason = "卡住了"; xhr.abort(); }
+    }, 2000);
+    const cleanup = () => { clearInterval(watchdog); run && run.xhrs.delete(xhr); };
+    xhr.upload.onprogress = (e) => {
+      if (e.loaded !== lastLoaded) { lastLoaded = e.loaded; lastMove = Date.now(); }
+      allSent = e.loaded >= blob.size;
+      onProgress(e.loaded);
+    };
+    xhr.onloadend = cleanup;
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) return resolve(blob.size);
       let msg = "HTTP " + xhr.status;
@@ -230,9 +254,12 @@ function putPart(video, n, signal, onProgress) {
     };
     xhr.onerror = () => reject(new Error("网络中断"));
     xhr.ontimeout = () => reject(new Error("超时"));
-    xhr.onabort = () => reject(Object.assign(new Error("已暂停"), { aborted: true }));
+    xhr.onabort = () => reject(xhr.kickReason && !signal.aborted
+      ? Object.assign(new Error(xhr.kickReason), { kicked: true })
+      : Object.assign(new Error("已暂停"), { aborted: true }));
     xhr.timeout = 10 * 60 * 1000;
     signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    run.xhrs.add(xhr);
     xhr.send(blob);
   });
 }
@@ -240,6 +267,13 @@ function putPart(video, n, signal, onProgress) {
 const sleep = (ms, signal) => new Promise((resolve) => {
   const t = setTimeout(resolve, ms);
   signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+});
+// 断网时等到恢复（或暂停）为止
+const untilOnline = (signal) => new Promise((resolve) => {
+  if (navigator.onLine !== false) return resolve();
+  const done = () => { window.removeEventListener("online", done); resolve(); };
+  window.addEventListener("online", done);
+  signal.addEventListener("abort", done, { once: true });
 });
 
 async function startUpload() {
@@ -282,6 +316,7 @@ async function startUpload() {
     video, controller, paused: false, finished: false,
     confirmed: video.uploadedBytes, // 服务器已确认的字节
     inflight: new Map(),            // 正在传的片 -> 已发送字节
+    xhrs: new Set(),                // 在途的请求，卡住时用来断开
     sentThisRun: 0, startedAt: Date.now(), retries: 0, samples: [],
   };
   hiddenCount = 0; hiddenTotalMs = 0; hiddenSince = 0;
@@ -298,7 +333,7 @@ async function startUpload() {
   async function worker() {
     while (todo.length && !controller.signal.aborted) {
       const n = todo.shift();
-      for (let attempt = 1; ; attempt++) {
+      for (let attempt = 1, httpFails = 0; ; attempt++) {
         try {
           r.inflight.set(n, 0);
           const size = await putPart(video, n, controller.signal, (loaded) => r.inflight.set(n, loaded));
@@ -309,12 +344,20 @@ async function startUpload() {
         } catch (e) {
           r.inflight.delete(n);
           if (e.aborted || controller.signal.aborted) { todo.unshift(n); return; }
-          if (e.status === 401 || e.status === 404 || e.status === 409 || attempt >= MAX_TRIES) throw e;
+          if (e.status === 401 || e.status === 404 || e.status === 409) throw e;
+          // 服务器明确报错才计入放弃次数；断网、卡住、切后台一直重试
+          if (e.status && ++httpFails >= MAX_TRIES) throw e;
           r.retries++;
           $("pRetries").textContent = String(r.retries);
-          const wait = Math.min(30000, 1000 * 2 ** (attempt - 1));
-          log(`第 ${n} 片失败（${e.message}），${wait / 1000} 秒后第 ${attempt + 1} 次尝试`);
-          await sleep(wait, controller.signal);
+          if (e.kicked) {
+            log(`第 ${n} 片${e.message}，马上重传`);
+            attempt = 0;
+          } else {
+            const wait = Math.min(15000, 1000 * 2 ** Math.min(attempt - 1, 4));
+            log(`第 ${n} 片失败（${e.message}），${wait / 1000} 秒后重试`);
+            await sleep(wait, controller.signal);
+          }
+          await untilOnline(controller.signal);
         }
       }
     }

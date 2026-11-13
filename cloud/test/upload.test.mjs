@@ -47,7 +47,7 @@ test("首页和脚本能打开", async () => {
 });
 
 test("分片上传、断点续传、合并、下载、删除", async () => {
-  const data = randomBytes(70 * 1024 * 1024 + 12345); // 3 片：32 + 32 + 6 MB 多一点
+  const data = randomBytes(20 * 1024 * 1024 + 12345); // 3 片：8 + 8 + 4 MiB 多一点
   const res = await call("/videos", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ filename: "game1.MOV", size: data.length, contentType: "video/quicktime", meta: { width: 3840, height: 2160, fps: 60 } }),
