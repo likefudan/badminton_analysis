@@ -100,6 +100,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="每 N 帧送一帧给模型；60fps 视频建议 2（TrackNetV3 是用 30fps 训练的），跳过的帧用插值补")
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
                    help="缩小画面的方法：pil 和 TrackNetV3 原版一样（默认）；area 稍快但位置稍有偏差")
+    s.add_argument("--zoom", type=float, default=1.0,
+                   help="分块放大：除了整帧，再把画面切成每块为整帧 1/N 大小的小块分别找球（远处的球在整帧里不到 1 像素时用，"
+                        "4K 0.5x 建议 3）。给了 --court 就只切球场上方的空间。会启用按轨迹选点")
+    s.add_argument("--window-step", type=int, default=1,
+                   help="每 N 个窗口跑一次 TrackNet（1 = 和原版一样，每帧 8 个窗口取平均；4 = 每帧 2 个窗口，计算量降到 1/4）")
 
     s = sub.add_parser("overlay", help="把羽毛球轨迹画到视频上（通常是 skeleton 输出的骨架视频），得到球场线+骨架+球轨迹的合成视频")
     s.add_argument("video", help="底图视频，例如 <视频名>.skeleton.mp4")
@@ -815,21 +820,39 @@ def cmd_shuttle(a) -> int:
     if a.frame_step == 1 and info.fps and info.fps > 45:
         print(f"提示：视频是 {info.fps:.0f} fps，TrackNetV3 是用 30 fps 训练的，可以试试 --frame-step 2")
     out = Path(a.output or video.with_suffix(".shuttle.csv"))
-    debug = {} if a.court else None
+    calib = None
+    if a.court:
+        from .court import CourtCalibration
+
+        calib = CourtCalibration.load(a.court)
+    views = None
+    if a.zoom > 1:
+        from .shuttle import tile_views
+        from .shuttle_path import far_roi
+
+        size = (info.width, info.height)
+        roi = far_roi(calib, size) if calib else None
+        if calib and roi is None:
+            print("分块：按球场标定，球在整帧里处处都够大，不需要分块")
+        else:
+            views = tile_views(size, a.zoom, roi)
+            print(f"分块：整帧加 {len(views) - 1} 块（每块 {views[1][2] - views[1][0]}x{views[1][3] - views[1][1]}，"
+                  f"{'只切球离镜头远、在整帧里太小的那部分画面' if roi else '没有球场标定，切整个画面'}），"
+                  f"TrackNet 的计算量是不分块、窗口步长 1 时的 {len(views) / a.window_step:.1f} 倍")
+    pick_path = bool(a.court or views)
+    debug = {} if pick_path else None
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
-                             frame_step=a.frame_step, debug=debug, model_dir=a.model_dir)
+                             frame_step=a.frame_step, debug=debug, model_dir=a.model_dir, views=views,
+                             window_step=a.window_step)
     measured = list(tm.measured)
     if a.raw_output:
         write_csv(rows, a.raw_output, row_sources(rows, measured))
-    if a.court:
-        from .court import CourtCalibration
+    if pick_path:
         from .shuttle_path import rows_from_candidates
 
-        if a.frame_step != 1:
-            raise SystemExit("--court 目前只支持 --frame-step 1")
-        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), CourtCalibration.load(a.court),
-                                    measured=measured)
+        rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib, measured=measured,
+                                    fps=info.fps, frame_step=a.frame_step, n_frames=len(rows))
     write_csv(rows, out, row_sources(rows, measured))
     seen = sum(r[1] for r in rows)
     filled = seen - sum(1 for r, m in zip(rows, measured) if r[1] and m)

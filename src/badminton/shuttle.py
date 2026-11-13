@@ -146,6 +146,40 @@ class _WindowEnsemble:
         return res
 
 
+class _StepEnsemble:
+    """Sliding-window average for windows `step` frames apart (step > 1 runs the
+    model on fewer windows: each frame is covered by n/step of them instead of n).
+    A frame's value is the weighted mean over the windows that contain it, with the
+    same position weights as the reference. With step 1 this differs from the
+    reference only in the first and last n-1 frames, so _WindowEnsemble stays in
+    use there."""
+
+    def __init__(self, n: int, step: int):
+        self.n, self.step = n, step
+        self.w = ensemble_weight(n)
+        self.buf: deque = deque()  # (first frame, output) of the windows that still matter
+        self.next = 0  # first frame not returned yet
+
+    def push(self, start: int, out: np.ndarray) -> list[np.ndarray]:
+        """Add the window that starts at frame `start`; return the frames that no later
+        window (the next one starts at start + step) will touch."""
+        self.buf.append((start, out))
+        return self.take(start + self.step)
+
+    def take(self, upto: int) -> list[np.ndarray]:
+        """Merged values for frames self.next .. upto-1 (those covered by a window)."""
+        res = []
+        for f in range(self.next, upto):
+            parts = [(o[f - s], self.w[f - s]) for s, o in self.buf if 0 <= f - s < self.n]
+            if not parts:
+                break
+            res.append(sum(p * w for p, w in parts) / sum(w for _, w in parts))
+        self.next += len(res)
+        while self.buf and self.buf[0][0] + self.n <= self.next:
+            self.buf.popleft()
+        return res
+
+
 # --- models ------------------------------------------------------------------------
 
 
@@ -240,31 +274,126 @@ def load_models(tracknet_dir=None, compute_units: str = "ALL", model_dir: str | 
 # --- pipeline ----------------------------------------------------------------------
 
 
-def _resize(frame_bgr: np.ndarray, method: str = "pil") -> np.ndarray:
-    """BGR frame -> RGB uint8 (288, 512).
+def _resize(frame_bgr: np.ndarray, method: str = "pil", rect: tuple[int, int, int, int] | None = None) -> np.ndarray:
+    """BGR frame (or its part `rect` = x0, y0, x1, y1) -> RGB uint8 (288, 512).
 
     "pil": Pillow bicubic, exactly what the reference does (~10 ms for 1080p).
     "area": OpenCV area averaging (~1 ms) but positions drift: on the test clip
-    95.9 % of frames within 5 px of the reference vs 99.4 % with "pil"."""
+    95.9 % of frames within 5 px of the reference vs 99.4 % with "pil".
+
+    A picture more than 4x the model's size (a full 4K frame) is first shrunk by a
+    whole factor with area averaging: Pillow alone needs 44 ms for 4K, this 12 ms,
+    and Pillow's bicubic averages over the same pixels anyway when it shrinks."""
+    if rect is not None:
+        x0, y0, x1, y1 = rect
+        frame_bgr = frame_bgr[y0:y1, x0:x1]
+    h, w = frame_bgr.shape[:2]
+    k = min(w // (2 * WIDTH), h // (2 * HEIGHT))
+    if k >= 2:
+        frame_bgr = cv2.resize(frame_bgr, (w // k, h // k), interpolation=cv2.INTER_AREA)
     if method == "pil":
         from PIL import Image
 
         rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
+        if rgb.shape[:2] == (HEIGHT, WIDTH):
+            return rgb
         return np.asarray(Image.fromarray(rgb).resize((WIDTH, HEIGHT), Image.BICUBIC))
     small = cv2.resize(frame_bgr, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
     return np.ascontiguousarray(small[..., ::-1])
 
 
-def median_background(video: str | Path, samples: int = MEDIAN_SAMPLES, method: str = "pil") -> np.ndarray:
-    """Median of up to `samples` evenly spread frames, resized to 512x288.
+def _resize_views(frame_bgr: np.ndarray, method: str, views, pool=None) -> np.ndarray:
+    """All views of one frame, (V, 288, 512, 3). Pillow and OpenCV release the GIL
+    while they resize, so a thread pool runs the views side by side."""
+    if len(views) == 1:
+        return _resize(frame_bgr, method, views[0])[None]
+    fn = lambda r: _resize(frame_bgr, method, r)  # noqa: E731
+    return np.stack(list(pool.map(fn, views)) if pool else [fn(r) for r in views])
+
+
+def tile_views(size: tuple[int, int], zoom: float, roi: tuple[float, float, float, float] | None = None,
+               overlap: float = 0.125) -> list[tuple[int, int, int, int]]:
+    """Views (x0, y0, x1, y1 in video pixels) for track_shuttle: the full frame first,
+    then tiles `zoom` times finer (each frame_size / zoom) that cover `roi` (default
+    the whole frame), neighbours overlapping by at least `overlap` of a tile.
+
+    Why: the model sees 512x288. A full 4K frame is shrunk 7.5x, and a shuttle at the
+    far end of the court (6 px in 4K at 0.5x) becomes less than one pixel. In a tile
+    it keeps `zoom` times more pixels; the full frame stays in for the near shuttle,
+    which a tile would show larger and more blurred than anything in the training data."""
+    w, h = size
+    views = [(0, 0, w, h)]
+    if zoom <= 1:
+        return views
+    tw, th = int(round(w / zoom)), int(round(h / zoom))
+    x0, y0, x1, y1 = roi if roi is not None else (0, 0, w, h)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+
+    def starts(a: float, b: float, t: int, limit: int) -> list[int]:
+        if b - a <= t:  # one tile is enough: centre it on the region
+            return [int(min(max(0, (a + b - t) / 2), limit - t))]
+        n = math.ceil((b - a - t) / (t * (1 - overlap))) + 1
+        return [int(round(v)) for v in np.linspace(a, b - t, n)]
+
+    for y in starts(y0, y1, th, h):
+        for x in starts(x0, x1, tw, w):
+            views.append((x, y, x + tw, y + th))
+    return views
+
+
+EDGE_MARGIN = 8  # model pixels: a blob this close to a tile's inner border may be cut off; the neighbour has it whole
+MERGE_RADIUS = 5.0  # full-frame heatmap pixels: candidates of two views this close are the same object
+# A tile's candidate must peak at least this high (the full frame's: 0.3, blob_candidates). Magnified, the
+# floor and the walls are full of small bright specks that light up weakly. Checked by hand on 64 frames
+# each of two 1080p phone videos, wrong picks with full frame only / tiles at 0.3 / at 0.7: 24 / 34 / 24
+# and 14 / 21 / 15. But a far shuttle that only a tile can see is not always a strong blob: on a video
+# shrunk to half size (so that the full frame loses the shuttle) correct picks were 24 without tiles and
+# 28 / 30 / 29 / 28 / 25 with tiles at 0.3 / 0.4 / 0.5 / 0.6 / 0.7. Hence the middle.
+TILE_MIN_PEAK = 0.6
+
+
+def merge_view_candidates(per_view: list, views: list, size: tuple[int, int]) -> np.ndarray:
+    """Candidates of all views of one frame (blob_candidates rows, in each view's own
+    heatmap pixels) -> one array in full-frame heatmap pixels (fractional), best peak
+    first. Blobs at a tile's inner border are dropped, so are a tile's weak blobs
+    (TILE_MIN_PEAK), and duplicates of one object (seen by overlapping views) keep
+    the highest peak."""
+    w, h = size
+    fx, fy = w / WIDTH, h / HEIGHT
+    rows = []
+    for c, (x0, y0, x1, y1) in zip(per_view, views):
+        sx, sy = (x1 - x0) / WIDTH, (y1 - y0) / HEIGHT
+        is_tile = (x0, y0, x1, y1) != (0, 0, w, h)
+        for x, y, peak, area, bbox in c:
+            if is_tile and peak < TILE_MIN_PEAK:
+                continue
+            if ((x < EDGE_MARGIN and x0 > 0) or (x > WIDTH - EDGE_MARGIN and x1 < w)
+                    or (y < EDGE_MARGIN and y0 > 0) or (y > HEIGHT - EDGE_MARGIN and y1 < h)):
+                continue
+            a = (sx * sy) / (fx * fy)
+            rows.append(((x0 + x * sx) / fx, (y0 + y * sy) / fy, peak, area * a, bbox * a))
+    rows.sort(key=lambda r: -r[2])
+    keep: list = []
+    for r in rows:
+        if all((r[0] - k[0]) ** 2 + (r[1] - k[1]) ** 2 >= MERGE_RADIUS**2 for k in keep):
+            keep.append(r)
+    return np.array(keep, dtype=np.float32).reshape(-1, 5)
+
+
+def median_background(video: str | Path, samples: int = MEDIAN_SAMPLES, method: str = "pil", views=None) -> np.ndarray:
+    """Median of up to `samples` evenly spread frames, resized to 512x288
+    (with `views`: one background per view, (V, 288, 512, 3)).
 
     Seeking costs a decode from the previous keyframe (63 ms per seek on a clip
     with a keyframe every 8 s), so videos up to SEQUENTIAL_MAX frames are read
     straight through instead (grab() without converting the skipped frames)."""
     cap = cv2.VideoCapture(str(video))
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if views is not None:
+        samples = max(60, min(samples, MEDIAN_SAMPLES * 4 // len(views)))  # 300 samples of 20 views would be 2.6 GB
     step = max(1, n // samples)
     imgs = []
+    small = (lambda f: _resize(f, method)) if views is None else (lambda f: _resize_views(f, method, views))
     if n <= SEQUENTIAL_MAX:
         for i in range(n):
             if i % step:
@@ -274,14 +403,14 @@ def median_background(video: str | Path, samples: int = MEDIAN_SAMPLES, method: 
             ok, f = cap.read()
             if not ok:
                 break
-            imgs.append(_resize(f, method))
+            imgs.append(small(f))
     else:
         for i in range(0, n, step):
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ok, f = cap.read()
             if not ok:
                 break
-            imgs.append(_resize(f, method))
+            imgs.append(small(f))
     cap.release()
     return np.median(np.stack(imgs), axis=0).astype(np.uint8)
 
@@ -301,16 +430,19 @@ class ShuttleTiming:
                 f"另加背景图 {self.median_s:.1f} 秒；每帧 ms：{parts}")
 
 
-def _reader(video, max_frames, method, q, busy, step=1, start=0):
+def _reader(video, max_frames, method, q, busy, step=1, start=0, views=None):
     """Decode + resize in a separate process. Core ML's predict() keeps Python's
     GIL while it runs, so a thread could not overlap with it; a process can.
-    Frames travel as uint8 (440 kB each); `busy` accumulates seconds spent.
+    Frames travel as uint8 (V views x 440 kB each); `busy` accumulates seconds spent.
     Only every `step`-th frame is sent. An exception is sent as ("error", text)
     so the caller fails instead of silently getting a shorter result."""
+    from concurrent.futures import ThreadPoolExecutor
+
     cap = cv2.VideoCapture(str(video))
     if start:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     i = 0
+    pool = ThreadPoolExecutor(min(len(views), 6)) if views is not None and len(views) > 1 else None
     try:
         while max_frames is None or i < max_frames:
             t0 = time.perf_counter()
@@ -322,7 +454,9 @@ def _reader(video, max_frames, method, q, busy, step=1, start=0):
             ok, f = cap.read()
             if not ok:
                 break
-            small = _resize(f, method)
+            if views is None:
+                views = [(0, 0, f.shape[1], f.shape[0])]
+            small = _resize_views(f, method, views, pool)
             with busy.get_lock():
                 busy.value += time.perf_counter() - t0
             q.put(small)
@@ -331,13 +465,15 @@ def _reader(video, max_frames, method, q, busy, step=1, start=0):
         q.put(("error", f"{type(e).__name__}: {e}"))
     finally:
         cap.release()
+        if pool:
+            pool.shutdown()
         q.put(None)
 
 
 def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "ALL", inpaint: bool = True,
                   max_frames: int | None = None, progress=None, resize: str = "pil", frame_step: int = 1,
                   start_frame: int = 0, debug: dict | None = None,
-                  model_dir: str | os.PathLike | None = None):
+                  model_dir: str | os.PathLike | None = None, views: list | None = None, window_step: int = 1):
     """Returns (rows, timing); rows = list of (frame, visibility, x, y) in video pixels, one per video frame.
 
     start_frame: begin there (row frame numbers stay video frame numbers).
@@ -349,10 +485,21 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     on 30 fps footage, so a 60 fps video looks like it does in training (the
     shuttle moves twice as far between the frames the model sees). The skipped
     frames are filled by linear interpolation between their neighbours when
-    both have the shuttle."""
+    both have the shuttle.
+
+    views: parts of the frame (x0, y0, x1, y1 in video pixels, see tile_views) that
+    each go through TrackNet at 512x288; the first must be the full frame. The rows
+    still come from the full frame alone (the reference method); the candidates in
+    `debug` are those of all views together, in full-frame heatmap pixels, for
+    shuttle_path.rows_from_candidates.
+
+    window_step: run TrackNet on every N-th window only (1 = like the reference,
+    8 windows per frame; 4 = 2 windows per frame, 4x less model time)."""
     import multiprocessing as mp
     import queue
 
+    if not 1 <= window_step <= SEQ_LEN:
+        raise ValueError(f"window_step must be 1..{SEQ_LEN}")
     tm = ShuttleTiming()
     tracknet, inpaintnet = load_models(tracknet_dir, compute_units, model_dir)
     cap = cv2.VideoCapture(str(video))
@@ -363,24 +510,39 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         raise RuntimeError(f"读不出视频画面：{video}")
     h, w = first.shape[:2]
     sx, sy = w / WIDTH, h / HEIGHT
+    views = [tuple(int(v) for v in r) for r in views] if views else [(0, 0, w, h)]
+    if views[0] != (0, 0, w, h):
+        raise ValueError("the first view must be the full frame")
+    V = len(views)
+
+    def chw(img):
+        # CHW, 0..1 as the model expects. Must be C-contiguous: astype() keeps the
+        # transposed layout, and Core ML converts a non-contiguous input 2.4x slower.
+        return np.ascontiguousarray(img.transpose(2, 0, 1)).astype(np.float32) / 255
 
     t = time.perf_counter()
-    median = np.ascontiguousarray(median_background(video, method=resize).transpose(2, 0, 1)).astype(np.float32) / 255
+    medians = [chw(m) for m in median_background(video, method=resize, views=views)]
     tm.median_s = time.perf_counter() - t
 
-    frames: deque = deque(maxlen=SEQ_LEN)
-    ens = _WindowEnsemble(SEQ_LEN)
+    frames = [deque(maxlen=SEQ_LEN) for _ in range(V)]
+    exact = window_step == 1  # the reference's ensemble, bit for bit
+    ens = [_WindowEnsemble(SEQ_LEN) if exact else _StepEnsemble(SEQ_LEN, window_step) for _ in range(V)]
+    ready = [deque() for _ in range(V)]  # merged heatmaps per view, waiting for the other views
     xs, ys, vis = [], [], []
 
     if debug is not None:
         debug.setdefault("candidates", [])
         debug.setdefault("heatmaps", {})
+        debug["views"] = views
         keep_hm = debug.get("keep_heatmaps", set())
 
-    def locate(heat):
+    def locate(heats):
+        """One frame: `heats` = the merged heatmap of every view."""
+        heat = heats[0]
         if debug is not None:
             k = len(xs)
-            debug["candidates"].append(blob_candidates(heat))
+            cands = [blob_candidates(hm) for hm in heats]
+            debug["candidates"].append(cands[0] if V == 1 else merge_view_candidates(cands, views, (w, h)))
             if k in keep_hm:
                 debug["heatmaps"][k] = heat.astype(np.float16)
         t0 = time.perf_counter()
@@ -392,35 +554,40 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
             xs.append(x), ys.append(y), vis.append(0 if x == 0 and y == 0 else 1)
         tm.seconds["locate"] += time.perf_counter() - t0
 
-    pending: list = []
+    def emit():
+        while all(ready):
+            locate([r.popleft() for r in ready])
 
-    def run_window(flush: bool = False):
-        """Queue the current 8-frame window; run the model once TRACKNET_BATCH are queued."""
-        if not flush:
-            pending.append(np.concatenate([median, *frames]))
-        if not pending or (len(pending) < TRACKNET_BATCH and not flush):
-            return
-        t0 = time.perf_counter()
-        k = len(pending)
-        batch = np.ascontiguousarray(np.stack(pending + [pending[-1]] * (TRACKNET_BATCH - k)))
-        heat = tracknet.predict({"frames": batch})["heatmaps"][:k]
-        pending.clear()
-        tm.seconds["tracknet"] += time.perf_counter() - t0
-        for hm in heat:
+    pending: list = []  # (view, first frame of the window, window)
+
+    def run_window(start: int | None, flush: bool = False):
+        """Queue the 8-frame window of every view; run the model on TRACKNET_BATCH at a time."""
+        if start is not None:
+            pending.extend((v, start, np.concatenate([medians[v], *frames[v]])) for v in range(V))
+        while len(pending) >= TRACKNET_BATCH or (flush and pending):
+            chunk = pending[:TRACKNET_BATCH]
+            del pending[:TRACKNET_BATCH]
             t0 = time.perf_counter()
-            merged = ens.push(hm.astype(np.float32))
+            k = len(chunk)
+            batch = np.ascontiguousarray(np.stack([c[2] for c in chunk] + [chunk[-1][2]] * (TRACKNET_BATCH - k)))
+            heat = tracknet.predict({"frames": batch})["heatmaps"][:k]
+            tm.seconds["tracknet"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            for (v, s, _), hm in zip(chunk, heat):
+                hm = hm.astype(np.float32)
+                ready[v].extend([ens[v].push(hm)] if exact else ens[v].push(s, hm))
             tm.seconds["ensemble"] += time.perf_counter() - t0
-            locate(merged)
+            emit()
 
     wall = time.perf_counter()
     ctx = mp.get_context("spawn")
-    q = ctx.Queue(maxsize=32)
+    q = ctx.Queue(maxsize=max(4, 32 // V))
     busy = ctx.Value("d", 0.0)
-    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy, frame_step, start_frame),
+    reader = ctx.Process(target=_reader, args=(str(video), max_frames, resize, q, busy, frame_step, start_frame, views),
                          daemon=True)
     reader.start()
     n = 0
-    last = None
+    last_start = -1
     while True:
         try:
             item = q.get(timeout=10)
@@ -433,29 +600,34 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         if isinstance(item, tuple):
             reader.join()
             raise RuntimeError(f"读视频时出错（第 {n * frame_step} 帧附近）：{item[1]}")
-        # CHW, 0..1 as the model expects. Must be C-contiguous: astype() keeps the
-        # transposed layout, and Core ML converts a non-contiguous input 2.4x slower.
-        last = np.ascontiguousarray(item.transpose(2, 0, 1)).astype(np.float32) / 255
-        frames.append(last)
+        for v in range(V):
+            frames[v].append(chw(item[v]))
         n += 1
-        if len(frames) == SEQ_LEN:
-            run_window()
+        if n >= SEQ_LEN and (n - SEQ_LEN) % window_step == 0:
+            last_start = n - SEQ_LEN
+            run_window(last_start)
         if progress:
             progress(n, (max_frames or n_total) // frame_step, time.perf_counter() - wall)
     reader.join()
     tm.seconds["decode+resize（并行）"] = busy.value
     if 0 < n < SEQ_LEN:  # shorter than one window: pad with the last frame, like the reference
-        while len(frames) < SEQ_LEN:
-            frames.append(last)
-        run_window()
-        run_window(flush=True)
-        tail = ens.flush()[: n - 1]
-    else:
-        run_window(flush=True)
-        tail = ens.flush() if n else []
-    for heat in tail:
-        locate(heat)
+        for v in range(V):
+            while len(frames[v]) < SEQ_LEN:
+                frames[v].append(frames[v][-1])
+        run_window(0)
+    elif n and last_start != n - SEQ_LEN:  # window_step > 1: the last frames need a window of their own
+        run_window(n - SEQ_LEN)
+    run_window(None, flush=True)
+    if n:
+        for v in range(V):
+            if exact:
+                ready[v].extend(ens[v].flush()[: n - 1] if n < SEQ_LEN else ens[v].flush())
+            else:
+                ready[v].extend(ens[v].take(n))
+        emit()
     tm.frames = n
+    if debug is not None:
+        del debug["candidates"][n:]
 
     xs, ys, vis = np.array(xs[:n], float), np.array(ys[:n], float), np.array(vis[:n], int)
     seen = vis.astype(bool)  # before InpaintNet fills gaps: what TrackNet itself saw

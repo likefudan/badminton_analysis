@@ -97,3 +97,81 @@ def test_path_reports_which_rows_are_measured():
     rows = rows_from_candidates(cands, (1920, 1080), measured=measured)
     assert [r[1] for r in rows] == [1] * 40  # the two-frame gap is filled
     assert measured == [f not in (4, 5) for f in range(40)]
+
+
+def test_tile_views_cover_the_region_with_overlap():
+    from badminton.shuttle import tile_views
+
+    assert tile_views((1920, 1080), 1) == [(0, 0, 1920, 1080)]
+    views = tile_views((3840, 2160), 3)
+    assert views[0] == (0, 0, 3840, 2160)
+    tiles = views[1:]
+    assert all(x1 - x0 == 1280 and y1 - y0 == 720 for x0, y0, x1, y1 in tiles)
+    cover = np.zeros((2160, 3840), int)
+    for x0, y0, x1, y1 in tiles:
+        assert 0 <= x0 and x1 <= 3840 and 0 <= y0 and y1 <= 2160
+        cover[y0:y1, x0:x1] += 1
+    assert cover.min() >= 1
+    xs = sorted({t[0] for t in tiles})
+    assert all(b - a <= 1280 * 0.875 + 1 for a, b in zip(xs[:-1], xs[1:]))  # neighbours overlap by 1/8 or more
+    # a region smaller than one tile gets a single tile around it, kept inside the frame
+    assert tile_views((3840, 2160), 3, roi=(3500, 100, 3800, 300))[1:] == [(2560, 0, 3840, 720)]
+    # only the region is tiled
+    part = tile_views((3840, 2160), 3, roi=(1000, 500, 3000, 1500))[1:]
+    assert len(part) < len(tiles) and min(t[0] for t in part) == 1000 and max(t[2] for t in part) == 3000
+
+
+def test_merge_view_candidates_maps_to_the_full_frame():
+    from badminton.shuttle import merge_view_candidates
+
+    size = (1920, 1080)
+    views = [(0, 0, 1920, 1080), (0, 0, 960, 540), (896, 0, 1856, 540)]
+    full = np.array([[100.0, 50.0, 0.6, 9, 9]], np.float32)  # at video (375, 187.5)
+    tile = np.array([[200.0, 100.0, 0.9, 16, 16],  # the same object, seen larger: video (375, 187.5)
+                     [508.0, 100.0, 0.9, 4, 4],  # at this tile's inner (right) border: cut off, dropped
+                     [3.0, 283.0, 0.9, 4, 4],
+                     [300.0, 200.0, 0.5, 4, 4]], np.float32)  # too weak for a tile  # the frame's left border is fine, but the tile's inner bottom border
+    right = np.array([[40.0, 100.0, 0.8, 16, 16]], np.float32)  # video (971, 187.5), well inside the right tile
+    out = merge_view_candidates([full, tile, right], views, size)
+    np.testing.assert_allclose(out[:, :3], [[100, 50, 0.9], [971 / 3.75, 50, 0.8]], atol=1e-4)
+    np.testing.assert_allclose(out[0, 3:], [4, 4])  # areas in full-frame heatmap pixels: 16 / 2^2
+
+
+def test_step_ensemble():
+    from badminton.shuttle import _StepEnsemble
+
+    n, F = 8, 30
+    truth = np.arange(F, dtype=float)
+    for step in (1, 2, 4, 8, 3):
+        ens = _StepEnsemble(n, step)
+        got = []
+        starts = list(range(0, F - n + 1, step))
+        if starts[-1] != F - n:
+            starts.append(F - n)
+        for s in starts:
+            got += ens.push(s, truth[s:s + n] + 100)  # every window agrees: the mean must return it
+        got += ens.take(F)
+        np.testing.assert_allclose(got, truth + 100)
+    # two windows that disagree: weights 4:4 at the first window's frame 4 = the second's frame 0 -> 1/(4+1) ...
+    ens = _StepEnsemble(8, 4)
+    a = ens.push(0, np.zeros(8))
+    b = ens.push(4, np.ones(8))
+    w = ensemble_weight(8)
+    assert a == [0, 0, 0, 0]
+    np.testing.assert_allclose(b, [w[k] / (w[k] + w[k + 4]) for k in range(4)])
+
+
+def test_resize_crops_and_prescales_large_frames():
+    from badminton.shuttle import HEIGHT, WIDTH, _resize
+
+    rng = np.random.default_rng(0)
+    big = np.kron(rng.integers(0, 255, (54, 96, 3), dtype=np.uint8), np.ones((40, 40, 1), np.uint8))  # 3840x2160, blocky
+    out = _resize(big)
+    assert out.shape == (HEIGHT, WIDTH, 3)
+    from PIL import Image
+
+    ref = np.asarray(Image.fromarray(np.ascontiguousarray(big[..., ::-1])).resize((WIDTH, HEIGHT), Image.BICUBIC))
+    assert np.abs(out.astype(int) - ref).mean() < 3  # prescaling changes little
+    # a crop of exactly the model's size is passed through (BGR -> RGB only)
+    crop = _resize(big, rect=(100, 200, 100 + WIDTH, 200 + HEIGHT))
+    np.testing.assert_array_equal(crop, big[200:200 + HEIGHT, 100:100 + WIDTH, ::-1])
