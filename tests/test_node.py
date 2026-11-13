@@ -20,6 +20,8 @@ class FakeCloud:
         self.queued = True
         self.released = False
         self.jobs: list[dict] = []
+        self.reviews = 0
+        self.review_error = ""
         self.results: dict[str, bytes] = {}
         self.multipart: dict[int, bytes] = {}
         self.drop = drop_first_download
@@ -69,6 +71,11 @@ class FakeCloud:
                     return self.send({"video": video})
                 if self.path.endswith("/original/release"):
                     cloud.released = True
+                    return self.send({})
+                if self.path.endswith("/review"):
+                    cloud.reviews += 1
+                    if cloud.review_error:
+                        return self.send({"error": cloud.review_error}, 503)
                     return self.send({})
                 if self.path.endswith("/job"):
                     cloud.jobs.append(json.loads(data))
@@ -137,6 +144,7 @@ def test_downloads_releases_uploads_and_finishes(cloud, tmp_path):
     assert steps["download"]["status"] == "done" and steps["download"]["percent"] == 100
     assert steps["sdr"]["status"] == "skipped" and steps["skeleton"]["status"] == "done"
     assert steps["upload"]["detail"] == "2 个文件"
+    assert steps["review"]["status"] == "skipped" and cloud.reviews == 0   # no statistics summary, nothing to ask
     assert any(j["stage"].startswith("下载原片") for j in cloud.jobs)
     # every report carries the whole step list, so the page can draw it from any one of them
     assert all(len(j["progress"]["steps"]) == len(node.STEPS) for j in cloud.jobs)
@@ -262,13 +270,13 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     first = p.to_json()
     assert first["etaSeconds"] is None and first["elapsedSeconds"] == 10
     assert first["steps"][0]["seconds"] == 10 and "estimateSeconds" not in first["steps"][3]
-    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("upload", 12)):
+    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("upload", 12), ("review", 30)):
         p.start(key)          # starting the next step finishes the one before
         clock.t += seconds
-    p.done("upload")
+    p.done("review")
     done = p.to_json()
-    assert [s["status"] for s in done["steps"]] == ["done"] * 9
-    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 12]
+    assert [s["status"] for s in done["steps"]] == ["done"] * 10
+    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 12, 30]
     assert done["etaSeconds"] == 0
 
     # second recording, twice as long and twice as big: estimates scale with it
@@ -280,7 +288,7 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     j = p2.to_json()
     assert j["steps"][0]["etaSeconds"] == 12
     assert j["steps"][3]["estimateSeconds"] == 80           # skeleton: 40 s for 20 s of video -> 80 s for 40 s
-    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 24
+    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 24 + 60
     p2.start("sdr")
     clock.t += 6
     assert p2.to_json()["steps"][1]["etaSeconds"] == 10     # 16 s expected, 6 s gone
@@ -358,3 +366,42 @@ def test_shuttle_failure_does_not_fail_the_job(tmp_path, fail):
     assert node.track_shuttle(tmp_path / "v.mp4", tmp_path / "v.court.json", tmp_path, progress, [], run=run) is None
     step = progress.steps["shuttle"]
     assert step["status"] == "skipped" and "找不到模型" in step["detail"]
+
+
+def with_review_request(video: Path, out_dir: Path, options, progress, log):
+    files = fake_analyse(video, out_dir, options, progress, log)
+    request = out_dir / f"{video.stem}.review.request.json"
+    request.write_text(json.dumps({"system": "s", "user": "u"}))
+    return files + [request]
+
+
+def test_the_site_is_asked_for_the_ai_report_after_the_upload(cloud, tmp_path):
+    node.run(config(cloud, tmp_path), once=True, analyse_fn=with_review_request)
+    assert "review.request.json" in cloud.results and cloud.reviews == 1
+    last = cloud.jobs[-1]
+    assert last["status"] == "done" and last["progress"]["steps"][-1]["status"] == "done"
+
+
+def test_no_api_key_on_the_site_skips_the_report_and_keeps_the_results(cloud, tmp_path):
+    cloud.review_error = "网站还没有配置 ANTHROPIC_API_KEY，出不了 AI 报告"
+    node.run(config(cloud, tmp_path), once=True, analyse_fn=with_review_request)
+    last = cloud.jobs[-1]
+    step = last["progress"]["steps"][-1]
+    assert last["status"] == "done" and step["status"] == "skipped" and "ANTHROPIC_API_KEY" in step["detail"]
+
+
+def test_review_inputs_use_what_the_analysis_produced(tmp_path):
+    calls = []
+
+    def run(args, log, on_line=None, on_frames=None):
+        calls.append(args)
+        return 0
+
+    work, court = tmp_path / "v.mp4", tmp_path / "v.court.json"
+    assert not node.review_inputs(work, court, tmp_path, [], run=run) and not calls   # no movement statistics
+    for name in ("v.movement.json", "v.positioning.json", "v.shuttle.csv"):
+        (tmp_path / name).write_text("{}")
+    assert node.review_inputs(work, court, tmp_path, [], run=run)
+    assert calls == [["review", str(tmp_path / "v.movement.json"), str(tmp_path / "v.positioning.json"),
+                      "--court", str(court), "-o", str(tmp_path), "--shuttle", str(tmp_path / "v.shuttle.csv"),
+                      "--video", str(work)]]

@@ -461,6 +461,14 @@ def build_messages(summary: dict, previous: dict | None = None, report: str | No
     return system, [{"role": "user", "content": context + "\n\n" + ask}]
 
 
+def request_json(summary: dict, previous: dict | None = None, model: str = DEFAULT_MODEL) -> dict:
+    """Everything a server needs to ask for the review (and follow-up questions) without this code:
+    the web site (cloud/) reads it, adds its own API key and calls the model. Text and numbers only."""
+    system, user = build_prompt(summary, previous)
+    return {"schema": SCHEMA, "model": model, "max_tokens": MAX_TOKENS, "system": system, "user": user,
+            "ask": ASK_REQUEST, "title": summary.get("source", "")}
+
+
 def prompt_file_text(system: str, messages: list[dict]) -> str:
     """One text file to paste into any chat model."""
     out = [system, ""]

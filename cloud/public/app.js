@@ -585,7 +585,10 @@ setInterval(() => {
 function openDetail(id) {
   openId = id;
   shownKey = "";
+  reviewKey = "";
+  reviewError = "";
   $("dBody").textContent = "";
+  $("dReview").textContent = "";
   $("detail").hidden = false;
   $("listCard").hidden = true;
   $("dDelete").textContent = "删除这局";
@@ -628,7 +631,8 @@ async function renderDetail() {
   $("dMode").hidden = !(v.status === "uploaded" && v.job && v.job.status !== "processing");
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
-  const key = v.results.map((r) => r.name + ":" + r.size).join("|");
+  renderReview(v);
+  const key = v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
   shownKey = key;
   const body = $("dBody");
@@ -668,6 +672,140 @@ async function renderDetail() {
       }
     }
   }
+}
+
+// ---------- AI 报告 ----------
+
+// 只认标题、列表、引用、粗体、行内代码；全部用 textContent 写入，报告里的 HTML 不会被执行
+function mdInline(el, text) {
+  for (const part of text.split(/(\*\*[^*]+\*\*|`[^`]+`)/)) {
+    if (/^\*\*[^*]+\*\*$/.test(part)) {
+      const b = document.createElement("strong");
+      b.textContent = part.slice(2, -2);
+      el.append(b);
+    } else if (/^`[^`]+`$/.test(part)) {
+      const c = document.createElement("code");
+      c.textContent = part.slice(1, -1);
+      el.append(c);
+    } else if (part) el.append(part);
+  }
+  return el;
+}
+
+function renderMarkdown(md) {
+  const root = document.createElement("div");
+  root.className = "md";
+  let list = null, para = null, quote = null;
+  const flush = () => { list = null; para = null; quote = null; };
+  for (const raw of md.split("\n")) {
+    const line = raw.trimEnd();
+    let m;
+    if (!line.trim()) { flush(); continue; }
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      flush();
+      root.append(mdInline(document.createElement(m[1].length <= 2 ? "h4" : "h5"), m[2]));
+    } else if ((m = line.match(/^\s*(?:[-*]|(\d+)[.、)])\s+(.*)$/))) {
+      const tag = m[1] ? "ol" : "ul";
+      if (!list || list.tagName.toLowerCase() !== tag) {
+        flush();
+        list = document.createElement(tag);
+        if (m[1]) list.start = Number(m[1]);
+        root.append(list);
+      }
+      para = mdInline(document.createElement("li"), m[2]);
+      list.append(para);
+    } else if ((m = line.match(/^>\s?(.*)$/))) {
+      if (!quote) { flush(); quote = document.createElement("blockquote"); root.append(quote); }
+      else quote.append(" ");
+      mdInline(quote, m[1]);
+    } else if (para && /^\s/.test(raw)) {
+      para.append(" ");
+      mdInline(para, line.trim()); // 列表项的续行
+    } else {
+      if (!para || list) { flush(); para = document.createElement("p"); root.append(para); }
+      else para.append(document.createElement("br"));
+      mdInline(para, line.trim());
+    }
+  }
+  return root;
+}
+
+let reviewKey = "";    // AI 报告区已经画过的内容
+let reviewBusy = "";   // 正在生成报告或回答追问的那一局
+let reviewError = "";
+
+async function renderReview(v, force) {
+  const box = $("dReview");
+  const find = (name) => v.results.find((r) => r.name === name);
+  const md = find("review.md"), qa = find("review.qa.md"), can = find("review.request.json");
+  const busy = reviewBusy === v.id;
+  const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busy, reviewError].join("|");
+  if (!force && key === reviewKey) return;
+  reviewKey = key;
+  if (!md && !can) { box.textContent = ""; return; }
+  const text = async (name) => {
+    try { return await (await fetch(`${API}/videos/${v.id}/results/${name}?t=${Date.now()}`)).text(); } catch { return ""; }
+  };
+  const [report, answers] = await Promise.all([md ? text("review.md") : "", qa ? text("review.qa.md") : ""]);
+  if (openId !== v.id || key !== reviewKey) return;
+  const draft = box.querySelector("textarea") ? box.querySelector("textarea").value : "";
+  box.textContent = "";
+  const h = document.createElement("h3");
+  h.textContent = "AI 报告";
+  box.append(h);
+  if (report) box.append(renderMarkdown(report));
+  if (answers) {
+    const h2 = document.createElement("h3");
+    h2.textContent = "追问";
+    box.append(h2, renderMarkdown(answers));
+  }
+  const note = document.createElement("p");
+  note.className = reviewError ? "bad" : "quiet";
+  note.textContent = reviewError || (busy ? "正在请大模型写，大约需要一分钟，请不要关闭页面……"
+    : report ? "" : "这局还没有 AI 报告。它只根据上面这些统计数字写，不看视频。");
+  if (note.textContent) box.append(note);
+  if (!can || busy) return;
+  const row = document.createElement("div");
+  row.className = "row";
+  const make = document.createElement("button");
+  make.className = "plain";
+  make.textContent = report ? "重新生成报告" : "生成 AI 报告";
+  make.onclick = () => runReview(v.id, "/review", {});
+  if (report) {
+    const input = document.createElement("textarea");
+    input.placeholder = "追问，例如：我下次最该先练哪一项？";
+    input.value = draft;
+    const ask = document.createElement("button");
+    ask.className = "plain";
+    ask.textContent = "追问";
+    ask.onclick = () => {
+      const question = input.value.trim();
+      if (!question) return;
+      input.value = "";
+      runReview(v.id, "/review/ask", { question });
+    };
+    box.append(input);
+    row.append(ask);
+  }
+  row.append(make);
+  box.append(row);
+}
+
+async function runReview(id, path, body) {
+  if (reviewBusy) return;
+  reviewBusy = id;
+  reviewError = "";
+  const again = () => { const v = videos.find((x) => x.id === id); if (v && openId === id) renderReview(v); };
+  again();
+  try {
+    await api(`/videos/${id}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  } catch (e) {
+    reviewError = "AI 报告没有成功：" + e.message;
+    log(reviewError);
+  }
+  reviewBusy = "";
+  await refreshList();
+  again();
 }
 
 function statsTable(mv) {

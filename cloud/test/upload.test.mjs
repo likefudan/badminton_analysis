@@ -6,6 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 
 const PORT = 8799;
 const BASE = `http://127.0.0.1:${PORT}/api/v1`;
@@ -14,14 +15,41 @@ const auth = { authorization: `Bearer ${TOKEN}` };
 const state = mkdtempSync(join(tmpdir(), "ba-test-"));
 let server;
 
+// 假的 Anthropic API：记下收到的请求，按流式格式回一段文字
+const AI_PORT = 8798;
+const aiCalls = [];
+const ai = createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    if (req.headers["x-api-key"] !== "test-ai-key") {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }));
+    }
+    const data = JSON.parse(body);
+    aiCalls.push(data);
+    const last = data.messages.at(-1).content;
+    const answer = last.startsWith("追问") ? ["先练", "步法。"] : ["## 比赛概况\n\n打了 ", "**25 秒**。<script>x</script>"];
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    const send = (ev) => res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+    send({ type: "message_start", message: { content: [] } });
+    for (const text of answer) send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+    send({ type: "message_delta", delta: { stop_reason: "end_turn" } });
+    send({ type: "message_stop" });
+    res.end();
+  });
+});
+
 const call = (path, init = {}) => fetch(BASE + path, { ...init, headers: { ...auth, ...(init.headers || {}) } });
 
 before(async () => {
+  await new Promise((r) => ai.listen(AI_PORT, "127.0.0.1", r));
   execFileSync("npx", ["wrangler", "d1", "migrations", "apply", "ba-db", "--local", "--persist-to", state], {
     stdio: "ignore", env: { ...process.env, CI: "1" },
   });
   server = spawn("npx", ["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", state,
-    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key", "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key",
+    "--var", "ANTHROPIC_API_KEY:test-ai-key", "--var", `ANTHROPIC_BASE_URL:http://127.0.0.1:${AI_PORT}`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(BASE + "/me")).status === 401) return; } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -31,6 +59,7 @@ before(async () => {
 
 after(() => {
   server?.kill();
+  ai.close();
   rmSync(state, { recursive: true, force: true });
 });
 
@@ -223,4 +252,43 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   // 删除录像时结果一起删
   assert.equal((await call(`/videos/${v.id}`, { method: "DELETE" })).status, 200);
   assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie } })).status, 404);
+});
+
+test("AI 报告：网站拿节点传上来的统计摘要去问模型，存成结果；可以追问", async () => {
+  const json = { "content-type": "application/json" };
+  const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
+  const data = randomBytes(1000);
+  let v = await (await post("/videos", { filename: "r.mp4", size: data.length, contentType: "video/mp4" })).json();
+  await call(`/videos/${v.id}/parts/1`, { method: "PUT", body: data });
+  await post(`/videos/${v.id}/complete`);
+  assert.equal((await (await call("/me")).json()).review, true);
+
+  // 还没有统计摘要
+  assert.equal((await post(`/videos/${v.id}/review`)).status, 409);
+  const request = { schema: 1, model: "claude-test", max_tokens: 16000, system: "你是教练", user: "摘要……请写点评", ask: "追问：{question}" };
+  await call(`/videos/${v.id}/results/review.request.json`, { method: "PUT", body: JSON.stringify(request) });
+
+  let res = await post(`/videos/${v.id}/review`);
+  assert.equal(res.status, 200);
+  v = await res.json();
+  assert.ok(v.results.some((r) => r.name === "review.md" && r.contentType.startsWith("text/markdown")));
+  assert.deepEqual([aiCalls[0].model, aiCalls[0].system, aiCalls[0].stream], ["claude-test", "你是教练", true]);
+  assert.deepEqual(aiCalls[0].messages, [{ role: "user", content: "摘要……请写点评" }]);
+  const report = await (await call(`/videos/${v.id}/results/review.md`)).text();
+  assert.match(report, /^## 比赛概况\n\n打了 \*\*25 秒\*\*。<script>x<\/script>\n\n> 由 claude-test /);
+
+  // 追问：带上原来的摘要、报告和之前的问答
+  assert.equal((await post(`/videos/${v.id}/review/ask`, { question: " " })).status, 400);
+  res = await post(`/videos/${v.id}/review/ask`, { question: "先练什么？" });
+  assert.equal((await res.json()).answer, "先练步法。");
+  await post(`/videos/${v.id}/review/ask`, { question: "为什么？" });
+  assert.deepEqual(aiCalls.at(-1).messages.map((m) => m.role), ["user", "assistant", "user", "assistant", "user"]);
+  assert.deepEqual(aiCalls.at(-1).messages.slice(2).map((m) => m.content), ["追问：先练什么？", "先练步法。", "追问：为什么？"]);
+  const qa = await (await call(`/videos/${v.id}/results/review.qa.md`)).text();
+  assert.equal(qa, "## 问：先练什么？\n\n先练步法。\n\n## 问：为什么？\n\n先练步法。\n\n");
+
+  // 重新生成报告后，旧的追问清掉
+  v = await (await post(`/videos/${v.id}/review`)).json();
+  assert.ok(!v.results.some((r) => r.name === "review.qa.md"));
+  await call(`/videos/${v.id}`, { method: "DELETE" });
 });

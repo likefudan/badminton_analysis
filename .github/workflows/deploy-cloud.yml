@@ -7,6 +7,7 @@ name: 部署 ba.llmat.dev
 #   CLOUDFLARE_ACCOUNT_ID
 #   BA_ACCESS_TOKEN        网站登录口令（自己定）
 #   BA_NODE_TOKEN          可选：Mac 处理节点的钥匙（和 ~/.config/badminton/node.json 里的一致）
+#   ANTHROPIC_API_KEY      可选：AI 报告用的 Anthropic API key；没有就不出报告
 on:
   push:
     branches: [main]
@@ -120,6 +121,16 @@ jobs:
             echo "没有 BA_NODE_TOKEN，跳过"
           fi
 
+      - name: 设置 AI 报告的 API key（有才设）
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            printf '%s' "$ANTHROPIC_API_KEY" | npx wrangler secret put ANTHROPIC_API_KEY
+          else
+            echo "没有 ANTHROPIC_API_KEY，跳过（网站不出 AI 报告）"
+          fi
+
       - name: 线上检查
         env:
           BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
@@ -138,6 +149,7 @@ jobs:
           check "首页" 200 "$SITE/"
           check "未登录 /api/v1/me" 401 "$SITE/api/v1/me"
           check "登录后 /api/v1/me" 200 -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me"
+          echo "AI 报告是否可用：$(curl -s -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me" | grep -o '"review":[a-z]*' || true)"
           if [ -n "$BA_NODE_TOKEN" ]; then
             check "处理节点的钥匙 /api/v1/me" 200 -H "Authorization: Bearer $BA_NODE_TOKEN" "$SITE/api/v1/me"
           fi

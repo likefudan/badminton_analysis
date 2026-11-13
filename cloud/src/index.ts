@@ -7,6 +7,8 @@ export interface Env {
   ASSETS: Fetcher;
   ACCESS_TOKEN: string;
   NODE_TOKEN?: string; // Mac 处理节点自己的钥匙，和登录口令分开；没设置就只认登录口令
+  ANTHROPIC_API_KEY?: string; // AI 报告用；没设置就不出报告
+  ANTHROPIC_BASE_URL?: string; // 只在测试里改
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -422,6 +424,132 @@ async function getResult(req: Request, env: Env, id: string, name: string): Prom
   return res;
 }
 
+// ---------- AI 报告 ----------
+// 节点上传 review.request.json（badminton review 写的：system、user、追问模板、模型），里面只有统计数字和文字。
+// 这里拿它去问 Anthropic API，回答存成 review.md；追问的问答追加到 review.qa.md。key 只在 Worker 里。
+
+interface ReviewRequest {
+  model: string;
+  max_tokens: number;
+  system: string;
+  user: string;
+  ask: string; // 含 {question}
+  title?: string;
+}
+
+async function resultText(env: Env, id: string, name: string): Promise<string | null> {
+  const object = await env.BUCKET.get(resultKey(id, name));
+  return object ? object.text() : null;
+}
+
+async function saveResultText(env: Env, id: string, name: string, text: string): Promise<void> {
+  const object = await env.BUCKET.put(resultKey(id, name), text, { httpMetadata: { contentType: resultType(name) } });
+  await recordResult(env, id, name, object.size);
+}
+
+async function reviewRequest(env: Env, id: string): Promise<ReviewRequest> {
+  if (!env.ANTHROPIC_API_KEY) throw new HttpError(503, "网站还没有配置 ANTHROPIC_API_KEY，出不了 AI 报告");
+  const text = await resultText(env, id, "review.request.json");
+  let r: ReviewRequest | null = null;
+  try {
+    r = text ? (JSON.parse(text) as ReviewRequest) : null;
+  } catch {}
+  if (!r || typeof r.system !== "string" || typeof r.user !== "string" || typeof r.model !== "string")
+    throw new HttpError(409, "这局还没有 AI 报告要用的统计摘要，请先重新处理");
+  return r;
+}
+
+type Message = { role: "user" | "assistant"; content: string };
+
+// 流式读取：长回答不会因为连接长时间没有数据被掐断
+async function askClaude(env: Env, r: ReviewRequest, messages: Message[]): Promise<string> {
+  const res = await fetch((env.ANTHROPIC_BASE_URL || "https://api.anthropic.com") + "/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY!, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: r.model,
+      max_tokens: Math.min(Math.max(Number(r.max_tokens) || 8000, 256), 16000),
+      system: r.system,
+      messages,
+      stream: true,
+    }),
+  });
+  if (!res.ok || !res.body) {
+    let detail = "";
+    try {
+      detail = ((await res.json()) as { error?: { message?: string } }).error?.message ?? "";
+    } catch {}
+    throw new HttpError(502, `调用 Anthropic API 失败（${res.status}）${detail ? "：" + detail.slice(0, 300) : ""}`);
+  }
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = "";
+  let text = "";
+  let stop = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += value;
+    const lines = buf.split("\n");
+    buf = lines.pop()!;
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      let ev: any;
+      try {
+        ev = JSON.parse(line.slice(5));
+      } catch {
+        continue;
+      }
+      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text;
+      else if (ev.type === "message_delta" && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+      else if (ev.type === "error") throw new HttpError(502, "Anthropic API 出错：" + String(ev.error?.message ?? "").slice(0, 300));
+    }
+  }
+  text = text.trim();
+  if (stop === "refusal") throw new HttpError(502, "模型拒绝回答这个请求");
+  if (!text) throw new HttpError(502, "模型没有返回文字");
+  if (stop === "max_tokens") text += "\n\n（回答到长度上限被截断）";
+  return text;
+}
+
+async function makeReview(env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const r = await reviewRequest(env, id);
+  const body = await askClaude(env, r, [{ role: "user", content: r.user }]);
+  const note = `> 由 ${r.model} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
+  await saveResultText(env, id, "review.md", `${body}\n\n${note}\n`);
+  await deleteResult(env, id, "review.qa.md"); // 追问是接着旧报告问的，报告换了就不再对得上
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+async function askReview(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { question?: unknown } | null;
+  const question = typeof body?.question === "string" ? body.question.trim().slice(0, 1000) : "";
+  if (!question) throw new HttpError(400, "请写下要问的问题");
+  const r = await reviewRequest(env, id);
+  const report = await resultText(env, id, "review.md");
+  const earlier = (await resultText(env, id, "review.qa.md")) ?? "";
+  const messages: Message[] = [{ role: "user", content: r.user }];
+  if (report) messages.push({ role: "assistant", content: report });
+  else messages[0].content += "\n\n（先不用写点评，等我提问。）";
+  if (!report) messages.push({ role: "assistant", content: "好的，请问。" });
+  const ask = (q: string) => (r.ask || "追问：{question}").replace("{question}", q);
+  // 之前的问答也带上，这样可以接着上一个问题问
+  for (const m of earlier.matchAll(/^## 问：(.*)\n\n([\s\S]*?)(?=\n\n## 问：|\s*$)/gm)) {
+    messages.push({ role: "user", content: ask(m[1]) }, { role: "assistant", content: m[2].trim() });
+  }
+  messages.push({ role: "user", content: ask(question) });
+  const answer = await askClaude(env, r, messages);
+  const oneLine = question.replace(/\s+/g, " ");
+  await saveResultText(env, id, "review.qa.md", `${earlier}## 问：${oneLine}\n\n${answer.replace(/^## /gm, "### ")}\n\n`);
+  return json({ answer, video: await describe(env, await getVideo(env, id)) });
+}
+
+async function deleteResult(env: Env, id: string, name: string): Promise<void> {
+  await env.BUCKET.delete(resultKey(id, name));
+  await env.DB.prepare("DELETE FROM results WHERE video_id = ? AND name = ?").bind(id, name).run();
+}
+
 async function deleteResults(env: Env, id: string): Promise<void> {
   const rows = await env.DB.prepare("SELECT r2_key FROM results WHERE video_id = ?").bind(id).all<{ r2_key: string }>();
   const keys = rows.results.map((r) => r.r2_key);
@@ -465,7 +593,7 @@ async function listVideos(env: Env): Promise<Response> {
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {
   if (!(await authorized(req, env))) throw new HttpError(401, "口令不对");
   const m = req.method;
-  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE });
+  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(env.ANTHROPIC_API_KEY) });
   if (path === "/videos" && m === "POST") return createVideo(req, env);
   if (path === "/videos" && m === "GET") return listVideos(env);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
@@ -483,6 +611,10 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (match && m === "POST") return updateJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job\/retry$/);
   if (match && m === "POST") return retryJob(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/review$/);
+  if (match && m === "POST") return makeReview(env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/review\/ask$/);
+  if (match && m === "POST") return askReview(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/original\/release$/);
   if (match && m === "POST") return releaseOriginal(env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/results\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);

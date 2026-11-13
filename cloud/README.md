@@ -44,7 +44,7 @@ badminton node            # 常驻：每 15 秒查一次有没有新录像
 badminton node --once     # 处理完排队中的就退出
 ```
 
-原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 羽毛球追踪（`badminton shuttle --court` 加 `overlay`，画在骨架视频上；失败不影响其它结果）→ 结果视频转成手机能放的 1080p H.264 → 上传。
+原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 羽毛球追踪（`badminton shuttle --court` 加 `overlay`，画在骨架视频上；失败不影响其它结果）→ 写出 AI 报告要用的统计摘要和提示词（`badminton review`，不联网）→ 结果视频转成手机能放的 1080p H.264 → 上传 → 让网站出 AI 报告。
 网页上能看到每一步的状态、用时和预计剩余时间。预计时间来自这台 Mac 之前处理的记录（`~/badminton_uploads/timings.json`，按录像时长折算），第一次处理时只有下载和骨架识别这两步有预计。网页还显示 Mac 是否在线（节点最后一次联系的时间）和排队位置。
 
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
@@ -92,3 +92,12 @@ npm run deploy                        # 发布到 https://ba.llmat.dev
 ```bash
 npx wrangler r2 bucket lifecycle add ba-files abort-stale-uploads --abort-multipart-days 7
 ```
+
+## AI 报告
+
+Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton review` 写的统计摘要和提示词，只有数字和文字，没有视频和图片）。网站（Worker）用自己的 `ANTHROPIC_API_KEY` 调 Anthropic API：
+
+- `POST /api/v1/videos/{id}/review`：生成报告，存成结果 `review.md`。节点上传完会自动调一次，结果页也有「生成 / 重新生成」按钮。
+- `POST /api/v1/videos/{id}/review/ask`，请求体 `{"question": "…"}`：追问，带上摘要、报告和之前的问答，回答追加到 `review.qa.md`。
+
+key 放在仓库的 Actions secret `ANTHROPIC_API_KEY` 里，部署时写进 Worker；没有这个 secret 时网站照常工作，只是不出报告（处理步骤里「AI 报告」显示跳过）。报告在网页上只按标题、列表、引用、粗体、行内代码渲染，里面的 HTML 不会被执行。
