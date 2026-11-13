@@ -85,3 +85,51 @@ def test_far_roi_is_the_far_part_of_the_court():
     assert x0 < far_net[0] < x1 and y0 < far_net[1] < y1
     # with a long lens the shuttle is large everywhere: nothing to tile
     assert far_roi(calib, (w, h), min_px=0.2) is None
+
+
+def test_still_stretches_of_the_path_are_dropped():
+    """A rally, then the path sits on a shuttle lying on the next court's floor (jitters by a pixel
+    or two, one frame missing), then creeps slowly, then another rally."""
+    from badminton.shuttle_path import drop_still_runs
+
+    p = np.zeros((80, 3))
+    for f in range(0, 20):                       # flying: 30 px a frame
+        p[f] = (1, 100 + 30 * f, 500 - 10 * f)
+    for f in range(20, 40):                      # lying still
+        if f != 27:
+            p[f] = (1, 772 + f % 2, 1024 - f % 3)
+    for f in range(40, 52):                      # creeping 2.5 px a frame: no block of 8 leaves a 19 px box
+        p[f] = (1, 774 + 2.5 * (f - 40), 1024)
+    for f in range(52, 58):                      # six slow frames at the top of a clear are kept
+        p[f] = (1, 1500 + 2 * (f - 52), 300)
+    for f in range(58, 80):
+        p[f] = (1, 1510 + 25 * (f - 58), 300 + 12 * (f - 58))
+    q = drop_still_runs(p, 19.0)
+    assert q[:20, 0].all() and not q[20:52, 0].any() and q[52:, 0].all()
+    np.testing.assert_array_equal(q[:20], p[:20])
+    # consecutive blocks only: the creeping part leaves a short tail behind
+    blocks = drop_still_runs(p, 19.0, overlap=False)
+    assert not blocks[20:40, 0].any() and 0 < blocks[40:52, 0].sum() < 12
+    assert drop_still_runs(p, 19.0, min_frames=40)[:, 0].sum() == p[:, 0].sum()   # nothing that long
+
+
+def test_still_stretch_above_the_horizon_is_kept(camera):
+    """The top of a clear flying along the camera axis hardly moves in the image, but it is above the
+    horizon; a shuttle lying on the next court's floor is below it."""
+    from badminton.court import MARKERS, CourtCalibration
+    from badminton.shuttle_path import drop_still_runs, floor_test
+
+    names = ["near_left_corner", "near_right_corner", "far_left_corner", "far_right_corner",
+             "near_short_service_left", "far_short_service_right"]
+    calib = CourtCalibration({n: tuple(p) for n, p in zip(names, camera.project(np.array([MARKERS[n] for n in names])))},
+                             camera.size)
+    on_floor = floor_test(calib)
+    lying = camera.project([[-4.5, 3.0, 0.0]])[0]      # 4.5 m left of the court, on the floor
+    apex = camera.project([[3.0, 8.0, 6.5]])[0]        # 6.5 m up over the far court, above the 3 m camera
+    assert on_floor(lying) and not on_floor(apex)
+    assert not on_floor(camera.project([[3.0, 200.0, 0.0]])[0])   # the far wall's foot is not "this floor"
+    p = np.zeros((30, 3))
+    p[:12] = (1, *lying)
+    p[15:] = (1, *apex)
+    q = drop_still_runs(p, 5.0, on_floor=on_floor)
+    assert not q[:12, 0].any() and q[15:, 0].all()

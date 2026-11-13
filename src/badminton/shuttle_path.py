@@ -20,7 +20,10 @@ So instead:
      (dynamic programming on a DAG). A candidate earns its heatmap score;
      linking two candidates g frames apart costs a speed penalty (fast is
      fine, teleporting is not) plus a per-missing-frame cost. Frames the path
-     skips have no shuttle.
+     skips have no shuttle;
+  4. still runs (with a calibration): stretches of that path that stay within a few pixels for
+     8 frames or more, at a pixel that can be on the floor, are dropped (a shuttle lying on a
+     neighbouring court, a shoe). Still stretches above the horizon are kept: the top of a lob.
 """
 
 from __future__ import annotations
@@ -38,6 +41,10 @@ SPEED_SCALE = 60.0
 GAP_COST = 0.15
 REWARD_OFFSET = 0.25  # a candidate is worth (score - offset)
 AIR_HEIGHT_M = 9.0
+STILL_EXTENT = 0.005  # of the frame width: a stretch of the path that stays within this is not a flying shuttle
+STILL_SECONDS = 0.13  # ... for at least this long (and at least STILL_FRAMES processed frames)
+STILL_FRAMES = 8
+GROUND_MAX_M = 50.0   # a still spot is "on the floor" if its pixel, read as a floor point, is this close to the camera
 
 
 def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, frac: float = STATIC_FRAC) -> np.ndarray:
@@ -174,6 +181,62 @@ def choose_path(candidates: list, scale: tuple[float, float], static: np.ndarray
     return out
 
 
+def drop_still_runs(path: np.ndarray, extent_px: float, min_frames: int = STILL_FRAMES, max_gap: int = MAX_GAP,
+                    overlap: bool = True, on_floor=None) -> np.ndarray:
+    """Remove stretches of the chosen path that do not move: `min_frames` or more points in a row
+    (gaps of up to `max_gap` frames allowed) that all fit in a box of `extent_px`.
+
+    The static map only catches spots that light up in a large share of the whole video. A shuttle
+    lying on the floor of the next court, a white shoe or a shuttle held before a serve is picked
+    up for a second or so and scores as high as a real one (first phone doubles clip: 42 frames on
+    a shuttle lying 4.5 m outside the court, cell seen in 1.4 % of frames). What tells them apart
+    is that a shuttle in flight does not stay within a few pixels for 8 frames.
+
+    overlap: also join stretches that drift slowly (every window of `min_frames` points is tested,
+    not consecutive blocks), so a spot that creeps is removed whole instead of leaving its ends.
+
+    on_floor(xy) -> bool: if given, a still stretch is only dropped when its pixel can be a point on
+    the floor. A lob or clear flying along the camera axis barely moves in the image near its top
+    (same clip: frames 176-194 and 219-233), but there it is above the horizon, where nothing lying
+    on a floor can be. A shuttle below the camera flying straight at it can still be lost."""
+    out = path.copy()
+    seen = np.flatnonzero(path[:, 0] > 0)
+    drop = np.zeros(len(seen), bool)
+    i = 0
+    while i < len(seen):
+        lo = hi = path[seen[i], 1:3]
+        j = i
+        while j + 1 < len(seen) and seen[j + 1] - seen[j] <= max_gap + 1:
+            p = path[seen[j + 1], 1:3]
+            nlo, nhi = np.minimum(lo, p), np.maximum(hi, p)
+            if (nhi - nlo).max() >= extent_px:
+                break
+            lo, hi, j = nlo, nhi, j + 1
+        if j - i + 1 >= min_frames and (on_floor is None or on_floor((lo + hi) / 2)):
+            drop[i:j + 1] = True
+            i = i + 1 if overlap else j + 1
+        else:
+            i += 1
+    out[seen[drop]] = 0
+    return out
+
+
+def floor_test(calib, max_m: float = GROUND_MAX_M):
+    """on_floor(xy) for drop_still_runs: True where the pixel, taken as a point on the floor, lies in front of
+    the camera and within `max_m` of it. Pixels above the horizon map behind the camera or very far away."""
+    from .camera import camera_from_calibration
+
+    cam = camera_from_calibration(calib)
+    eye = np.asarray(cam.center, float)
+
+    def on_floor(xy) -> bool:
+        g = np.asarray(calib.to_court(np.asarray([xy], float)), float)[0]
+        p = np.array([[g[0], g[1], 0.0]])
+        return bool(np.isfinite(g).all() and cam.depth(p)[0] > 0 and np.hypot(*(g - eye[:2])) <= max_m)
+
+    return on_floor
+
+
 def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
     """Linear interpolation over gaps of up to `max_gap` frames inside the chosen path."""
     out = path.copy()
@@ -203,6 +266,10 @@ def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=No
     static = static_map(candidates)
     mask = airspace_mask(calib) if calib is not None else None
     chosen = choose_path(candidates, (w / 512, h / 288), static, mask, speed_unit=speed_unit(w, fps, frame_step))
+    if calib is not None:  # without the camera a still shuttle in the air cannot be told from one on the floor
+        rate = (round(fps) if fps else 30.0) / frame_step
+        chosen = drop_still_runs(chosen, STILL_EXTENT * w, max(STILL_FRAMES, round(STILL_SECONDS * rate)),
+                                 on_floor=floor_test(calib))
     path = fill_short_gaps(chosen)
     if frame_step > 1:
         from .shuttle import expand_rows
