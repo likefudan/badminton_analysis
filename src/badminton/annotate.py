@@ -225,13 +225,15 @@ def predict(video: str | Path, court: str | Path | None = None, tracknet_dir=Non
 
     info = probe(video)
     debug: dict = {}
-    rows, _ = track_shuttle(video, tracknet_dir, progress=progress, debug=debug)
+    rows, tm = track_shuttle(video, tracknet_dir, progress=progress, debug=debug)
     calib = None
     if court:
         from .court import CourtCalibration
 
         calib = CourtCalibration.load(court)
-    path_rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib)
+    # the same path selection as `badminton shuttle` (gravity check on flights included)
+    path_rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib,
+                                     measured=list(getattr(tm, "measured", []) or []) or None, fps=info.fps, n_frames=len(rows))
     n = len(rows)
     sx, sy = info.width / WIDTH, info.height / HEIGHT
     cands = [np.column_stack([c[:, 0] * sx, c[:, 1] * sy, c[:, 2]]) if len(c) else np.zeros((0, 3))

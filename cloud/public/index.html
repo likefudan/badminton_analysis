@@ -116,6 +116,23 @@
   .field { margin: 10px 0; } .field label { display: block; color: var(--quiet); font-size: 13px; margin-bottom: 4px; }
   #prices input { padding: 6px; text-align: right; } #prices td, #prices th { padding: 4px; }
   .danger { color: var(--bad) !important; }
+  /* ---------- 标注 ---------- */
+  main.wide { max-width: 1400px; }
+  #lPic { position: relative; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #lCanvas { display: block; width: 100%; border-radius: 8px; background: #000; touch-action: none; }
+  #lLoupe { position: absolute; top: 6px; border: 2px solid #fff; border-radius: 8px; box-shadow: 0 1px 6px rgba(0,0,0,.5); pointer-events: none; }
+  #lWhat { min-height: 1.5em; margin: 4px 0 8px; }
+  #lWhere { margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+  .lbtns { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
+  .lbtns button { padding: 14px 6px; }
+  #lBulk { margin-top: 8px; }
+  #lSave { font-size: 12px; white-space: nowrap; }
+  #lAcc table td:nth-child(2) { font-weight: 600; white-space: nowrap; }
+  #lAcc table td:nth-child(3) { text-align: left; font-size: 12px; }
+  #tAnnot code { font-size: 13px; }
+  @media (orientation: landscape) and (min-width: 600px) {
+    #lStage { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+  }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -196,11 +213,20 @@
         <p class="quiet" id="dMeta"></p>
         <p id="dStatus"></p>
         <div class="tabs" id="tabs">
-          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process">处理</button>
+          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="annot">标注</button><button data-tab="process">处理</button>
         </div>
         <div id="tOverview"><div id="dStats"></div><div id="dReview"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
         <div id="tVideos" hidden></div>
         <div id="tCards" hidden></div>
+        <div id="tAnnot" hidden>
+          <p class="quiet">在手机上一帧一帧确认羽毛球的位置：模型猜对了点「对」，猜错了点画面上真正的球。标好的帧用来检验球追踪准不准，也能用来微调模型（Mac 上 <code>badminton annotate-export</code>）。</p>
+          <p id="aState"></p>
+          <p id="aError" class="bad" hidden></p>
+          <div id="aCounts" class="quiet"></div>
+          <a class="pick" id="aOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注</a>
+          <div class="row"><button id="aPrepare" hidden>准备标注</button></div>
+          <div class="row"><button class="plain" id="aFresh" hidden>用新模型重新预测</button><button class="plain" id="aClear" hidden>删除图片</button></div>
+        </div>
         <div id="tProcess" hidden>
           <p id="dError" class="bad" hidden></p>
           <div id="dProgress"></div>
@@ -211,6 +237,35 @@
           <div class="row"><button class="plain danger" id="dDelete">删除这段录像</button></div>
         </div>
       </section>
+    </div>
+
+    <!-- 标注球的位置 -->
+    <div class="view" id="vLabel" hidden>
+      <div class="top"><a id="lBack">‹ 返回</a><h1>标注球的位置</h1><span id="lSave" class="quiet"></span></div>
+      <p class="quiet" id="lMsg"></p>
+      <div id="lStage" hidden>
+        <div id="lPic"><canvas id="lCanvas"></canvas><canvas id="lLoupe" hidden></canvas></div>
+        <div id="lSide">
+          <p class="quiet" id="lWhere"></p>
+          <p id="lWhat"></p>
+          <div class="lbtns">
+            <button id="lPrev" class="plain">‹ 上一帧</button>
+            <button id="lOk">对</button>
+            <button id="lNext" class="plain">下一帧 ›</button>
+            <button id="lNone" class="plain">没有球</button>
+            <button id="lSkip" class="plain">看不清</button>
+            <button id="lClear" class="plain" hidden>清除</button>
+          </div>
+          <button id="lBulk" class="plain" hidden></button>
+          <div class="chips" id="lRallies"></div>
+          <h2 style="margin-top:14px">模型准不准</h2>
+          <div id="lAcc" class="quiet"></div>
+          <details class="quiet" style="margin-top:10px"><summary>怎么标</summary>
+            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去），再用手指在画面上拖动微调，左上或右上角的放大镜里看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。</p>
+            <p>「一键接受」把这回合里模型很有把握、你还没看过的帧直接按预测记下来（和电脑版一样记成“批量接受”），不算进上面的准确率。横过来拿手机画面更大。</p>
+          </details>
+        </div>
+      </div>
     </div>
 
     <!-- 设置 -->
@@ -239,6 +294,7 @@
     </div>
   </div>
 </main>
+<script src="label.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

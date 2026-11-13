@@ -31,6 +31,10 @@
 | `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
 | `PUT /videos/{id}/results/{name}` | 传一个结果文件；大文件用 `.../multipart` 分片传 |
 | `GET /videos/{id}/results/{name}` | 读结果，支持 Range |
+| `POST /videos/{id}/annot`、`DELETE /videos/{id}/annot` | 请 Mac 准备手机标注用的图片（`{"fresh": true}` 用新模型重新预测）；删掉图片（标注保留） |
+| `POST /videos/{id}/annot/job` | 节点汇报准备进度，或以 `ready` / `failed` 结束 |
+| `PUT/GET /videos/{id}/annot/files/{name}` | 标注用的图片包和 `state.json`（大文件用 `.../multipart`），读的时候支持 Range |
+| `GET/PUT /videos/{id}/labels`、`POST /videos/{id}/labels/synced` | 读、存标注（`{items: [{frame, visibility, x, y, status}]}`，status 是 human / bulk / skip）；节点同步完后记一笔 |
 
 ## Mac 上的处理节点
 
@@ -49,6 +53,12 @@ badminton node --once     # 处理完排队中的就退出
 网页上能看到每一步的状态、用时和预计剩余时间。预计时间来自这台 Mac 之前处理的记录（`~/badminton_uploads/timings.json`，按录像时长折算），第一次处理时只有下载和骨架识别这两步有预计。网页还显示 Mac 是否在线（节点最后一次联系的时间）和排队位置。
 
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
+
+## 手机上标注球的位置
+
+录像页的「标注」里点「准备标注」：节点领到 `annotate` 任务（只有没有录像要分析时才领），运行 `badminton annotate-pack`，挑模型最没把握的 3 个回合（优先 20 秒以内的，最多 3600 帧），每个回合的帧切成 1280 宽的 JPEG 拼成一个文件，`state.json` 记每帧在文件里的位置和模型的预测，传到 R2 的 `annot/` 下（不算在 10 GB 结果里）。网页（`public/label.js`，`#/label/<编号>`）一次用 Range 取 8 帧。
+每标一帧存进 D1 的 `labels` 表；停手一分钟后节点领到 `labels` 任务，写回录像旁边的 `<视频名>.labels.csv`（网页回合里的帧以网站为准，其它帧保留 Mac 上原来的标注），之后 `badminton annotate-export` 照常用。
+再次准备时沿用同样的回合，所以微调后点「用新模型重新预测」，标注页上的准确率就是同一批帧上微调前后的对比。
 
 ## 本地运行
 

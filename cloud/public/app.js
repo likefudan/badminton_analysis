@@ -485,6 +485,7 @@ function statusText(v) {
   return "已上传";
 }
 const busy = (v) => v.status === "uploaded" && v.job && (v.job.status === "queued" || v.job.status === "processing");
+const annotBusy = (v) => v.annot && (v.annot.status === "queued" || v.annot.status === "preparing");
 
 
 // 卡片右下角的小标签：一眼看出这段录像到哪一步了
@@ -583,7 +584,7 @@ async function refreshList() {
   renderList();
   if (openId) renderDetail();
   clearTimeout(pollTimer);
-  if (videos.some(busy) || (run && !run.finished)) pollTimer = setTimeout(refreshList, 3000);
+  if (videos.some(busy) || videos.some(annotBusy) || (run && !run.finished)) pollTimer = setTimeout(refreshList, 3000);
 }
 
 function renderNodeLine() {
@@ -673,10 +674,16 @@ setInterval(() => {
 function route() {
   const h = location.hash || "#/";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
-  const name = m ? "vDetail" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
+  const lm = h.match(/^#\/label\/([0-9a-f-]{36})$/);
+  const name = m ? "vDetail" : lm ? "vLabel" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
+  document.querySelector("main").classList.toggle("wide", Boolean(lm));
   if (m) openDetail(m[1]);
   else closeDetail();
+  if (lm) {
+    $("lBack").href = "#/v/" + lm[1];
+    Label.open(lm[1]);
+  }
   if (name === "vUpload" && !$("upDone").hidden) {
     // 上一段已经传完：回到空白的上传页，方便接着传下一段
     file = null;
@@ -710,7 +717,7 @@ function closeDetail() {
   for (const pane of ["tVideos", "tCards"]) $(pane).textContent = ""; // 停掉正在放的视频
 }
 
-const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", process: "tProcess" };
+const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", annot: "tAnnot", process: "tProcess" };
 function setTab(name) {
   tab = name;
   for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
@@ -755,6 +762,7 @@ async function renderDetail() {
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   renderReview(v);
+  renderAnnot(v);
   const key = v.id + "|" + v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
   shownKey = key;
@@ -1099,6 +1107,61 @@ $("aiSave").onclick = () => {
   $("aiSave").textContent = "已保存";
   setTimeout(() => { $("aiSave").textContent = "保存设置"; }, 1500);
   saveAi({ prices }, "单价已保存");
+};
+
+// ---------- 标注球的位置（标注页本身在 label.js） ----------
+
+function renderAnnot(v) {
+  const a = v.annot || { status: "none", labels: {} };
+  const c = a.labels || {};
+  const n = (c.human || 0) + (c.bulk || 0) + (c.skip || 0);
+  const ready = v.status === "uploaded" && v.job && ["done", "failed", "archived"].includes(v.job.status);
+  const st = $("aState");
+  st.className = a.status === "failed" ? "bad" : "quiet";
+  st.textContent = {
+    none: ready ? "点「准备标注」：家里的 Mac 会挑出模型最没把握的 3 个回合，切成图片传上来，一般几分钟。" : "这段录像分析完之后才能标注。",
+    queued: nodeOnline() ? "排队中，Mac 马上开始准备" : "排队中。家里的 Mac 现在离线，上线后开始准备",
+    preparing: "Mac 正在准备：" + (a.stage || "开始"),
+    ready: "图片准备好了" + (a.stage ? "：" + a.stage : "") + "。",
+    failed: "准备失败",
+  }[a.status] || "";
+  $("aError").hidden = !(a.status === "failed" && a.error);
+  $("aError").textContent = a.status === "failed" ? a.error || "" : "";
+  const synced = a.labelsChangedAt && a.labelsSyncedAt && a.labelsSyncedAt >= a.labelsChangedAt;
+  $("aCounts").textContent = n
+    ? `已标 ${n} 帧：亲手确认 ${c.human || 0}，一键接受 ${c.bulk || 0}，看不清 ${c.skip || 0}。` +
+      (synced ? "已同步到 Mac 上的 .labels.csv。" : "停手一分钟后会同步到 Mac 上的 .labels.csv。")
+    : "";
+  $("aOpen").hidden = a.status !== "ready";
+  $("aOpen").href = "#/label/" + v.id;
+  $("aOpen").textContent = n ? "接着标注" : "开始标注";
+  $("aPrepare").hidden = !(ready && (a.status === "none" || a.status === "failed"));
+  $("aPrepare").textContent = a.status === "failed" ? "重新准备" : "准备标注";
+  $("aFresh").hidden = !(ready && a.status === "ready");
+  $("aClear").hidden = !(a.status === "ready" || a.status === "failed");
+  $("aClear").textContent = "删除图片";
+  delete $("aClear").dataset.armed;
+}
+
+async function annotAction(path, method, body, done) {
+  try {
+    await api(`/videos/${openId}${path}`, { method, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    log(done);
+  } catch (e) {
+    log("标注：" + e.message);
+    $("aError").hidden = false;
+    $("aError").textContent = e.message;
+    return;
+  }
+  refreshList();
+}
+$("aPrepare").onclick = () => annotAction("/annot", "POST", {}, "已请 Mac 准备标注材料");
+// 微调换了权重后：同样这些回合，用新模型重新预测（标注保留），在标注页对比准确率
+$("aFresh").onclick = () => annotAction("/annot", "POST", { fresh: true }, "已请 Mac 用新模型重新预测");
+$("aClear").onclick = () => {
+  const btn = $("aClear");
+  if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次：删除图片（标注保留）"; return; }
+  annotAction("/annot", "DELETE", null, "标注用的图片已删除，标注保留");
 };
 
 // ---------- 处理：重新处理、改单打双打、删除 ----------
