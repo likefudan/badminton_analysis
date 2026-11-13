@@ -516,8 +516,9 @@ async function renderDetail() {
   st.className = v.job && v.job.status === "failed" ? "bad" : v.job && v.job.status === "done" ? "ok" : "quiet";
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
-  $("dRetry").hidden = !(v.status === "uploaded" && v.job && (v.job.status === "failed" || v.job.status === "done"));
-  $("dMode").hidden = $("dRetry").hidden;
+  $("dRetry").hidden = !(v.status === "uploaded" && v.job && ["failed", "done", "archived"].includes(v.job.status));
+  // 处理中不能改（Mac 正在跑）；排队中、完成、失败、已清理都可以改
+  $("dMode").hidden = !(v.status === "uploaded" && v.job && v.job.status !== "processing");
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   const key = v.results.map((r) => r.name + ":" + r.size).join("|");
