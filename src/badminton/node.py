@@ -421,6 +421,18 @@ def web_video(src: Path, dst: Path) -> Path:
     return dst if done.returncode == 0 and dst.exists() and dst.stat().st_size else src
 
 
+def cover_image(video: Path, dst: Path, seconds: float) -> Path | None:
+    """A small picture of the recording for the list on the web page."""
+    if dst.exists():
+        return dst
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    done = subprocess.run([ffmpeg, "-y", "-v", "error", "-ss", f"{max(0.0, seconds):.2f}", "-i", str(video), "-frames:v", "1",
+                           "-vf", "scale=640:-2", "-q:v", "5", str(dst)], stdin=subprocess.DEVNULL)
+    return dst if done.returncode == 0 and dst.exists() else None
+
+
 def web_image(src: Path, dst: Path) -> Path:
     """A 4K frame saved as PNG is 8-9 MB; the phone gets a 1920-wide JPEG instead. Cards stay as they are."""
     if src.stat().st_size <= WEB_IMAGE_BYTES or not shutil.which("ffmpeg"):
@@ -718,6 +730,10 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
                 name = name[:-4] + f.suffix.lower()
             print(f"  上传 {name}（{f.stat().st_size / 1e6:.1f} MB）")
             api.upload_result(vid, f, name)
+        cover = cover_image(local.with_name(local.stem + "_sdr.mp4") if local.with_name(local.stem + "_sdr.mp4").exists() else local,
+                            web_dir / "cover.jpg", (progress.video_seconds or 0) * 0.1)
+        if cover:
+            api.upload_result(vid, cover, "cover.jpg")
         progress.done("upload", f"{len(files)} 个文件")
         ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
         stop.set()

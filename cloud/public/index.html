@@ -77,14 +77,52 @@
   .steps li.done .ico { color: var(--good); } .steps li.failed .ico, .steps li.failed .lab { color: var(--bad); }
   @keyframes pulse { 50% { opacity: .3; } }
   @media (prefers-reduced-motion: reduce) { .steps li.running .ico { animation: none; } }
+
+  /* ---------- 页面框架 ---------- */
+  .top { display: flex; align-items: center; gap: 8px; margin: 2px 0 12px; min-height: 40px; }
+  .top h1 { flex: 1; margin: 0; font-size: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top a, .top button.icon { flex: none; width: auto; padding: 8px 10px; background: none; border: 0; color: var(--accent); font-size: 15px; font-weight: 400; cursor: pointer; text-decoration: none; }
+  .view[hidden] { display: none; }
+  .chips { display: flex; gap: 6px; margin: 12px 0; overflow-x: auto; }
+  .chips button { width: auto; flex: none; padding: 6px 12px; border-radius: 16px; font-size: 14px; font-weight: 400; background: var(--card); color: var(--ink); border: 1px solid var(--line); }
+  .chips button.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .chips button .n { opacity: .6; margin-left: 4px; font-variant-numeric: tabular-nums; }
+  #list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .vcard { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; cursor: pointer; display: flex; align-items: stretch; }
+  .vcard .cover { position: relative; flex: 0 0 42%; max-width: 220px; aspect-ratio: 16 / 9; align-self: flex-start; background: #20201e center / cover no-repeat; }
+  .vcard .cover .ph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #8a8a84; font-size: 13px; }
+  .vcard .cover .len { position: absolute; right: 6px; bottom: 6px; padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,.65); color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .vcard .cover .pbar { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(255,255,255,.25); }
+  .vcard .cover .pbar > div { height: 100%; background: var(--accent); }
+  .vcard .body { padding: 8px 12px; flex: 1; min-width: 0; }
+  .vcard .name { font-weight: 600; overflow-wrap: anywhere; }
+  .vcard .sub { color: var(--quiet); font-size: 13px; margin-top: 2px; }
+  .badge { display: inline-block; margin-top: 6px; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); color: var(--quiet); }
+  .badge.done { color: var(--good); border-color: var(--good); } .badge.failed { color: var(--bad); border-color: var(--bad); }
+  .badge.busy { color: var(--accent); border-color: var(--accent); } .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .empty { text-align: center; color: var(--quiet); padding: 28px 12px; }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); margin: 4px 0 12px; }
+  .tabs button { flex: 1; width: auto; padding: 10px 4px; background: none; color: var(--quiet); border: 0; border-bottom: 2px solid transparent; border-radius: 0; font-weight: 400; }
+  .tabs button.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+  .kpis div { background: var(--bg); border-radius: 10px; padding: 8px 10px; }
+  .kpis b { display: block; font-size: 16px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .kpis span { color: var(--quiet); font-size: 12px; }
+  #dTitleRow { display: flex; align-items: baseline; gap: 8px; }
+  #dTitleRow h2 { flex: 1; font-size: 18px; margin: 0; overflow-wrap: anywhere; }
+  #dTitleRow a { color: var(--accent); font-size: 14px; cursor: pointer; white-space: nowrap; }
+  input[type=text], input[type=number], select, #dReview textarea { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font: inherit; }
+  .usage { color: var(--quiet); font-size: 12px; margin: -4px 0 10px; font-variant-numeric: tabular-nums; }
+  .field { margin: 10px 0; } .field label { display: block; color: var(--quiet); font-size: 13px; margin-bottom: 4px; }
+  #prices input { padding: 6px; text-align: right; } #prices td, #prices th { padding: 4px; }
+  .danger { color: var(--bad) !important; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
-  <h1>羽毛球分析</h1>
-
   <section class="card" id="login" hidden>
+    <h1 style="margin-top:0">羽毛球分析</h1>
     <h2>输入口令</h2>
     <input type="password" id="token" autocomplete="current-password" placeholder="口令">
     <button id="loginBtn">进入</button>
@@ -92,75 +130,113 @@
   </section>
 
   <div id="app" hidden>
-    <section class="card">
-      <label class="pick" for="file">选择录像</label>
-      <input type="file" id="file" accept="video/*">
-      <p class="quiet">从相册选的时候，如果出现“选项”，请选“当前格式”或“原始”，不要选“最兼容”。也可以从“文件”App 里选。上传期间请停在这个页面，插上电源。</p>
-    </section>
+    <!-- 首页：我的录像 -->
+    <div class="view" id="vHome">
+      <div class="top"><h1>我的录像</h1><a href="#/settings">设置</a></div>
+      <a class="pick" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
+      <div class="chips" id="filters"></div>
+      <div id="list"><div class="empty">读取中</div></div>
+      <p class="quiet" id="nodeLine" style="margin-top:14px"></p>
+    </div>
 
-    <section class="card" id="info" hidden>
-      <h2>这个文件</h2>
-      <dl>
-        <dt>文件名</dt><dd id="iName"></dd>
-        <dt>大小</dt><dd id="iSize"></dd>
-        <dt>分辨率</dt><dd id="iRes"></dd>
-        <dt>帧率（估计）</dt><dd id="iFps"></dd>
-        <dt>时长</dt><dd id="iDur"></dd>
-        <dt>每分钟大小</dt><dd id="iRate"></dd>
-      </dl>
-      <p id="verdict"></p>
-      <div class="seg" id="mode">
-        <label><input type="radio" name="mode" value="singles" checked><span>单打</span></label>
-        <label><input type="radio" name="mode" value="doubles"><span>双打</span></label>
-      </div>
-      <div class="row">
-        <button id="startBtn">开始上传</button>
-        <button id="pauseBtn" class="plain" hidden>暂停</button>
-      </div>
-    </section>
+    <!-- 上传 -->
+    <div class="view" id="vUpload" hidden>
+      <div class="top"><a href="#/">‹ 返回</a><h1>上传录像</h1></div>
+      <section class="card">
+        <label class="pick" for="file">选择录像</label>
+        <input type="file" id="file" accept="video/*">
+        <p class="quiet">从相册选的时候，如果出现“选项”，请选“当前格式”或“原始”，不要选“最兼容”。也可以从“文件”App 里选。上传期间请停在这个页面，插上电源。传完后由家里的 Mac 自动处理。</p>
+      </section>
 
-    <section class="card" id="progress" hidden>
-      <h2 id="pTitle">上传中</h2>
-      <div class="bar"><div id="pBar"></div></div>
-      <dl>
-        <dt>已上传</dt><dd id="pBytes"></dd>
-        <dt>当前速度</dt><dd id="pSpeed"></dd>
-        <dt>平均速度</dt><dd id="pAvg"></dd>
-        <dt>预计剩余</dt><dd id="pEta"></dd>
-        <dt>已用时间</dt><dd id="pElapsed"></dd>
-        <dt>重试次数</dt><dd id="pRetries">0</dd>
-        <dt>页面进入后台</dt><dd id="pHidden">0 次</dd>
-        <dt>保持亮屏</dt><dd id="pWake">未申请</dd>
-      </dl>
-    </section>
+      <section class="card" id="info" hidden>
+        <h2>这个文件</h2>
+        <dl>
+          <dt>文件名</dt><dd id="iName"></dd>
+          <dt>大小</dt><dd id="iSize"></dd>
+          <dt>分辨率</dt><dd id="iRes"></dd>
+          <dt>帧率（估计）</dt><dd id="iFps"></dd>
+          <dt>时长</dt><dd id="iDur"></dd>
+          <dt>每分钟大小</dt><dd id="iRate"></dd>
+        </dl>
+        <p id="verdict"></p>
+        <div class="field"><label for="upTitle">标题（可以不填，之后也能改）</label><input type="text" id="upTitle" maxlength="80" placeholder="例如：周六双打第 2 局"></div>
+        <div class="seg" id="mode">
+          <label><input type="radio" name="mode" value="singles" checked><span>单打</span></label>
+          <label><input type="radio" name="mode" value="doubles"><span>双打</span></label>
+        </div>
+        <div class="row">
+          <button id="startBtn">开始上传</button>
+          <button id="pauseBtn" class="plain" hidden>暂停</button>
+        </div>
+      </section>
 
-    <section class="card" id="listCard">
-      <h2>我的录像</h2>
-      <ul id="list"><li class="quiet">读取中</li></ul>
-      <p class="quiet" id="nodeLine"></p>
-      <p class="quiet">传完后由家里的 Mac 自动处理，处理完点开就能看结果。</p>
-    </section>
+      <section class="card" id="progress" hidden>
+        <h2 id="pTitle">上传中</h2>
+        <div class="bar"><div id="pBar"></div></div>
+        <dl>
+          <dt>已上传</dt><dd id="pBytes"></dd>
+          <dt>当前速度</dt><dd id="pSpeed"></dd>
+          <dt>平均速度</dt><dd id="pAvg"></dd>
+          <dt>预计剩余</dt><dd id="pEta"></dd>
+          <dt>已用时间</dt><dd id="pElapsed"></dd>
+          <dt>重试次数</dt><dd id="pRetries">0</dd>
+          <dt>页面进入后台</dt><dd id="pHidden">0 次</dd>
+          <dt>保持亮屏</dt><dd id="pWake">未申请</dd>
+        </dl>
+        <a class="pick" id="upDone" href="#/" style="text-decoration:none;margin-top:12px" hidden>回到我的录像</a>
+      </section>
+    </div>
 
-    <section class="card" id="detail" hidden>
-      <a class="back" id="dBack">‹ 返回列表</a>
-      <h2 id="dTitle" style="margin-top:8px"></h2>
-      <p id="dStatus"></p>
-      <p id="dError" class="bad" hidden></p>
-      <div id="dProgress"></div>
-      <div id="dReview"></div>
-      <div id="dBody"></div>
-      <div class="row">
-        <button class="plain" id="dRetry" hidden>重新处理</button>
-        <button class="plain" id="dMode" hidden>改成双打重跑</button>
-        <button class="plain" id="dDelete">删除这局</button>
-      </div>
-    </section>
+    <!-- 一段录像的结果 -->
+    <div class="view" id="vDetail" hidden>
+      <div class="top"><a href="#/">‹ 我的录像</a><h1></h1></div>
+      <section class="card" id="detail">
+        <div id="dTitleRow"><h2 id="dTitle"></h2><a id="dRename">改标题</a></div>
+        <div id="dRenameBox" class="row" hidden><input type="text" id="dTitleInput" maxlength="80"><button id="dTitleSave" style="flex:none;width:auto;padding:10px 16px">保存</button></div>
+        <p class="quiet" id="dMeta"></p>
+        <p id="dStatus"></p>
+        <div class="tabs" id="tabs">
+          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process">处理</button>
+        </div>
+        <div id="tOverview"><div id="dStats"></div><div id="dReview"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
+        <div id="tVideos" hidden></div>
+        <div id="tCards" hidden></div>
+        <div id="tProcess" hidden>
+          <p id="dError" class="bad" hidden></p>
+          <div id="dProgress"></div>
+          <div class="row">
+            <button class="plain" id="dRetry" hidden>重新处理</button>
+            <button class="plain" id="dMode" hidden>改成双打重跑</button>
+          </div>
+          <div class="row"><button class="plain danger" id="dDelete">删除这段录像</button></div>
+        </div>
+      </section>
+    </div>
 
-    <section class="card">
-      <h2>记录</h2>
-      <pre id="log"></pre>
-      <div class="row"><button class="plain" id="copyLog">复制记录</button><button class="plain" id="logout">退出登录</button></div>
-    </section>
+    <!-- 设置 -->
+    <div class="view" id="vSettings" hidden>
+      <div class="top"><a href="#/">‹ 返回</a><h1>设置</h1></div>
+      <section class="card">
+        <h2>AI 报告</h2>
+        <p class="quiet" id="aiState"></p>
+        <div class="field"><label for="aiDefault">默认模型（处理完自动出报告时用它）</label><select id="aiDefault"></select></div>
+        <h2 style="margin-top:16px">累计用量</h2>
+        <div id="aiUsage" class="quiet">读取中</div>
+        <h2 style="margin-top:16px">单价（美元 / 100 万 token）</h2>
+        <table id="prices"></table>
+        <p class="quiet">价格是估算：token 数是模型接口返回的真实数字，单价默认是查到的公开价，你在 Azure 的实际账单可能不同。可以改成你账单上的单价，改完点保存；之后的调用按新单价算。</p>
+        <button class="plain" id="aiSave">保存设置</button>
+      </section>
+      <section class="card">
+        <h2>家里的 Mac</h2>
+        <p class="quiet" id="nodeLine2"></p>
+      </section>
+      <section class="card">
+        <h2>诊断记录</h2>
+        <pre id="log"></pre>
+        <div class="row"><button class="plain" id="copyLog">复制记录</button><button class="plain" id="logout">退出登录</button></div>
+      </section>
+    </div>
   </div>
 </main>
 <script src="app.js"></script>

@@ -23,6 +23,7 @@
 | `POST /videos/{id}/complete` | 合并，核对总大小 |
 | `GET /videos/{id}/file` | 下载原片，支持 Range（以后 Mac 处理节点用） |
 | `GET /videos`、`DELETE /videos/{id}` | 列表、删除（结果一起删） |
+| `PATCH /videos/{id}` | 改标题，请求体 `{"title": "…"}`（新建时也可以带 `title`） |
 | `POST /session` | 发一个只读 cookie，网页里的图片和视频靠它读取 |
 | `POST /node/claim` | 处理节点领取一个排队中的录像（节点失联 10 分钟后可被重新领取） |
 | `POST /videos/{id}/job` | 节点汇报进度（`stage` 文字加 `progress` 步骤列表：每步状态、用时、百分比、预计剩余），或以 `done` / `failed` 结束 |
@@ -44,7 +45,7 @@ badminton node            # 常驻：每 15 秒查一次有没有新录像
 badminton node --once     # 处理完排队中的就退出
 ```
 
-原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 羽毛球追踪（`badminton shuttle --court` 加 `overlay`，画在骨架视频上；失败不影响其它结果）→ 写出 AI 报告要用的统计摘要和提示词（`badminton review`，不联网）→ 结果视频转成手机能放的 1080p H.264 → 上传 → 让网站出 AI 报告。
+原片和结果放在 `~/badminton_uploads/<录像编号>/`。每一局依次做：下载原片（断了接着下）→ 通知云端删原片 → HDR 转 SDR → 自动标定球场（`calibrate --auto`，在录像的几个时刻各试一次，取线条重合度最高的）→ `badminton analyze` → 羽毛球追踪（`badminton shuttle --court` 加 `overlay`，画在骨架视频上；失败不影响其它结果）→ 写出 AI 报告要用的统计摘要和提示词（`badminton review`，不联网）→ 结果视频转成手机能放的 1080p H.264 → 上传（另外截一帧 `cover.jpg` 作为列表里的封面）→ 让网站出 AI 报告。
 网页上能看到每一步的状态、用时和预计剩余时间。预计时间来自这台 Mac 之前处理的记录（`~/badminton_uploads/timings.json`，按录像时长折算），第一次处理时只有下载和骨架识别这两步有预计。网页还显示 Mac 是否在线（节点最后一次联系的时间）和排队位置。
 
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
@@ -97,16 +98,20 @@ npx wrangler r2 bucket lifecycle add ba-files abort-stale-uploads --abort-multip
 
 Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton review` 写的统计摘要和提示词，只有数字和文字，没有视频和图片）。网站（Worker）用自己的 key 调模型：
 
-- `POST /api/v1/videos/{id}/review`：生成报告，存成结果 `review.md`。节点上传完会自动调一次，结果页也有「生成 / 重新生成」按钮。
-- `POST /api/v1/videos/{id}/review/ask`，请求体 `{"question": "…"}`：追问，带上摘要、报告和之前的问答，回答追加到 `review.qa.md`。
+- `POST /api/v1/videos/{id}/review`，请求体 `{"model": "…"}`（可以不填）：生成报告，存成结果 `review.md`。节点上传完会自动调一次（用默认模型），结果页可以换模型重新生成。
+- `POST /api/v1/videos/{id}/review/ask`，请求体 `{"question": "…", "model": "…"}`：追问，带上摘要、报告和之前的问答，回答追加到 `review.qa.md`。
+- `GET /api/v1/ai`：可选的模型和单价、默认模型、按模型汇总的累计用量。
+- `PUT /api/v1/ai/settings`，请求体 `{"defaultModel": "…", "prices": {"<模型>": {"in": 2, "out": 10}}}`：改默认模型和单价（美元 / 100 万 token）。
 
-用哪个模型由这几项决定：
+配置：
 
 | 名字 | 放在哪 | 含义 |
 |---|---|---|
-| `AI_API_KEY` | 仓库的 Actions secret，部署时写进 Worker | 模型的 API key。没有就不出报告（处理步骤里「AI 报告」显示跳过），网站其它功能照常 |
-| `AI_FORMAT` | `wrangler.toml` 的 `[vars]` | `anthropic`（默认，Messages 接口，头 `x-api-key`）或 `openai`（Chat Completions 接口，头 `api-key` 和 `Authorization: Bearer`） |
-| `AI_ENDPOINT` | `[vars]` | 默认 `https://api.anthropic.com`。可以只写到资源地址（会补上 `/v1/messages` 或 `/chat/completions`），也可以直接写完整的接口地址（比如带 `?api-version=` 的 Azure 地址） |
-| `AI_MODEL` | `[vars]` | 模型或部署名；不填就用摘要里写的（`claude-sonnet-5-5`） |
+| `AI_API_KEY` | 仓库的 Actions secret（`AI_API_KEY` 或 `AZURE_API_KEY`），部署时写进 Worker | 模型的 API key。没有就不出报告（处理步骤里「AI 报告」显示跳过），网站其它功能照常 |
+| `AI_ENDPOINT_ANTHROPIC` | `wrangler.toml` 的 `[vars]` | Claude 模型的地址（Messages 接口，头 `x-api-key`），会补上 `/v1/messages`。现在是 Azure AI Foundry 资源的 `…services.ai.azure.com/anthropic` |
+| `AI_ENDPOINT_OPENAI` | `[vars]` | GPT、Grok 等模型的地址（Chat Completions 接口，头 `api-key`），会补上 `/chat/completions`。现在是 `…openai.azure.com/openai/v1` |
+| `AI_MODELS` | `[vars]`，可选 | JSON 数组 `[{"id": "部署名", "label": "显示名", "format": "anthropic" 或 "openai", "in": 单价, "out": 单价}]`，替换 `src/index.ts` 里内置的模型列表（Azure 上部署的 8 个） |
+
+**用量和价格。** 每次调用模型，接口返回的输入、输出 token 数记在 D1 的 `ai_usage` 表里，同时按当时的单价算出估算价格。结果页显示每份报告、每次追问的用量，设置页显示累计。单价默认是公开的标价，可以在设置页改成账单上的数字（存在 `settings` 表）；没有单价的模型只记 token 数。价格只是估算，以 Azure 账单为准。
 
 报告在网页上只按标题、列表、引用、粗体、行内代码渲染，里面的 HTML 不会被执行。
