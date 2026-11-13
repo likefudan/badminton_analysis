@@ -188,7 +188,7 @@ def test_node_packs_uploads_and_syncs_labels(clip, tmp_path):
     try:
         cfg = node.Config(url=cloud.url, token="secret", work_dir=work, name="test-mac")
         assert node.run(cfg, once=True, pack_fn=pack_fn) == 0  # annotate; once stops after the labels task
-        assert set(cloud.claims[0]["tasks"]) == {"process", "annotate", "labels"}
+        assert set(cloud.claims[0]["tasks"]) == {"process", "annotate", "labels", "strokes", "stroke-labels"}
         assert seen == {"work": job / "clip.mp4", "movement": job / "analysis" / "clip.movement.json", "fresh": True}
         assert list(cloud.files)[-1] == "state.json" and {"rally-0.bin", "rally-1.bin"} <= set(cloud.files)
         state = json.loads(cloud.files["state.json"])

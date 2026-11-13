@@ -176,6 +176,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--fresh", action="store_true", help="不用缓存的预测，重新跑一遍 TrackNetV3（换了权重会自动重跑）")
     s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要）")
 
+    s = sub.add_parser("annotate-strokes", help="为手机网页上标注击球类型准备材料：每拍一段小视频（框出击球人），连同模型的判断")
+    s.add_argument("video")
+    s.add_argument("-o", "--out-dir", required=True, help="输出目录（strokes.mp4 和 strokes.state.json）")
+    s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+    s.add_argument("--analysis-dir", help="analyze 的输出目录（找 .skeleton.npz、.shuttle.csv、.players.json、.strokes.json）；默认视频所在目录")
+    s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
+
     s = sub.add_parser("review", help="第 4 步：AI 赛后点评（大模型只读程序算出的数字，不看视频）")
     s.add_argument("inputs", nargs="+", metavar="ANALYSIS_JSON", help="movement.json，可再加 positioning.json")
     s.add_argument("--ask", help="追问一个问题（沿用同一份数据和已有的点评）")
@@ -228,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
-            "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "positioning": cmd_positioning,
+            "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "annotate-strokes": cmd_annotate_strokes, "positioning": cmd_positioning,
             "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes}[a.cmd](a)
 
 
@@ -1075,6 +1082,16 @@ def cmd_annotate_pack(a) -> int:
     state = pack(video, a.out_dir, court, a.rallies, a.fresh, a.count, a.tracknet_dir, print_progress)
     frames = sum(len(r["offsets"]) for r in state["rallies"])
     print(f"准备好 {len(state['rallies'])} 个回合、{frames} 帧，放在 {a.out_dir}")
+    return 0
+
+
+def cmd_annotate_strokes(a) -> int:
+    from .pipeline import print_progress
+    from .stroke_pack import pack
+
+    state = pack(a.video, a.out_dir, a.court, a.analysis_dir, True if a.singles else None, progress=print_progress)
+    n = len(state["strokes"])
+    print(f"准备好 {n} 拍（其中 {sum(r['needs_review'] for r in state['strokes'])} 拍没把握），放在 {a.out_dir}")
     return 0
 
 
