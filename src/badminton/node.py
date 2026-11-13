@@ -233,6 +233,51 @@ def web_video(src: Path, dst: Path) -> Path:
     return dst if done.returncode == 0 and dst.exists() and dst.stat().st_size else src
 
 
+CALIBRATION_FRACTIONS = (0.5, 0.25, 0.75, 0.1, 0.9)  # where in the recording to look for a clear view of the court
+GOOD_CONFIDENCE = 85                                 # stop looking once a fit is this good (percent)
+_CONFIDENCE = re.compile(r"置信度 (\d+)%")
+
+
+def auto_calibrate_video(work: Path, court: Path, duration: float, on_stage, log: list[str], run=None) -> None:
+    """Automatic court calibration, tried at several moments of the recording.
+
+    Players stand on different lines at different times, so one frame can fail
+    where another passes. Every attempt goes to its own file; the fit with the
+    highest confidence becomes ``court`` (with its preview picture).
+    """
+    run = run or run_step
+    times = [1.0] + [round(duration * f, 1) for f in CALIBRATION_FRACTIONS if duration * f > 2.0]
+    best: tuple[int, Path] | None = None
+    reason = ""
+    rejected: Path | None = None
+    for i, t in enumerate(times, 1):
+        on_stage(f"自动标定球场（第 {i}/{len(times)} 次）")
+        attempt = court.with_name(f"{court.stem}.try{i}.json")
+        lines: list[str] = []  # this attempt's own output (the shared log is trimmed as it grows)
+        code = run(["calibrate", str(work), "--auto", "--time", str(t), "-o", str(attempt)], on_stage, "自动标定球场", lines)
+        log.extend(lines)
+        if code == 0 and attempt.exists():
+            m = next((m for m in map(_CONFIDENCE.search, lines) if m), None)
+            confidence = int(m.group(1)) if m else 0
+            if best is None or confidence > best[0]:
+                best = (confidence, attempt)
+            if confidence >= GOOD_CONFIDENCE:
+                break
+        else:
+            reason = next((x for x in lines if x.startswith("自动标定失败")), reason)
+            if attempt.with_suffix(".rejected.png").exists():
+                rejected = attempt.with_suffix(".rejected.png")
+    if best is None:
+        raise StepFailedWithFiles(
+            f"自动标定球场失败（试了录像里的 {len(times)} 个时刻）。{reason}\n"
+            "请确认整片球场（四条边线和两条底线）都在画面里；或者在 Mac 上手动标定后，在网页上点“重新处理”。",
+            [rejected] if rejected else [])
+    shutil.copyfile(best[1], court)
+    if best[1].with_suffix(".png").exists():
+        shutil.copyfile(best[1].with_suffix(".png"), court.with_suffix(".png"))
+    log.append(f"球场标定采用第 {times[int(best[1].stem.rsplit('try', 1)[1]) - 1]} 秒的画面，置信度 {best[0]}%")
+
+
 def analyse(video: Path, out_dir: Path, options: dict, on_stage, log: list[str]) -> list[Path]:
     """The normal one-click pipeline, without anything that needs a person at the keyboard."""
     from .video import probe  # needs OpenCV; imported late so the node itself starts without it
@@ -247,15 +292,9 @@ def analyse(video: Path, out_dir: Path, options: dict, on_stage, log: list[str])
     court = work.with_suffix(".court.json")
     extra: list[Path] = []
     if not court.exists():
-        on_stage("自动标定球场")
-        code = run_step(["calibrate", str(work), "--auto", "-o", str(court)], on_stage, "自动标定球场", log)
-        if code != 0:
-            rejected = court.with_suffix(".rejected.png")
-            if rejected.exists():
-                extra.append(rejected)
-            raise StepFailedWithFiles(
-                "自动标定球场失败：画面里找不到完整、清楚的球场线。请确认整片球场都在画面里，或者在 Mac 上手动标定后重新处理。",
-                extra)
+        info = probe(work)
+        duration = info.frames / info.fps if info.frames and info.fps else 0.0
+        auto_calibrate_video(work, court, duration, on_stage, log)
     if court.with_suffix(".png").exists():
         extra.append(court.with_suffix(".png"))
     args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir)]
@@ -277,6 +316,7 @@ def result_name(path: Path, stem: str) -> str:
         if name.startswith(prefix):
             name = name[len(prefix):]
             break
+    name = re.sub(r"^court\.try\d+\.", "court.", name)  # calibration attempts: one name on the web
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
 
 

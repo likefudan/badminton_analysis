@@ -169,3 +169,50 @@ def test_result_names_drop_the_recording_stem():
     assert node.result_name(Path("IMG_1_sdr.movement.json"), "IMG_1") == "movement.json"
     assert node.result_name(Path("IMG_1.court.png"), "IMG_1") == "court.png"
     assert node.result_name(Path("别的 文件.png"), "IMG_1") == "_____.png"
+
+
+def calib_runner(outcomes):
+    """Stand-in for run_step: outcomes[i] is a confidence in percent (success) or None (failure)."""
+    calls = []
+
+    def run(args, on_stage, label, log):
+        t, out = float(args[args.index("--time") + 1]), Path(args[args.index("-o") + 1])
+        result = outcomes[len(calls)]
+        calls.append(t)
+        if result is None:
+            log.append("自动标定失败：结果不可靠（线条重合度 54%，只对上 6/12 条线）")
+            out.with_suffix(".rejected.png").write_bytes(b"red")
+            return 2
+        out.write_text(json.dumps({"confidence": result}))
+        out.with_suffix(".png").write_bytes(b"green %d" % result)
+        log.append(f"置信度 {result}%（投影的球场线落在白线上的比例），对上 10/12 条线")
+        return 0
+
+    return run, calls
+
+
+def test_calibration_tries_several_moments_and_keeps_the_best(tmp_path):
+    court = tmp_path / "IMG_sdr.court.json"
+    run, calls = calib_runner([None, 73, None, 78, None, 71])
+    log = []
+    node.auto_calibrate_video(tmp_path / "IMG_sdr.mp4", court, 20.0, lambda s: None, log, run=run)
+    assert calls == [1.0, 10.0, 5.0, 15.0, 18.0]            # 10% of 20 s is too close to the start
+    assert json.loads(court.read_text()) == {"confidence": 78}
+    assert court.with_suffix(".png").read_bytes() == b"green 78"
+    assert "15.0 秒" in log[-1] and "78%" in log[-1]
+
+
+def test_calibration_stops_at_a_good_fit(tmp_path):
+    run, calls = calib_runner([90])
+    node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 600.0, lambda s: None, [], run=run)
+    assert calls == [1.0]
+
+
+def test_calibration_failure_names_the_reason_and_keeps_the_rejected_picture(tmp_path):
+    run, calls = calib_runner([None] * 6)
+    with pytest.raises(node.StepFailedWithFiles) as e:
+        node.auto_calibrate_video(tmp_path / "v.mp4", tmp_path / "v.court.json", 60.0, lambda s: None, [], run=run)
+    assert len(calls) == 6
+    assert "只对上 6/12 条线" in str(e.value)
+    assert [node.result_name(f, "v") for f in e.value.files] == ["court.rejected.png"]
+    assert not (tmp_path / "v.court.json").exists()
