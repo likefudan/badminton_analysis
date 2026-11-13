@@ -201,13 +201,26 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--labels", help="人工标注的击球 CSV（Frame, Player, Note），给了就报告准确率、召回率和 F1")
     s.add_argument("--manual", help="人工核对过的击球 CSV：不做识别，直接写成来源为「人工」的击球文件")
 
+    s = sub.add_parser("strokes", help="每次击球的技术类型（BST 模型 + 直线/对角、平高/高远规则），单打双打都可以")
+    s.add_argument("video")
+    s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+    s.add_argument("--shuttle", help="badminton shuttle 输出的 CSV，默认 <视频名>.shuttle.csv")
+    s.add_argument("--data", help="skeleton 生成的 .npz（要 --stride 1 逐帧跑），默认 <视频名>.skeleton.npz")
+    s.add_argument("--hits", help="badminton hits 输出的 hits.json（或带 frame、player 列的 CSV）；不给就当场识别")
+    s.add_argument("--players", help="球员名字文件，默认 <视频名>.players.json")
+    s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
+    s.add_argument("--weights", nargs="+", help="BST 不合并类别的权重 bst_CG_AP_JnB_bone*.pt，"
+                   "默认 ~/codebase/third_party/BST_weights/weight/bst_CG_AP_JnB_bone.pt")
+    s.add_argument("--no-video", action="store_true", help="不输出带类型标签的视频")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "hits": cmd_hits, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze,
-            "review": cmd_review, "cut": cmd_cut, "node": cmd_node}[a.cmd](a)
+            "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -919,6 +932,50 @@ def cmd_hits(a) -> int:
     print(f"{'人工核对的' if a.manual else '识别出'} {len(hits)} 次击球（{who}）")
     print(f"已写入 {out}（每个数值带来源标记）、{out.with_suffix('.csv').name}、"
           f"{out.with_suffix('.html').name}（用浏览器打开可逐拍核对并导出标注）")
+    return 0
+
+
+def cmd_strokes(a) -> int:
+    import collections
+
+    from . import strokes as ST
+    from .court import CourtCalibration
+
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    data_path = Path(a.data) if a.data else video.with_suffix(".skeleton.npz")
+    shuttle_path = Path(a.shuttle) if a.shuttle else video.with_suffix(".shuttle.csv")
+    for path, how in ((data_path, "badminton skeleton --stride 1"), (shuttle_path, "badminton shuttle --court")):
+        if not path.exists():
+            raise SystemExit(f"找不到 {path}：先运行 {how}")
+    weights = [Path(w) for w in (a.weights or [ST.DEFAULT_WEIGHTS])]
+    for w in weights:
+        if not w.exists():
+            raise SystemExit(f"找不到 BST 权重 {w}：下载办法见 docs/stroke_types.md")
+    names_path = Path(a.players) if a.players else video.with_suffix(".players.json")
+    names = json.loads(names_path.read_text()) if names_path.exists() else {}
+    per_side = 1 if a.singles else _players_per_side(data_path)
+    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side)
+    doc = ST.strokes_json(results, ctx["fps"], str(video),
+                          {"skeleton": str(data_path), "shuttle": str(shuttle_path), "hits": a.hits},
+                          names, [str(w) for w in weights])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{video.stem}.strokes.json"
+    out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    ST.write_csv(results, out.with_suffix(".csv"))
+    for pid in sorted({r["player_id"] for r in results}, key=str):
+        mine = [r for r in results if r["player_id"] == pid]
+        kinds = collections.Counter(r["type"] for r in mine if not r["needs_review"])
+        who = names.get(str(pid), f"球员 {pid}")
+        print(f"  {who}：{len(mine)} 拍，有把握的 " + ("、".join(f"{k} {v}" for k, v in kinds.most_common()) or "无"))
+    n_review = sum(r["needs_review"] for r in results)
+    print(f"{len(results)} 次击球，其中 {n_review} 次没把握（概率低于 {ST.REVIEW_PROB:.0%}、判成未知、"
+          f"或击球前后球员数据不全），需要人工看")
+    print(f"已写入 {out}、{out.with_suffix('.csv').name}")
+    if not a.no_video:
+        mp4 = out_dir / f"{video.stem}.strokes.mp4"
+        ST.draw_video(video, mp4, results, ctx["data"], ctx["tracking"])
+        print(f"已写入 {mp4}（击球人头顶写类型；灰字带问号的是没把握的）")
     return 0
 
 

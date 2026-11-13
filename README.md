@@ -502,10 +502,19 @@ badminton hits match.mp4 --court match.court.json
 
 在 `data/singles.mp4`（转播单打，66 拍对照）上，±0.1 秒内 F1 是 91.3%，击球人 57/58 正确；参数是在这同一段上调的，手机录像和双打还没有对照。击球声实测后没有采用。做法、数字的限制、人工核对的办法和来源标记的定义见 [docs/hits.md](docs/hits.md)。
 
+## 每次击球的技术类型
+
+```bash
+badminton strokes match.mp4 --court match.court.json --hits match.hits.json
+```
+
+给每拍写出击球人和技术类型（杀球、点杀、吊球、过渡吊球、放网、勾对角、推球、扑球、挑球、高远球、平高球、平抽、挡网、发球等），附带直线/对角，输出 `match.strokes.json`、`.csv` 和带标签的 `match.strokes.mp4`。单打和双打都能用。主类型来自 BST 模型（需要另外下载权重），直线/对角和平高/高远是按下一拍击球人的位置推算的。还没有人工标注，所以没有准确率数字；劈杀、劈吊、收吊、搓球要等有了标注再做。说明见 [docs/stroke_types.md](docs/stroke_types.md)。
+
 ## 代码结构
 
 | 文件 | 内容 |
 | --- | --- |
+| `src/badminton/strokes.py` | 每拍击球类型：击球人和对手送进 BST、只取击球人一侧的类别、直线/对角和平高规则、带标签的视频 |
 | `src/badminton/court.py` | 球场尺寸、标记点、画面与球场坐标的单应变换、检测区域 |
 | `src/badminton/calibrate.py` | 点标记点的窗口（带放大镜） |
 | `src/badminton/autocal.py` | 自动标定：找白线、和标准球场对应、精调、机位漂移、从球场线估计镜头畸变 |
