@@ -6,6 +6,7 @@ export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
   ACCESS_TOKEN: string;
+  NODE_TOKEN?: string; // Mac 处理节点自己的钥匙，和登录口令分开；没设置就只认登录口令
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -81,7 +82,11 @@ async function sameSecret(got: string, want: string): Promise<boolean> {
 async function authorized(req: Request, env: Env): Promise<boolean> {
   if (!env.ACCESS_TOKEN) return false;
   const header = req.headers.get("authorization") ?? "";
-  if (header.startsWith("Bearer ")) return sameSecret(header.slice(7), env.ACCESS_TOKEN);
+  if (header.startsWith("Bearer ")) {
+    const got = header.slice(7);
+    if (await sameSecret(got, env.ACCESS_TOKEN)) return true;
+    return env.NODE_TOKEN ? sameSecret(got, env.NODE_TOKEN) : false;
+  }
   // cookie 只用于读取（GET）：别的网站没法借它来改数据
   if (req.method !== "GET") return false;
   const cookie = (req.headers.get("cookie") ?? "").split(/;\s*/).find((c) => c.startsWith(SESSION_COOKIE + "="));

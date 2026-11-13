@@ -21,7 +21,7 @@ before(async () => {
     stdio: "ignore", env: { ...process.env, CI: "1" },
   });
   server = spawn("npx", ["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", state,
-    "--var", `ACCESS_TOKEN:${TOKEN}`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key", "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(BASE + "/me")).status === 401) return; } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -37,6 +37,8 @@ after(() => {
 test("没有口令或口令不对都是 401", async () => {
   assert.equal((await fetch(BASE + "/videos")).status, 401);
   assert.equal((await fetch(BASE + "/videos", { headers: { authorization: "Bearer nope" } })).status, 401);
+  // 处理节点有自己的钥匙
+  assert.equal((await fetch(BASE + "/me", { headers: { authorization: "Bearer node-key" } })).status, 200);
 });
 
 test("首页和脚本能打开", async () => {

@@ -33,9 +33,13 @@
 
 ## Mac 上的处理节点
 
+节点用自己的钥匙连网站，和登录口令分开：`~/.config/badminton/node.json` 里的 `token` 要和仓库 secret `BA_NODE_TOKEN` 一致（部署时写成 Worker 的 `NODE_TOKEN`）。也可以直接填登录口令。
+
 ```bash
-mkdir -p ~/.config/badminton
-echo '{"token": "网站的登录口令"}' > ~/.config/badminton/node.json && chmod 600 ~/.config/badminton/node.json
+umask 077; mkdir -p ~/.config/badminton
+python3 -c 'import json,secrets; print(json.dumps({"token": secrets.token_hex(32)}))' > ~/.config/badminton/node.json
+python3 -c 'import json,sys,pathlib; sys.stdout.write(json.loads((pathlib.Path.home()/".config/badminton/node.json").read_text())["token"])' | gh secret set BA_NODE_TOKEN
+# 然后重新运行一次部署流程
 badminton node            # 常驻：每 15 秒查一次有没有新录像
 badminton node --once     # 处理完排队中的就退出
 ```
