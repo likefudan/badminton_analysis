@@ -429,12 +429,32 @@ let videos = [];
 let openId = null;     // 正在看哪一局
 let shownKey = "";     // 结果区已经画过的内容，没变化就不重画（不然视频会被打断）
 let pollTimer = null;
+let node = null;       // Mac 处理节点：{ name, seenAt }
+let clockSkew = 0;     // 服务器时间 - 手机时间（毫秒），时间差都按服务器时间算
+const serverNow = () => Date.now() + clockSkew;
+const NODE_ONLINE_MS = 90 * 1000; // 节点空闲时每 15 秒来问一次任务，处理中每 20 秒汇报一次
+
+// 节点上报之后又过了多久（秒）：用来让“已用时间”和“预计剩余”在两次上报之间继续走
+const sinceReport = (j) => (j && j.updatedAt ? Math.max(0, (serverNow() - new Date(j.updatedAt)) / 1000) : 0);
+const fmtAbout = (s) => (s < 50 ? `约 ${Math.max(5, Math.round(s / 5) * 5)} 秒` : `约 ${Math.max(1, Math.round(s / 60))} 分钟`);
+const nodeOnline = () => node && serverNow() - new Date(node.seenAt) < NODE_ONLINE_MS;
+
+function queueText(v) {
+  const ahead = videos.filter((x) => x.id !== v.id && x.status === "uploaded" && x.job &&
+    (x.job.status === "processing" || (x.job.status === "queued" && x.completedAt < v.completedAt))).length;
+  const where = ahead ? `排队中，前面还有 ${ahead} 局` : "排队中，下一个就是它";
+  if (!node) return where + "。Mac 上的处理程序还没连接过";
+  return where + (nodeOnline() ? "" : "。Mac 现在离线，上线后自动开始");
+}
 
 function statusText(v) {
   if (v.status !== "uploaded") return `上传中 ${(v.uploadedBytes / v.size * 100).toFixed(0)}%`;
   const j = v.job || {};
-  if (j.status === "queued") return "排队中，等 Mac 处理";
-  if (j.status === "processing") return "处理中：" + (j.stage || "");
+  if (j.status === "queued") return queueText(v);
+  if (j.status === "processing") {
+    const eta = j.progress && j.progress.etaSeconds != null ? Math.max(0, j.progress.etaSeconds - sinceReport(j)) : null;
+    return "处理中：" + (j.stage || "") + (eta != null ? `，${fmtAbout(eta).replace("约", "约剩")}` : "");
+  }
   if (j.status === "done") return "已完成";
   if (j.status === "failed") return "处理失败";
   if (j.status === "archived") return "云端结果已清理，Mac 上还有";
@@ -445,7 +465,10 @@ const busy = (v) => v.status === "uploaded" && v.job && (v.job.status === "queue
 async function refreshList() {
   const ul = $("list");
   try {
-    videos = (await api("/videos")).videos;
+    const data = await api("/videos");
+    videos = data.videos;
+    node = data.node;
+    if (data.now) clockSkew = new Date(data.now) - Date.now();
   } catch (e) {
     ul.innerHTML = '<li class="quiet">读取失败</li>';
     return;
@@ -472,10 +495,92 @@ async function refreshList() {
     li.onclick = () => openDetail(v.id);
     ul.append(li);
   }
+  renderNodeLine();
   if (openId) renderDetail();
   clearTimeout(pollTimer);
-  if (videos.some(busy)) pollTimer = setTimeout(refreshList, 5000);
+  if (videos.some(busy)) pollTimer = setTimeout(refreshList, 3000);
 }
+
+function renderNodeLine() {
+  const el = $("nodeLine");
+  el.textContent = "";
+  const dot = document.createElement("span");
+  dot.className = "dot " + (node ? (nodeOnline() ? "on" : "off") : "");
+  let text = "Mac 上的处理程序还没连接过";
+  if (node) {
+    const ago = Math.max(0, (serverNow() - new Date(node.seenAt)) / 1000);
+    text = nodeOnline() ? `Mac 在线（${node.name}）` : `Mac 离线（${node.name}），最后在线是 ${fmtDur(ago)}前`;
+  }
+  el.append(dot, text);
+}
+
+const STEP_ICON = { done: "✓", running: "●", pending: "○", skipped: "–", failed: "✕" };
+
+// 步骤列表：每步的状态、用时、进度条和预计时间。每秒重画一次，让时间一直在走。
+function renderProgress(v) {
+  const box = $("dProgress");
+  box.textContent = "";
+  const j = v.job || {};
+  const p = j.progress;
+  if (v.status !== "uploaded" || !p || !Array.isArray(p.steps)) return;
+  const live = j.status === "processing";
+  const extra = live ? sinceReport(j) : 0;
+  const sum = document.createElement("p");
+  sum.className = "sum";
+  if (live) {
+    const eta = p.etaSeconds != null ? Math.max(0, p.etaSeconds - extra) : null;
+    sum.textContent = `已用 ${fmtDur(p.elapsedSeconds + extra)}` +
+      (eta != null ? ` · 预计还要${fmtAbout(eta)}` : " · 总时间暂时估不出（这台 Mac 多处理几局后会有）");
+    if (extra > 90) sum.textContent += ` · Mac 已经 ${fmtDur(extra)}没有消息`;
+  } else {
+    const total = p.steps.reduce((t, s) => t + (s.seconds || 0), 0);
+    sum.textContent = (j.status === "failed" ? "失败前用了 " : "处理用时 ") + fmtDur(total) +
+      (p.videoSeconds ? `（录像 ${fmtDur(p.videoSeconds)}）` : "");
+  }
+  box.append(sum);
+  const ul = document.createElement("ul");
+  ul.className = "steps";
+  for (const s of p.steps) {
+    const li = document.createElement("li");
+    li.className = s.status;
+    const ico = document.createElement("span");
+    ico.className = "ico";
+    ico.textContent = STEP_ICON[s.status] || "○";
+    const lab = document.createElement("span");
+    lab.className = "lab";
+    lab.textContent = s.label + (s.status === "running" && s.percent != null ? ` ${s.percent}%` : "");
+    const time = document.createElement("span");
+    time.className = "time";
+    if (s.status === "done" || s.status === "failed") time.textContent = fmtDur(s.seconds || 0);
+    else if (s.status === "skipped") time.textContent = "跳过";
+    else if (s.status === "running") {
+      const left = s.etaSeconds != null ? Math.max(0, s.etaSeconds - extra) : null;
+      time.textContent = `已 ${fmtDur((s.seconds || 0) + extra)}` + (left != null ? `，${fmtAbout(left).replace("约", "约剩")}` : "");
+    } else if (s.estimateSeconds != null) time.textContent = fmtAbout(s.estimateSeconds);
+    li.append(ico, lab, time);
+    if (s.status === "running" && s.percent != null) {
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      const fill = document.createElement("div");
+      fill.style.width = s.percent + "%";
+      bar.append(fill);
+      li.append(bar);
+    }
+    if (s.detail) {
+      const note = document.createElement("span");
+      note.className = "note";
+      note.textContent = s.detail;
+      li.append(note);
+    }
+    ul.append(li);
+  }
+  box.append(ul);
+}
+setInterval(() => {
+  if (document.hidden) return;
+  const v = openId && videos.find((x) => x.id === openId);
+  if (v && busy(v)) renderProgress(v);
+}, 1000);
 
 function openDetail(id) {
   openId = id;
@@ -499,12 +604,13 @@ $("dBack").onclick = closeDetail;
 const RESULT_ORDER = [
   [/^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
   [/^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
+  [/^combined\.mp4$/, () => "羽毛球轨迹 + 骨架视频"],
   [/^longest\.mp4$/, () => "最长的几个回合"],
   [/^rallies\.mp4$/, () => "只有回合的精简视频"],
   [/^skeleton\.mp4$/, () => "骨架视频"],
-  [/^players\.png$/, () => "球员编号"],
-  [/^court\.png$/, () => "球场标定（绿线应该压在白线上）"],
-  [/^court\.rejected\.png$/, () => "自动标定找到的最好结果（红线，没有采用）"],
+  [/^players\.(png|jpg)$/, () => "球员编号"],
+  [/^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
+  [/^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
 ];
 
 async function renderDetail() {
@@ -514,6 +620,7 @@ async function renderDetail() {
   const st = $("dStatus");
   st.textContent = statusText(v) + (v.options && v.options.mode === "doubles" ? " · 双打" : " · 单打");
   st.className = v.job && v.job.status === "failed" ? "bad" : v.job && v.job.status === "done" ? "ok" : "quiet";
+  renderProgress(v);
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
   $("dRetry").hidden = !(v.status === "uploaded" && v.job && ["failed", "done", "archived"].includes(v.job.status));

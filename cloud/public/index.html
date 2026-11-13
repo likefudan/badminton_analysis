@@ -51,6 +51,22 @@
   th { color: var(--quiet); font-weight: 400; border-top: 0; }
   th:first-child, td:first-child { text-align: left; }
   .back { color: var(--accent); cursor: pointer; font-size: 14px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--quiet); margin-right: 6px; }
+  .dot.on { background: var(--good); } .dot.off { background: var(--bad); }
+  #dProgress .sum { font-size: 15px; margin: 8px 0; font-variant-numeric: tabular-nums; }
+  .steps { list-style: none; margin: 0 0 12px; padding: 0; }
+  .steps li { display: grid; grid-template-columns: 22px 1fr auto; gap: 2px 6px; padding: 7px 0; border-top: 1px solid var(--line); align-items: baseline; }
+  .steps li:first-child { border-top: 0; }
+  .steps .ico { text-align: center; }
+  .steps .time { color: var(--quiet); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .steps .note { grid-column: 2 / 4; color: var(--quiet); font-size: 13px; word-break: break-all; }
+  .steps .bar { grid-column: 2 / 4; height: 6px; margin: 4px 0 2px; }
+  .steps li.pending .lab, .steps li.skipped .lab { color: var(--quiet); }
+  .steps li.running .lab { font-weight: 600; }
+  .steps li.running .ico { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  .steps li.done .ico { color: var(--good); } .steps li.failed .ico, .steps li.failed .lab { color: var(--bad); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { .steps li.running .ico { animation: none; } }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -111,6 +127,7 @@
     <section class="card" id="listCard">
       <h2>我的录像</h2>
       <ul id="list"><li class="quiet">读取中</li></ul>
+      <p class="quiet" id="nodeLine"></p>
       <p class="quiet">传完后由家里的 Mac 自动处理，处理完点开就能看结果。</p>
     </section>
 
@@ -119,6 +136,7 @@
       <h2 id="dTitle" style="margin-top:8px"></h2>
       <p id="dStatus"></p>
       <p id="dError" class="bad" hidden></p>
+      <div id="dProgress"></div>
       <div id="dBody"></div>
       <div class="row">
         <button class="plain" id="dRetry" hidden>重新处理</button>

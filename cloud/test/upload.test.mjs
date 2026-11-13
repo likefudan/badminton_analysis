@@ -158,8 +158,17 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal((await call(`/videos/${v.id}/file`)).status, 410);
 
   // 进度
-  let st = await (await post(`/videos/${v.id}/job`, { status: "processing", stage: "骨架 40%" })).json();
+  const progress = { steps: [{ key: "skeleton", label: "骨架识别", status: "running", percent: 40 }], etaSeconds: 90 };
+  let st = await (await post(`/videos/${v.id}/job`, { status: "processing", stage: "骨架 40%", progress })).json();
   assert.equal(st.job.stage, "骨架 40%");
+  assert.deepEqual(st.job.progress, progress);
+  assert.ok(st.job.startedAt);
+  // 只续租不带进度时，进度保持不变；网页能看到 Mac 最近在线
+  st = await (await post(`/videos/${v.id}/job`, { status: "processing" })).json();
+  assert.deepEqual(st.job.progress, progress);
+  const listing = await (await call("/videos")).json();
+  assert.equal(listing.node.name, "mac");
+  assert.ok(Math.abs(new Date(listing.now) - new Date(listing.node.seenAt)) < 60000);
   assert.equal(st.originalDeleted, true);
   assert.equal((await post(`/videos/${v.id}/job`, { status: "weird" })).status, 400);
 
@@ -206,6 +215,7 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal(st.job.status, "queued");
   assert.deepEqual(st.options, { mode: "singles" });
   assert.deepEqual(st.results, []); // 旧结果清掉
+  assert.equal(st.job.progress, null);
   assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.id, v.id);
   st = await (await post(`/videos/${v.id}/job`, { status: "failed", stage: "自动标定球场", error: "找不到球场线" })).json();
   assert.equal(st.job.error, "找不到球场线");
