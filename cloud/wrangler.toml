@@ -1,0 +1,24 @@
+name = "ba"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+# 网站地址。llmat.dev 必须是同一个 Cloudflare 账号下的域名。
+routes = [{ pattern = "ba.llmat.dev", custom_domain = true }]
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "ba-files"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ba-db"
+# 部署前用 `wrangler d1 create ba-db` 得到的 id 替换
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# 口令用 `wrangler secret put ACCESS_TOKEN` 设置，本地开发写在 .dev.vars

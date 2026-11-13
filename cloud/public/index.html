@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="羽毛球分析">
+<title>羽毛球分析 · 上传录像</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --ink: #1c1c1a; --quiet: #6b6b66; --line: #dcdcd6; --accent: #1f6feb; --good: #1a7f37; --bad: #cf222e; --warn: #9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #222220; --ink: #ecece8; --quiet: #a3a39c; --line: #3a3a36; --accent: #58a6ff; --good: #3fb950; --bad: #f85149; --warn: #d29922; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; padding-bottom: calc(24px + env(safe-area-inset-bottom)); background: var(--bg); color: var(--ink); font: 16px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .quiet { color: var(--quiet); font-size: 13px; }
+  button, .pick { display: block; width: 100%; padding: 12px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; text-align: center; cursor: pointer; }
+  button.plain { background: none; color: var(--accent); border: 1px solid var(--line); font-weight: 400; }
+  button:disabled { opacity: .5; }
+  input[type=password] { width: 100%; padding: 12px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--ink); font: inherit; }
+  input[type=file] { display: none; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 14px; }
+  dt { color: var(--quiet); }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .bar { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; margin: 10px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .ok { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  #log { font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--quiet); white-space: pre-wrap; max-height: 220px; overflow: auto; margin: 0; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .row > * { flex: 1; }
+  ul { list-style: none; margin: 0; padding: 0; font-size: 14px; }
+  li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  li a { color: var(--bad); cursor: pointer; white-space: nowrap; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>羽毛球分析 · 上传录像</h1>
+
+  <section class="card" id="login" hidden>
+    <h2>输入口令</h2>
+    <input type="password" id="token" autocomplete="current-password" placeholder="口令">
+    <button id="loginBtn">进入</button>
+    <p class="quiet" id="loginMsg"></p>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card">
+      <label class="pick" for="file">选择录像</label>
+      <input type="file" id="file" accept="video/*">
+      <p class="quiet">从相册选的时候，如果出现“选项”，请选“当前格式”或“原始”，不要选“最兼容”。也可以从“文件”App 里选。上传期间请停在这个页面，插上电源。</p>
+    </section>
+
+    <section class="card" id="info" hidden>
+      <h2>这个文件</h2>
+      <dl>
+        <dt>文件名</dt><dd id="iName"></dd>
+        <dt>大小</dt><dd id="iSize"></dd>
+        <dt>分辨率</dt><dd id="iRes"></dd>
+        <dt>帧率（估计）</dt><dd id="iFps"></dd>
+        <dt>时长</dt><dd id="iDur"></dd>
+        <dt>每分钟大小</dt><dd id="iRate"></dd>
+      </dl>
+      <p id="verdict"></p>
+      <div class="row">
+        <button id="startBtn">开始上传</button>
+        <button id="pauseBtn" class="plain" hidden>暂停</button>
+      </div>
+    </section>
+
+    <section class="card" id="progress" hidden>
+      <h2 id="pTitle">上传中</h2>
+      <div class="bar"><div id="pBar"></div></div>
+      <dl>
+        <dt>已上传</dt><dd id="pBytes"></dd>
+        <dt>当前速度</dt><dd id="pSpeed"></dd>
+        <dt>平均速度</dt><dd id="pAvg"></dd>
+        <dt>预计剩余</dt><dd id="pEta"></dd>
+        <dt>已用时间</dt><dd id="pElapsed"></dd>
+        <dt>重试次数</dt><dd id="pRetries">0</dd>
+        <dt>页面进入后台</dt><dd id="pHidden">0 次</dd>
+        <dt>保持亮屏</dt><dd id="pWake">未申请</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>云端的录像</h2>
+      <ul id="list"><li class="quiet">读取中</li></ul>
+    </section>
+
+    <section class="card">
+      <h2>记录</h2>
+      <pre id="log"></pre>
+      <div class="row"><button class="plain" id="copyLog">复制记录</button><button class="plain" id="logout">退出登录</button></div>
+    </section>
+  </div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
