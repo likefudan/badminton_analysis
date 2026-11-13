@@ -111,3 +111,25 @@ def test_still_stretches_of_the_path_are_dropped():
     blocks = drop_still_runs(p, 19.0, overlap=False)
     assert not blocks[20:40, 0].any() and 0 < blocks[40:52, 0].sum() < 12
     assert drop_still_runs(p, 19.0, min_frames=40)[:, 0].sum() == p[:, 0].sum()   # nothing that long
+
+
+def test_still_stretch_above_the_horizon_is_kept(camera):
+    """The top of a clear flying along the camera axis hardly moves in the image, but it is above the
+    horizon; a shuttle lying on the next court's floor is below it."""
+    from badminton.court import MARKERS, CourtCalibration
+    from badminton.shuttle_path import drop_still_runs, floor_test
+
+    names = ["near_left_corner", "near_right_corner", "far_left_corner", "far_right_corner",
+             "near_short_service_left", "far_short_service_right"]
+    calib = CourtCalibration({n: tuple(p) for n, p in zip(names, camera.project(np.array([MARKERS[n] for n in names])))},
+                             camera.size)
+    on_floor = floor_test(calib)
+    lying = camera.project([[-4.5, 3.0, 0.0]])[0]      # 4.5 m left of the court, on the floor
+    apex = camera.project([[3.0, 8.0, 6.5]])[0]        # 6.5 m up over the far court, above the 3 m camera
+    assert on_floor(lying) and not on_floor(apex)
+    assert not on_floor(camera.project([[3.0, 200.0, 0.0]])[0])   # the far wall's foot is not "this floor"
+    p = np.zeros((30, 3))
+    p[:12] = (1, *lying)
+    p[15:] = (1, *apex)
+    q = drop_still_runs(p, 5.0, on_floor=on_floor)
+    assert not q[:12, 0].any() and q[15:, 0].all()
