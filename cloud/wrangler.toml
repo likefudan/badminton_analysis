@@ -17,8 +17,8 @@ bucket_name = "ba-files"
 [[d1_databases]]
 binding = "DB"
 database_name = "ba-db"
-# 部署前用 `wrangler d1 create ba-db` 得到的 id 替换
-database_id = "00000000-0000-0000-0000-000000000000"
+# ba-db 的 id（部署流程会核对它和账号里的一致）
+database_id = "d6bf17a9-b0f3-4dd1-80b2-1bba2d6a5ee1"
 migrations_dir = "migrations"
 
 # 口令用 `wrangler secret put ACCESS_TOKEN` 设置，本地开发写在 .dev.vars
