@@ -5,6 +5,10 @@ Court coordinates are in metres, seen from above:
      ("left" as seen from the camera, which stands behind the near baseline)
   y: along the court, 0 = near baseline (camera side), 13.40 = far baseline
 The net is at y = 6.70.
+
+With a lens model (lens.py, for ultra-wide lenses) the homography is between
+the court and *straightened* pixels; `to_court` and `to_image` take and
+return pixels of the picture as it was recorded, so callers need not care.
 """
 
 from __future__ import annotations
@@ -15,6 +19,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from .lens import Lens
 
 LENGTH = 13.40
 WIDTH = 6.10
@@ -95,10 +101,11 @@ def court_lines() -> list[tuple[tuple[float, float], tuple[float, float]]]:
 class CourtCalibration:
     """Image points clicked for named court markers, and the fitted homography."""
 
-    image_points: dict[str, tuple[float, float]]
+    image_points: dict[str, tuple[float, float]]  # pixels of the recorded picture
     frame_size: tuple[int, int]  # (width, height) of the video frame
-    H: np.ndarray = field(init=False)  # image -> court
-    H_inv: np.ndarray = field(init=False)  # court -> image
+    lens: Lens | None = None  # None = no distortion (a plain homography)
+    H: np.ndarray = field(init=False)  # straightened image -> court
+    H_inv: np.ndarray = field(init=False)  # court -> straightened image
     reprojection_error_px: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -107,22 +114,26 @@ class CourtCalibration:
             raise ValueError(f"未知的球场标记点: {sorted(unknown)}")
         if len(self.image_points) < 4:
             raise ValueError("至少需要 4 个标记点（建议 6 个以上）")
+        if self.lens is not None and self.lens.is_identity:
+            self.lens = None
         names = list(self.image_points)
         img = np.array([self.image_points[n] for n in names], dtype=np.float64)
         court = np.array([MARKERS[n] for n in names], dtype=np.float64)
+        # the homography is fitted to the points with the lens distortion removed
+        self._flat = dict(zip(names, map(tuple, self.undistort(img))))
         # Plain least squares over all points (no RANSAC): a mis-click should show
         # up as a high reprojection error rather than be silently dropped.
-        H = _fit(names, self.image_points)
+        H = _fit(names, self._flat)
         if H is None:
             raise ValueError("标记点共线或重复，无法计算单应矩阵")
         self.H = H
         self.H_inv = np.linalg.inv(H)
-        projected = court_to_image(self.H_inv, court)
+        projected = self.to_image(court)
         self.reprojection_error_px = float(np.sqrt(((projected - img) ** 2).sum(1)).mean())
 
     def per_point_error_px(self) -> dict[str, float]:
         """Distance between each clicked point and where the fitted court puts it."""
-        return {name: _residuals(self.H_inv, [name], self.image_points)[0] for name in self.image_points}
+        return {name: _residuals(self.H_inv, [name], self._flat)[0] for name in self.image_points}
 
     def suspect_point(self) -> tuple[str, float] | None:
         """The click most likely to be wrong, and the mean error once it is left out.
@@ -139,19 +150,29 @@ class CourtCalibration:
         best = None
         for name in names:
             others = [n for n in names if n != name]
-            H = _fit(others, self.image_points)
+            H = _fit(others, self._flat)
             if H is None:
                 continue
-            err = float(np.mean(_residuals(np.linalg.inv(H), others, self.image_points)))
+            err = float(np.mean(_residuals(np.linalg.inv(H), others, self._flat)))
             if best is None or err < best[1]:
                 best = (name, err)
         return best
 
+    def undistort(self, image_xy: np.ndarray) -> np.ndarray:
+        """Pixels of the picture -> straightened pixels (what the homography works on)."""
+        p = np.asarray(image_xy, dtype=np.float64).reshape(-1, 2)
+        return p if self.lens is None else self.lens.undistort(p, self.frame_size)
+
+    def distort(self, flat_xy: np.ndarray) -> np.ndarray:
+        """Straightened pixels -> pixels of the picture."""
+        p = np.asarray(flat_xy, dtype=np.float64).reshape(-1, 2)
+        return p if self.lens is None else self.lens.distort(p, self.frame_size)
+
     def to_image(self, court_xy: np.ndarray) -> np.ndarray:
-        return court_to_image(self.H_inv, court_xy)
+        return self.distort(court_to_image(self.H_inv, court_xy))
 
     def to_court(self, image_xy: np.ndarray) -> np.ndarray:
-        return image_to_court(self.H, image_xy)
+        return image_to_court(self.H, self.undistort(image_xy))
 
     def save(self, path: str | Path) -> None:
         data = {
@@ -160,13 +181,16 @@ class CourtCalibration:
             "homography_image_to_court": self.H.tolist(),
             "reprojection_error_px": self.reprojection_error_px,
         }
+        if self.lens is not None:
+            # with a lens the homography above is for pixels straightened by it (lens.py)
+            data["lens"] = self.lens.to_json()
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
     @classmethod
     def load(cls, path: str | Path) -> "CourtCalibration":
         data = json.loads(Path(path).read_text())
         pts = {k: (float(v[0]), float(v[1])) for k, v in data["image_points"].items()}
-        return cls(pts, tuple(data["frame_size"]))
+        return cls(pts, tuple(data["frame_size"]), Lens.from_json(data.get("lens")))
 
 
 def _fit(names, image_points) -> np.ndarray | None:
@@ -231,6 +255,8 @@ def detection_roi(
             (-side_margin, LENGTH + end_margin),
         ]
     )
+    if calib.lens is not None:  # the edges of the area are curved in the picture: follow them
+        corners = np.concatenate([np.linspace(corners[i], corners[(i + 1) % 4], 9) for i in range(4)])
     img = calib.to_image(corners)
     far = calib.to_image(np.array([(0.0, LENGTH), (WIDTH, LENGTH)]))
     px_per_m_far = float(np.hypot(*(far[1] - far[0]))) / WIDTH

@@ -7,6 +7,10 @@ homography also fixes the focal length (the floor's two axes must be
 orthogonal and equally scaled after removing K) and the camera pose, which
 lets us project 3D points such as the net tape or a shuttle 5 m above the
 court.
+
+When the calibration has a lens model, K, R and t describe the pinhole camera
+behind the straightened picture, and `project` bends its result back into the
+recorded picture.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .court import CourtCalibration
+from .lens import Lens
 
 
 @dataclass
@@ -24,6 +29,7 @@ class Camera:
     R: np.ndarray  # (3, 3) world -> camera
     t: np.ndarray  # (3,)
     size: tuple[int, int]  # (width, height)
+    lens: Lens | None = None
 
     @property
     def center(self) -> np.ndarray:
@@ -38,7 +44,8 @@ class Camera:
         p = np.atleast_2d(np.asarray(xyz, float))
         cam = p @ self.R.T + self.t
         uv = cam @ self.K.T
-        return uv[:, :2] / uv[:, 2:3]
+        uv = uv[:, :2] / uv[:, 2:3]
+        return uv if self.lens is None else self.lens.distort(uv, self.size)
 
     def depth(self, xyz) -> np.ndarray:
         p = np.atleast_2d(np.asarray(xyz, float))
@@ -76,8 +83,8 @@ def camera_from_calibration(calib: CourtCalibration) -> Camera:
     r3 = np.cross(r1, r2)
     U, _, Vt = np.linalg.svd(np.stack([r1, r2, r3], 1))
     R = U @ Vt
-    cam = Camera(K, R, t, (w, h))
+    cam = Camera(K, R, t, (w, h), calib.lens)
     if cam.center[2] < 0:  # court axes (x across, y along) give z = x * y; make z point up
         R = R @ np.diag([1, 1, -1.0])
-        cam = Camera(K, R, t, (w, h))
+        cam = Camera(K, R, t, (w, h), calib.lens)
     return cam
