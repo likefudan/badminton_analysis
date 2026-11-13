@@ -100,10 +100,10 @@ class Api:
                 pass
             raise ApiError(e.code, text) from None
 
-    def json(self, method: str, path: str, data: dict | None = None) -> dict:
+    def json(self, method: str, path: str, data: dict | None = None, timeout: float = 120) -> dict:
         body = json.dumps(data).encode() if data is not None else None
         headers = {"content-type": "application/json"} if data is not None else None
-        with self.request(method, path, body, headers) as res:
+        with self.request(method, path, body, headers, timeout) as res:
             return json.loads(res.read() or b"{}")
 
     def retrying(self, fn, what: str, tries: int = 6):
@@ -199,6 +199,7 @@ STEPS = [
     ("cut", "剪辑回合视频"),
     ("shuttle", "羽毛球追踪"),
     ("upload", "转码并上传结果"),
+    ("review", "AI 报告"),
 ]
 HISTORY_KEEP = 8
 
@@ -527,6 +528,44 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     return combined
 
 
+def review_inputs(work: Path, court: Path, out_dir: Path, log: list[str], run=None) -> bool:
+    """Write <stem>.review.request.json: the statistics as text plus the prompt. No model is called here;
+    the web site asks the model with its own key once the file is uploaded."""
+    movement = out_dir / f"{work.stem}.movement.json"
+    if not movement.exists():
+        return False
+    args = ["review", str(movement)]
+    positioning = out_dir / f"{work.stem}.positioning.json"
+    if positioning.exists():
+        args.append(str(positioning))
+    args += ["--court", str(court), "-o", str(out_dir)]
+    csv = out_dir / f"{work.stem}.shuttle.csv"
+    if csv.exists():
+        args += ["--shuttle", str(csv), "--video", str(work)]
+    mine: list[str] = []  # its chatter (how to paste the prompt) is of no use in the job's error log
+    if (run or run_step)(args, mine, None, None) != 0:
+        print("  生成 AI 报告的统计摘要失败：" + (mine[-1] if mine else ""))
+        return False
+    return True
+
+
+def ask_for_review(api: "Api", vid: str, progress: Progress, names: set[str]) -> None:
+    """Have the web site write the AI report. Never fails the job: the results are already up."""
+    if "review.request.json" not in names:
+        progress.skip("review", "这次没有生成统计摘要")
+        return
+    progress.start("review", "把统计数字交给大模型写点评（不发视频）")
+    try:
+        api.json("POST", f"/videos/{vid}/review", {}, timeout=600)
+    except ApiError as e:
+        progress.skip("review", str(e).split(": ", 1)[-1][:200])
+        return
+    except Exception as e:
+        progress.skip("review", f"没连上网站：{type(e).__name__}")
+        return
+    progress.done("review")
+
+
 def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str]) -> list[Path]:
     """The normal one-click pipeline, without anything that needs a person at the keyboard."""
     from .video import probe  # needs OpenCV; imported late so the node itself starts without it
@@ -584,6 +623,7 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
         if progress.steps[key]["status"] == "pending":
             progress.skip(key, "这次没有运行")
     combined = track_shuttle(work, court, out_dir, progress, log)
+    review_inputs(work, court, out_dir, log)
     files = sorted(p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in RESULT_SUFFIXES)
     if combined:  # the combined video is the skeleton video plus the shuttle: no need to send both
         files = [p for p in files if p.name != f"{work.stem}.skeleton.mp4"]
@@ -675,6 +715,7 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
             print(f"  上传 {name}（{f.stat().st_size / 1e6:.1f} MB）")
             api.upload_result(vid, f, name)
         progress.done("upload", f"{len(files)} 个文件")
+        ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
         stop.set()
         api.retrying(lambda: api.json("POST", f"/videos/{vid}/job",
                                       {"status": "done", "stage": "完成", "progress": progress.to_json()}), "汇报完成")

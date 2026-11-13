@@ -45,6 +45,16 @@
   #detail img, #detail video { display: block; width: 100%; border-radius: 8px; background: #000; margin: 6px 0 14px; }
   #detail img { background: none; }
   #detail h3 { font-size: 14px; margin: 14px 0 2px; }
+  #dReview .md { border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; margin: 6px 0 10px; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; }
+  #dReview .md h4 { font-size: 15px; margin: 14px 0 4px; }
+  #dReview .md h5 { font-size: 14px; margin: 10px 0 2px; }
+  #dReview .md p, #dReview .md ul, #dReview .md ol { margin: 6px 0; }
+  #dReview .md ul, #dReview .md ol { padding-left: 22px; font-size: inherit; }
+  #dReview .md ul { list-style: disc; }
+  #dReview .md li { display: list-item; padding: 2px 0; border-top: 0; }
+  #dReview .md blockquote { margin: 8px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--quiet); font-size: 13px; }
+  #dReview .md code { font-size: 13px; }
+  #dReview textarea { width: 100%; min-height: 64px; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); }
   #dError { white-space: pre-wrap; font-size: 13px; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
   th, td { text-align: right; padding: 5px 4px; border-top: 1px solid var(--line); }
@@ -137,6 +147,7 @@
       <p id="dStatus"></p>
       <p id="dError" class="bad" hidden></p>
       <div id="dProgress"></div>
+      <div id="dReview"></div>
       <div id="dBody"></div>
       <div class="row">
         <button class="plain" id="dRetry" hidden>重新处理</button>

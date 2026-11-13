@@ -227,6 +227,10 @@ def test_cli_without_key_writes_prompt_file(tmp_path, monkeypatch, capsys):
     summary = json.loads((tmp_path / "match.review.summary.json").read_text())
     assert summary["schema"] == 1 and "heatmap" not in json.dumps(summary)
     assert not (tmp_path / "match.review.md").exists()
+    # what the web site needs to ask a model itself: the same text, no key, nothing but text
+    request = json.loads((tmp_path / "match.review.request.json").read_text())
+    assert request["model"] == rv.DEFAULT_MODEL and request["system"] + "\n\n" + request["user"] + "\n" == prompt
+    assert "{question}" in request["ask"] and request["title"] == "match"
     out = capsys.readouterr().out
     assert "没有联网" in out and "--response" in out and "--api" in out
 

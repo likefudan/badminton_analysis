@@ -1111,6 +1111,7 @@ def cmd_review(a) -> int:
     system, messages = rv.build_messages(summary, previous)
     prompt_path = out("prompt.txt")
     prompt_path.write_text(rv.prompt_file_text(system, messages))
+    out("request.json").write_text(json.dumps(rv.request_json(summary, previous, model), ensure_ascii=False, indent=1))
     if a.response:
         body, origin = Path(a.response).read_text(), f"点评文字从 {Path(a.response).name} 导入（聊天模型按提示词文件生成）"
     elif use_api:
