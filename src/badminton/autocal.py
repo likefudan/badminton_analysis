@@ -22,6 +22,15 @@ Neighbouring courts fit the same model equally well. The court that covers
 the most line pixels wins (normally the one the camera is pointed at); a
 ``hint`` pixel inside the wanted court overrides that.
 
+Lens distortion (ultra-wide lenses, see lens.py) bends the court lines. The
+search above needs straight lines, so it runs on a picture straightened with
+a lens model. With ``lens="auto"`` the model is estimated from the lines
+themselves: a first guess from how well the line pieces join up into long
+straight lines (``coarse_k1``), then a joint fit of homography and lens to
+the line pixels (``refine_lens``). The lens is only kept when the court then
+lies clearly closer to the white lines; otherwise the result is exactly the
+plain homography.
+
 The court is symmetric, so the fit cannot tell left from right or near from
 far. The result follows the convention of ``court.py``: y = 0 is the base line
 nearer to the camera and x = 0 is on the left as the camera sees it.
@@ -35,10 +44,17 @@ import cv2
 import numpy as np
 
 from .court import LENGTH, MARKERS, NET_Y, WIDTH, CourtCalibration, court_lines
+from .lens import Lens, rectify
 
 REF_WIDTH = 1920  # pixel tolerances below are for a frame this wide
 MIN_CONFIDENCE = 0.7
 MIN_LINES = 6  # painted lines that must be found (of 12), at least 2 in each direction
+# A lens estimated from the lines is kept only when it is at least this strong
+# (0.004 = corner pixels move by 0.4 % of the half diagonal, 4 px at 1080p) ...
+MIN_LENS_K = 0.004
+# ... and brings the court lines this much closer to the middle of the white strokes
+# (ratio of mean distances; pixel rounding alone leaves about half a pixel).
+LENS_GAIN = 0.9
 
 
 class AutoCalibrationError(RuntimeError):
@@ -99,9 +115,15 @@ def median_frame(frames: list[np.ndarray], max_shift_px: float = 1.5) -> np.ndar
     return np.median(np.stack(keep), axis=0).astype(np.uint8)
 
 
-def line_mask(frame: np.ndarray) -> np.ndarray:
-    """uint8 mask (0/255) of white structures about as thin as a court line."""
-    scale = frame.shape[1] / REF_WIDTH
+def line_mask(frame: np.ndarray, scale: float | None = None) -> np.ndarray:
+    """uint8 mask (0/255) of white structures about as thin as a court line.
+
+    `scale` (here and below) is the size of the picture relative to one
+    REF_WIDTH wide; the default takes it from the frame's width. A
+    straightened picture is wider than the recording it was made from and
+    passes the recording's scale, since its lines are no thicker.
+    """
+    scale = scale or frame.shape[1] / REF_WIDTH
     white = frame.min(axis=2)  # high only where all of B, G, R are high
     k = int(round(17 * scale)) | 1
     top = cv2.morphologyEx(white, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (max(k, 5),) * 2))
@@ -133,10 +155,10 @@ class ImageLine:
         return np.array([-self.abc[1], self.abc[0]])
 
 
-def detect_lines(mask: np.ndarray, max_lines: int = 60) -> list[ImageLine]:
+def detect_lines(mask: np.ndarray, max_lines: int = 60, scale: float | None = None) -> list[ImageLine]:
     """Long straight lines in the mask, strongest first."""
     h, w = mask.shape
-    scale = w / REF_WIDTH
+    scale = scale or w / REF_WIDTH
     segs = cv2.HoughLinesP(_centre_lines(mask), 1, np.pi / 360, int(40 * scale),
                            minLineLength=50 * scale, maxLineGap=12 * scale)
     if segs is None:
@@ -331,13 +353,16 @@ def _project(Hc: np.ndarray, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return q[..., :2] / safe, w
 
 
-def _overlap(Hc: np.ndarray, dist: np.ndarray, tol: float, use: np.ndarray | None = None) -> dict[str, np.ndarray]:
+def _overlap(Hc: np.ndarray, dist: np.ndarray, tol: float, use: np.ndarray | None = None,
+             valid: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """How well projected court lines lie on the mask, for a stack of homographies.
 
     `dist` is the distance of every pixel to the nearest mask pixel. Samples
     are weighted by the pixel length they stand for, so the result is in
     pixels of line: `on` matched, `off` visible but unmatched. `use` switches
-    individual samples off.
+    individual samples off; `valid` marks the pixels that show anything at
+    all (a straightened picture has empty borders), the rest counts as out of
+    the picture.
     """
     Hc = np.asarray(Hc, dtype=np.float64).reshape(-1, 3, 3)
     h, w = dist.shape
@@ -349,9 +374,11 @@ def _overlap(Hc: np.ndarray, dist: np.ndarray, tol: float, use: np.ndarray | Non
     visible = (depth > 0) & (uv[..., 0] >= 0) & (uv[..., 0] <= w - 1) & (uv[..., 1] >= 0) & (uv[..., 1] <= h - 1)
     if use is not None:
         visible &= use[None]
-    step = np.where(visible, np.minimum(step, 0.05 * w), 0.0)
     ix = np.clip(np.nan_to_num(uv[..., 0]), 0, w - 1).round().astype(np.intp)
     iy = np.clip(np.nan_to_num(uv[..., 1]), 0, h - 1).round().astype(np.intp)
+    if valid is not None:
+        visible &= valid[iy, ix]
+    step = np.where(visible, np.minimum(step, 0.05 * w), 0.0)
     d = dist[iy, ix]
     match = np.clip(1.5 - d / tol, 0, 1)  # full credit within tol/2, none beyond 1.5 tol
     on = (step * match).sum(1)
@@ -433,8 +460,47 @@ def _segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray
     return np.linalg.norm(p - (a + t[:, None] * d), axis=1)
 
 
+def _lm(fn, theta: np.ndarray, wts: np.ndarray, huber: float, iters: int = 12) -> np.ndarray:
+    """Levenberg-Marquardt with Huber weights and a numeric Jacobian.
+
+    `fn(theta)` returns the residuals already multiplied by `wts`; the Huber
+    threshold applies to the unweighted residuals.
+    """
+    n = len(theta)
+    lam = 1e-3
+    for _ in range(iters):
+        r0 = fn(theta)
+        raw = np.abs(r0 / wts)
+        rob = np.sqrt(np.where(raw <= huber, 1.0, huber / np.maximum(raw, 1e-12)))
+        J = np.empty((len(r0), n))
+        for k in range(n):
+            dth = theta.copy()
+            eps = 1e-6 * max(1.0, abs(theta[k]))
+            dth[k] += eps
+            J[:, k] = (fn(dth) - r0) / eps
+        Jw, rw = J * rob[:, None], r0 * rob
+        A, g = Jw.T @ Jw, Jw.T @ rw
+        cost0 = float(rw @ rw)
+        improved = False
+        step = np.zeros(n)
+        for _ in range(8):
+            try:
+                step = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), -g)
+            except np.linalg.LinAlgError:
+                lam *= 10
+                continue
+            r1 = fn(theta + step) * rob
+            if np.isfinite(r1).all() and float(r1 @ r1) < cost0:
+                theta, lam, improved = theta + step, lam / 3, True
+                break
+            lam *= 10
+        if not improved or np.abs(step).max() < 1e-7:
+            break
+    return theta
+
+
 def refine(Hc: np.ndarray, points: np.ndarray, size: tuple[int, int],
-           radii: tuple[float, ...] = (12.0, 8.0, 5.0, 3.0)) -> np.ndarray:
+           radii: tuple[float, ...] = (12.0, 8.0, 5.0, 3.0), scale: float | None = None) -> np.ndarray:
     """Fit the homography to the mask pixels that lie next to the projected lines.
 
     `points` are (x, y) pixels on the centre of the white strokes. Each round
@@ -444,7 +510,7 @@ def refine(Hc: np.ndarray, points: np.ndarray, size: tuple[int, int],
     start can still pull in and the final fit ignores clutter.
     """
     w, h = size
-    scale = w / REF_WIDTH
+    scale = scale or w / REF_WIDTH
     # normalised coordinates keep the 8 parameters at similar magnitudes
     Ti = np.array([[2 / w, 0, -1], [0, 2 / w, -h / w], [0, 0, 1.0]])
     Tc = np.array([[1 / LENGTH, 0, -WIDTH / 2 / LENGTH], [0, 1 / LENGTH, -0.5], [0, 0, 1.0]])
@@ -487,38 +553,128 @@ def refine(Hc: np.ndarray, points: np.ndarray, size: tuple[int, int],
         counts = np.bincount(wh, minlength=len(_SEGMENTS)).astype(np.float64)
         wts = 1.0 / np.sqrt(counts[wh])  # a long near line must not drown out a short far one
         huber = 1.5 * scale * 2 / w
-        lam = 1e-3
-        for _ in range(12):
-            r0 = residuals(theta, pn, wh, wts)
-            raw = np.abs(r0 / wts)
-            rob = np.sqrt(np.where(raw <= huber, 1.0, huber / np.maximum(raw, 1e-12)))
-            J = np.empty((len(r0), 8))
-            for k in range(8):
-                dth = theta.copy()
-                eps = 1e-6 * max(1.0, abs(theta[k]))
-                dth[k] += eps
-                J[:, k] = (residuals(dth, pn, wh, wts) - r0) / eps
-            Jw, rw = J * rob[:, None], r0 * rob
-            A, g = Jw.T @ Jw, Jw.T @ rw
-            cost0 = float(rw @ rw)
-            improved = False
-            for _ in range(8):
-                try:
-                    step = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), -g)
-                except np.linalg.LinAlgError:
-                    lam *= 10
-                    continue
-                r1 = residuals(theta + step, pn, wh, wts) * rob
-                if np.isfinite(r1).all() and float(r1 @ r1) < cost0:
-                    theta, lam, improved = theta + step, lam / 3, True
-                    break
-                lam *= 10
-            if not improved or np.abs(step).max() < 1e-7:
-                break
+        theta = _lm(lambda th: residuals(th, pn, wh, wts), theta, wts, huber)
         moved = _project(np.linalg.inv(Ti) @ to_h(theta) @ Tc, corners)[0] - _project(np.linalg.inv(Ti) @ to_h(before) @ Tc, corners)[0]
         if radius == radii[-1] and np.abs(moved).max() < 0.05:
             break
     return np.linalg.inv(Ti) @ to_h(theta) @ Tc
+
+
+# ---------------------------------------------------------------- lens
+
+def coarse_k1(mask: np.ndarray, max_segments: int = 400) -> tuple[float, float]:
+    """First guess of the lens distortion from the line pieces alone: (k1, gain).
+
+    Short pieces of a bent line are still straight. With the right k1 the
+    pieces of one court line fall on one straight line, so k1 is chosen to
+    make as many pairs of pieces collinear as possible (weighted by length).
+    `gain` is that score relative to k1 = 0; near 1 means the picture gives
+    no reason to assume any distortion.
+    """
+    h, w = mask.shape
+    scale = w / REF_WIDTH
+    segs = cv2.HoughLinesP(_centre_lines(mask), 1, np.pi / 360, int(40 * scale),
+                           minLineLength=50 * scale, maxLineGap=12 * scale)
+    if segs is None or len(segs) < 8:
+        return 0.0, 1.0
+    ends = segs.reshape(-1, 2, 2).astype(np.float64)
+    length = np.linalg.norm(ends[:, 1] - ends[:, 0], axis=1)
+    keep = np.argsort(-length)[:max_segments]
+    ends, length = ends[keep], length[keep]
+    centre, R = np.array([w / 2, h / 2]), np.hypot(w, h) / 2
+    r2 = (np.linalg.norm(ends.mean(1) - centre, axis=1) / R) ** 2
+    weight = length[:, None] * length[None]
+    np.fill_diagonal(weight, 0.0)
+    tol = 2.0 * scale
+
+    def score(k: float) -> float:
+        try:
+            lens = Lens(k)
+        except ValueError:
+            return -np.inf
+        u = lens.undistort(ends.reshape(-1, 2), (w, h)).reshape(-1, 2, 2)
+        d = u[:, 1] - u[:, 0]
+        n = np.stack([-d[:, 1], d[:, 0]], 1) / np.linalg.norm(d, axis=1, keepdims=True)
+        c = -(n * u[:, 0]).sum(1)
+        dist = np.abs(np.einsum("id,jed->ije", n, u) + c[:, None, None]).max(2)
+        dist = dist / (1 + k * r2)[None]  # back to picture pixels, so shrinking the picture gains nothing
+        return float((weight * np.exp(-(dist / tol) ** 2)).sum())
+
+    base = score(0.0)
+    if base <= 0:
+        return 0.0, 1.0
+    grid = np.linspace(-0.2, 0.8, 51)
+    best = grid[int(np.argmax([score(k) for k in grid]))]
+    fine = np.linspace(best - 0.02, best + 0.02, 21)
+    best = fine[int(np.argmax([score(k) for k in fine]))]
+    return float(best), score(best) / base
+
+
+def refine_lens(Hc: np.ndarray, lens: Lens | None, points: np.ndarray, size: tuple[int, int],
+                terms: int = 1, radii: tuple[float, ...] = (8.0, 5.0, 3.0, 3.0)) -> tuple[np.ndarray, Lens]:
+    """Fit homography and lens together to the line pixels of the recorded picture.
+
+    Like `refine`, but the pixels (`points`, in the picture as recorded) are
+    straightened by the lens before their distance to the projected court
+    lines is taken, and the first `terms` lens parameters (k1, k2) move along
+    with the homography; with `terms` = 0 the lens stays as given. `Hc` maps the court to straightened pixels. Straight lines
+    stay straight under any homography, so the bend of the lines determines
+    the lens independently of where the court is.
+    """
+    w, h = size
+    scale = w / REF_WIDTH
+    lens = lens or Lens()
+    Ti = np.array([[2 / w, 0, -1], [0, 2 / w, -h / w], [0, 0, 1.0]])  # picture centre -> origin
+    Tc = np.array([[1 / LENGTH, 0, -WIDTH / 2 / LENGTH], [0, 1 / LENGTH, -0.5], [0, 0, 1.0]])
+    court_lines_h = np.cross(np.c_[_SEGMENTS[:, 0], np.ones(len(_SEGMENTS))], np.c_[_SEGMENTS[:, 1], np.ones(len(_SEGMENTS))])
+    lines_n = court_lines_h @ np.linalg.inv(Tc)
+    Hn = Ti @ Hc @ np.linalg.inv(Tc)
+    if abs(Hn[2, 2]) < 1e-9:
+        return Hc, lens
+    theta = np.concatenate([(Hn / Hn[2, 2]).ravel()[:8], [lens.k1, lens.k2][:terms]])
+    pn_all = (np.c_[points, np.ones(len(points))] @ Ti.T)[:, :2]
+    r2_all = (pn_all ** 2).sum(1) / (1 + (h / w) ** 2)  # (r / half diagonal)^2
+
+    def unpack(th):
+        k = [*th[8:], *[lens.k1, lens.k2][terms:]]
+        return np.append(th[:8], 1.0).reshape(3, 3), float(k[0]), float(k[1])
+
+    def residuals(th, pn, r2, which, wts):
+        Hm, k1, k2 = unpack(th)
+        try:
+            Lens(k1, k2)
+        except ValueError:  # folds the picture: not a lens
+            return np.full(len(pn), np.inf)
+        g = 1 + k1 * r2 + k2 * r2 * r2
+        L = lines_n @ np.linalg.inv(Hm)
+        L = L / np.linalg.norm(L[:, :2], axis=1, keepdims=True)
+        # divided by g: distances in picture pixels, so shrinking the picture gains nothing
+        return ((L[which, :2] * pn).sum(1) + L[which, 2] / g) * wts
+
+    for radius in radii:
+        Hm, k1, k2 = unpack(theta)
+        now = Lens(k1, k2)
+        H_now = np.linalg.inv(Ti) @ Hm @ Tc
+        flat = now.undistort(points, size)
+        ends, depth = _project(H_now, _SEGMENTS.reshape(-1, 2))
+        ends, depth = ends.reshape(-1, 2, 2), depth.reshape(-1, 2)
+        best = np.full(len(points), np.inf)
+        which = np.full(len(points), -1)
+        for i, (a, b) in enumerate(ends):
+            if depth[i].min() <= 0:
+                continue
+            d = _segment_distance(flat, a, b)
+            closer = d < best
+            best[closer], which[closer] = d[closer], i
+        sel = best <= radius * scale
+        if sel.sum() < 30 or len(np.unique(which[sel])) < 4:
+            break
+        pn, r2, wh = pn_all[sel], r2_all[sel], which[sel]
+        counts = np.bincount(wh, minlength=len(_SEGMENTS)).astype(np.float64)
+        wts = 1.0 / np.sqrt(counts[wh])
+        theta = _lm(lambda th: residuals(th, pn, r2, wh, wts), theta, wts, 1.5 * scale * 2 / w, iters=20)
+    Hm, k1, k2 = unpack(theta)
+    return np.linalg.inv(Ti) @ Hm @ Tc, Lens(k1, k2)
 
 
 # ---------------------------------------------------------------- top level
@@ -534,7 +690,7 @@ class AutoCalibration:
     mask: np.ndarray = field(repr=False, default=None)
 
 
-def _summary(Hc: np.ndarray, dist: np.ndarray, tol: float) -> dict:
+def _summary(Hc: np.ndarray, dist: np.ndarray, tol: float, valid: np.ndarray | None = None) -> dict:
     """Final quality numbers for one homography.
 
     Stricter than the ranking score: where two model lines project onto the
@@ -550,7 +706,7 @@ def _summary(Hc: np.ndarray, dist: np.ndarray, tol: float) -> dict:
         if end_depth[i].min() > 0:
             later = _SAMPLE_LINE > i
             own[later] &= _segment_distance(uv[later], a, b) > 2 * tol
-    o = _overlap(Hc, dist, tol, own)
+    o = _overlap(Hc, dist, tol, own, valid)
     lt, lo = o["line_total"][0], o["line_on"][0]
     seen = lt > 20 * tol
     found = seen & (lo >= 0.5 * lt)
@@ -562,8 +718,13 @@ def _summary(Hc: np.ndarray, dist: np.ndarray, tol: float) -> dict:
     }
 
 
-def _marker_points(Hc: np.ndarray, found: np.ndarray) -> dict[str, tuple[float, float]]:
-    """Image positions of the named markers whose two lines were both found."""
+def _marker_points(Hc: np.ndarray, found: np.ndarray, lens: Lens | None = None,
+                   size: tuple[int, int] | None = None) -> dict[str, tuple[float, float]]:
+    """Image positions of the named markers whose two lines were both found.
+
+    `Hc` maps the court to straightened pixels; with a lens the positions are
+    bent back into the recorded picture of `size`.
+    """
     seg_along = {round(float(s[0, 0]), 3) for s, ok in zip(_SEGMENTS[_ALONG], found[_ALONG]) if ok}
     seg_across = {round(float(s[0, 1]), 3) for s, ok in zip(_SEGMENTS[~_ALONG], found[~_ALONG]) if ok}
     names = [n for n, (x, y) in MARKERS.items() if round(x, 3) in seg_along and round(y, 3) in seg_across]
@@ -571,24 +732,37 @@ def _marker_points(Hc: np.ndarray, found: np.ndarray) -> dict[str, tuple[float, 
     if len(names) < 4 or min(len(s) for s in spread) < 2:
         names = [n for n, (_, y) in MARKERS.items() if y != NET_Y]
     uv, _ = _project(Hc, np.array([MARKERS[n] for n in names]))
+    if lens is not None:
+        uv = lens.distort(uv, size)
     return {n: (round(float(u), 2), round(float(v), 2)) for n, (u, v) in zip(names, uv)}
 
 
-def auto_calibrate(frame: np.ndarray, hint: tuple[float, float] | None = None,
-                   refine_top: int = 6) -> AutoCalibration:
-    """Find the court in a frame (BGR). Raises AutoCalibrationError when unsure.
+@dataclass
+class _Found:
+    """A court found in one (downscaled) frame, before it is turned into a calibration."""
 
-    `hint` is a pixel inside the wanted court, for halls with several courts.
-    """
-    full_h, full_w = frame.shape[:2]
-    shrink = min(1.0, REF_WIDTH / full_w)
-    if shrink < 1:
-        frame = cv2.resize(frame, (int(round(full_w * shrink)), int(round(full_h * shrink))), interpolation=cv2.INTER_AREA)
-        hint = (hint[0] * shrink, hint[1] * shrink) if hint else None
+    Hc: np.ndarray  # court -> straightened pixels of the downscaled frame
+    lens: Lens | None
+    summary: dict
+    mean_dist: float  # px of the downscaled frame
+    candidates: int
+    mask: np.ndarray
+
+    @property
+    def ok(self) -> bool:
+        found = self.summary["found"]
+        return bool(self.summary["confidence"] >= MIN_CONFIDENCE and found.sum() >= MIN_LINES
+                    and found[_ALONG].sum() >= 2 and found[~_ALONG].sum() >= 2)
+
+
+def _search(frame: np.ndarray, hint: tuple[float, float] | None, refine_top: int,
+            valid: np.ndarray | None = None, scale: float | None = None) -> tuple[np.ndarray, dict, int, np.ndarray]:
+    """The court in a frame without lens distortion: (court -> image, summary, candidates, mask)."""
     h, w = frame.shape[:2]
-    tol = 3.0 * w / REF_WIDTH
-    mask = line_mask(frame)
-    lines = detect_lines(mask)
+    scale = scale or w / REF_WIDTH
+    tol = 3.0 * scale
+    mask = line_mask(frame, scale)
+    lines = detect_lines(mask, scale=scale)
     families = _families(lines) if len(lines) >= 4 else []
     if len(families) < 2:
         raise AutoCalibrationError("画面里找不到两个方向的球场线")
@@ -616,7 +790,7 @@ def auto_calibrate(frame: np.ndarray, hint: tuple[float, float] | None = None,
     if not cands:
         raise AutoCalibrationError("检测到的线拼不出一个球场")
     cands = np.array(cands)
-    coarse = _overlap(cands, dist, 3 * tol)
+    coarse = _overlap(cands, dist, 3 * tol, valid=valid)
     score = coarse["on"] - 0.5 * coarse["off"]
     score[(coarse["visible"] < 0.25) | ~_plausible(cands, (w, h))] = -np.inf
     if hint is not None:
@@ -639,28 +813,183 @@ def auto_calibrate(frame: np.ndarray, hint: tuple[float, float] | None = None,
         if any(np.abs(c0 - t).max() < 6 * tol for t in tried):  # same court as one already refined
             continue
         tried.append(c0)
-        H1 = _canonical(refine(H0, points, (w, h)))
-        s = _summary(H1, dist, tol)
+        H1 = _canonical(refine(H0, points, (w, h), scale=scale))
+        s = _summary(H1, dist, tol, valid)
         if not _plausible(H1, (w, h))[0]:
             continue
         if best is None or s["score"] > best[1]["score"]:
             best = (H1, s)
     if best is None:
         raise AutoCalibrationError("提示点不在任何找到的球场里" if hint is not None else "检测到的线拼不出一个球场")
-    Hc, s = best
-    found, seen = s["found"], s["seen"]
-    result_ok = (s["confidence"] >= MIN_CONFIDENCE and found.sum() >= MIN_LINES
-                 and found[_ALONG].sum() >= 2 and found[~_ALONG].sum() >= 2)
-    S = np.diag([1 / shrink, 1 / shrink, 1.0])
-    calib = CourtCalibration(_marker_points(S @ Hc, found), (full_w, full_h))
-    res = AutoCalibration(calib, s["confidence"], s["mean_dist"] / shrink, int(found.sum()), int(seen.sum()),
-                          len(cands), mask)
-    if not result_ok:
+    return best[0], best[1], len(cands), mask
+
+
+def _find(frame: np.ndarray, hint: tuple[float, float] | None, lens: Lens | None, refine_top: int) -> _Found:
+    """The court in a frame whose lens is known (None = no distortion)."""
+    flat, A, valid = rectify(frame, lens)
+    if hint is not None and lens is not None:
+        q = np.linalg.solve(A, np.append(lens.undistort([hint], frame.shape[1::-1])[0], 1.0))
+        hint = (float(q[0] / q[2]), float(q[1] / q[2]))
+    Hc, s, n, mask = _search(flat, hint, refine_top, valid, frame.shape[1] / REF_WIDTH)
+    return _Found(A @ Hc, lens, s, s["mean_dist"], n, mask)
+
+
+def _with_lens(frame: np.ndarray, Hc: np.ndarray, lens: Lens | None, candidates: int) -> _Found | None:
+    """Score a court + lens from `refine_lens` the same way as a plain search result."""
+    scale = frame.shape[1] / REF_WIDTH
+    flat, A, valid = rectify(frame, lens)
+    h, w = flat.shape[:2]
+    mask = line_mask(flat, scale)
+    dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
+    points = np.argwhere(_centre_lines(mask) > 0)[:, ::-1].astype(np.float64)
+    if len(points) > 40000:
+        points = points[np.random.default_rng(0).choice(len(points), 40000, replace=False)]
+    H1 = _canonical(refine(_canonical(np.linalg.solve(A, Hc)), points, (w, h), scale=scale))
+    if not _plausible(H1, (w, h))[0]:
+        return None
+    s = _summary(H1, dist, 3.0 * scale, valid)
+    return _Found(A @ H1, lens, s, s["mean_dist"], candidates, mask)
+
+
+def _stroke_distance(f: _Found, points: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Distance of every stroke-centre pixel of the recorded picture to the nearest court line."""
+    flat = points if f.lens is None else f.lens.undistort(points, size)
+    ends, depth = _project(f.Hc, _SEGMENTS.reshape(-1, 2))
+    ends, depth = ends.reshape(-1, 2, 2), depth.reshape(-1, 2)
+    best = np.full(len(points), np.inf)
+    for i, (a, b) in enumerate(ends):
+        if depth[i].min() > 0:
+            best = np.minimum(best, _segment_distance(flat, a, b))
+    return best
+
+
+def _clearly_better(new: _Found, old: _Found | None, points: np.ndarray, size: tuple[int, int]) -> bool:
+    """Is the court with a lens model enough of an improvement to believe the lens?
+
+    Compared on the stroke-centre pixels near the court lines of either fit
+    (the distance to the nearest white pixel, as used for the confidence,
+    hides a bend that is smaller than the stroke is wide).
+    """
+    if old is None or (new.ok and not old.ok):
+        return True
+    # (a half-hidden line may drop just below the "found" mark; more than one is a worse court)
+    if not new.ok or new.summary["found"].sum() < old.summary["found"].sum() - 1:
+        return False
+    if new.summary["confidence"] < old.summary["confidence"] - 0.02:
+        return False
+    r = 6.0 * size[0] / REF_WIDTH
+    d_new, d_old = _stroke_distance(new, points, size), _stroke_distance(old, points, size)
+    near = (d_new < r) | (d_old < r)
+    if near.sum() < 200:
+        return False
+    return float(np.minimum(d_new[near], r).mean()) <= LENS_GAIN * float(np.minimum(d_old[near], r).mean())
+
+
+def _estimate_lens(frame: np.ndarray, plain: _Found | None, hint, refine_top: int, coarse: bool = True) -> _Found | None:
+    """The best court with a lens estimated from the lines, or `plain` when no lens is called for."""
+    h, w = frame.shape[:2]
+    mask = line_mask(frame)
+    points = np.argwhere(_centre_lines(mask) > 0)[:, ::-1].astype(np.float64)
+    if len(points) > 40000:
+        points = points[np.random.default_rng(0).choice(len(points), 40000, replace=False)]
+    starts: list[_Found] = [plain] if plain is not None else []
+    k0, gain = coarse_k1(mask) if coarse else (0.0, 1.0)
+    if abs(k0) >= 0.03 and gain > 1.2:  # visibly bent lines: search again on a straightened picture
+        try:
+            starts.append(_find(frame, hint, Lens(k0), refine_top))
+        except AutoCalibrationError:
+            pass
+    best = bar = plain  # `bar` is what a lens has to beat; without a lens the answer stays `plain` itself
+    if plain is not None:
+        # The same extra fitting without a lens, so that a lens is not credited
+        # with what a few more rounds on the homography alone would have gained.
+        again = _with_lens(frame, refine_lens(plain.Hc, None, points, (w, h), terms=0)[0], None, plain.candidates)
+        if again is not None and again.ok >= plain.ok and again.summary["score"] > plain.summary["score"]:
+            bar = again
+    for start in starts:
+        Hc, lens = refine_lens(start.Hc, start.lens, points, (w, h))
+        if abs(lens.k1) < MIN_LENS_K:
+            continue
+        cand = _with_lens(frame, Hc, lens, start.candidates)
+        if cand is None or not _clearly_better(cand, bar, points, (w, h)):
+            continue
+        best = bar = cand
+        # k2 has to earn its place over k1 alone, the same way k1 did over no lens
+        Hc, lens = refine_lens(Hc, lens, points, (w, h), terms=2)
+        cand = _with_lens(frame, Hc, lens, start.candidates)
+        if cand is not None and _clearly_better(cand, bar, points, (w, h)):
+            best = bar = cand
+    return best
+
+
+def estimate_lens(frame: np.ndarray, calib: CourtCalibration) -> Lens | None:
+    """Lens distortion of a frame whose court is already known roughly (clicked by hand).
+
+    The clicked court tells which white pixels belong to which court line;
+    the lens is then fitted to the bend of those lines. None when the lines
+    are not clearly closer to a court with a lens than to one without, or
+    when the court lines cannot be seen well enough to tell.
+    """
+    full_h, full_w = frame.shape[:2]
+    shrink = min(1.0, REF_WIDTH / full_w)
+    if shrink < 1:
+        frame = cv2.resize(frame, (int(round(full_w * shrink)), int(round(full_h * shrink))), interpolation=cv2.INTER_AREA)
+    h, w = frame.shape[:2]
+    mask = line_mask(frame)
+    dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
+    points = np.argwhere(_centre_lines(mask) > 0)[:, ::-1].astype(np.float64)
+    if len(points) > 40000:
+        points = points[np.random.default_rng(0).choice(len(points), 40000, replace=False)]
+    Hc = _canonical(refine(_canonical(np.diag([shrink, shrink, 1.0]) @ calib.H_inv), points, (w, h)))
+    s = _summary(Hc, dist, 3.0 * w / REF_WIDTH)
+    plain = _Found(Hc, None, s, s["mean_dist"], 1, mask)
+    best = _estimate_lens(frame, plain, None, 0, coarse=False)
+    return best.lens if best.ok else None  # the court could not be seen well: no opinion
+
+
+def auto_calibrate(frame: np.ndarray, hint: tuple[float, float] | None = None,
+                   refine_top: int = 6, lens: Lens | str | None = "auto") -> AutoCalibration:
+    """Find the court in a frame (BGR). Raises AutoCalibrationError when unsure.
+
+    `hint` is a pixel inside the wanted court, for halls with several courts.
+    `lens`: "auto" estimates the lens distortion from the court lines and
+    uses it only when it clearly helps; None assumes there is none; a `Lens`
+    is used as given.
+    """
+    full_h, full_w = frame.shape[:2]
+    shrink = min(1.0, REF_WIDTH / full_w)
+    if shrink < 1:
+        frame = cv2.resize(frame, (int(round(full_w * shrink)), int(round(full_h * shrink))), interpolation=cv2.INTER_AREA)
+        hint = (hint[0] * shrink, hint[1] * shrink) if hint else None
+    if isinstance(lens, str):
+        if lens != "auto":
+            raise ValueError(f"lens 应为 'auto'、None 或 Lens，得到 {lens!r}")
+        plain, failure = None, None
+        try:
+            plain = _find(frame, hint, None, refine_top)
+        except AutoCalibrationError as e:
+            failure = e
+        best = _estimate_lens(frame, plain, hint, refine_top)
+        if best is None:
+            raise failure
+    else:
+        best = _find(frame, hint, lens, refine_top)
+    res = _result(best, shrink, (full_w, full_h))
+    if not best.ok:
+        s = best.summary
         err = AutoCalibrationError(
-            f"结果不可靠（线条重合度 {s['confidence']:.0%}，只对上 {int(found.sum())}/{int(seen.sum())} 条线）")
+            f"结果不可靠（线条重合度 {s['confidence']:.0%}，只对上 {int(s['found'].sum())}/{int(s['seen'].sum())} 条线）")
         err.result = res
         raise err
     return res
+
+
+def _result(f: _Found, shrink: float, full_size: tuple[int, int]) -> AutoCalibration:
+    S = np.diag([1 / shrink, 1 / shrink, 1.0])
+    s = f.summary
+    calib = CourtCalibration(_marker_points(S @ f.Hc, s["found"], f.lens, full_size), full_size, f.lens)
+    return AutoCalibration(calib, s["confidence"], f.mean_dist / shrink, int(s["found"].sum()), int(s["seen"].sum()),
+                           f.candidates, f.mask)
 
 
 def track(frame: np.ndarray, calib: CourtCalibration, min_confidence: float = 0.8) -> AutoCalibration | None:
@@ -675,20 +1004,20 @@ def track(frame: np.ndarray, calib: CourtCalibration, min_confidence: float = 0.
     small = frame
     if shrink < 1:
         small = cv2.resize(frame, (int(round(full_w * shrink)), int(round(full_h * shrink))), interpolation=cv2.INTER_AREA)
-    h, w = small.shape[:2]
-    mask = line_mask(small)
+    scale = small.shape[1] / REF_WIDTH
+    flat, A, valid = rectify(small, calib.lens)  # the lens belongs to the camera: it does not drift
+    h, w = flat.shape[:2]
+    mask = line_mask(flat, scale)
     dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
     points = np.argwhere(_centre_lines(mask) > 0)[:, ::-1].astype(np.float64)
     S = np.diag([shrink, shrink, 1.0])
-    Hc = _canonical(refine(S @ calib.H_inv, points, (w, h)))
-    s = _summary(Hc, dist, 3.0 * w / REF_WIDTH)
+    Hc = _canonical(refine(np.linalg.solve(A, S @ calib.H_inv), points, (w, h), scale=scale))
+    s = _summary(Hc, dist, 3.0 * scale, valid)
     if s["confidence"] >= min_confidence:
-        new = CourtCalibration(_marker_points(np.linalg.inv(S) @ Hc, s["found"]), (full_w, full_h))
-        return AutoCalibration(new, s["confidence"], s["mean_dist"] / shrink, int(s["found"].sum()),
-                               int(s["seen"].sum()), 1, mask)
+        return _result(_Found(A @ Hc, calib.lens, s, s["mean_dist"], 1, mask), shrink, (full_w, full_h))
     centre = calib.to_image(np.array([(WIDTH / 2, LENGTH / 4)]))[0]  # near half: large in the picture
     try:
-        return auto_calibrate(frame, (float(centre[0]), float(centre[1])))
+        return auto_calibrate(frame, (float(centre[0]), float(centre[1])), lens=calib.lens)
     except AutoCalibrationError:
         return None
 
@@ -713,7 +1042,8 @@ def intersection_distance_px(a: CourtCalibration, b: CourtCalibration, in_frame:
 
 def mask_agreement(calib: CourtCalibration, frame: np.ndarray) -> tuple[float, float]:
     """(share of the visible court lines on white pixels, mean distance in px) for any calibration."""
-    mask = line_mask(frame)
+    flat, A, valid = rectify(frame, calib.lens)
+    mask = line_mask(flat, frame.shape[1] / REF_WIDTH)
     dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
-    s = _summary(calib.H_inv, dist, 3.0 * frame.shape[1] / REF_WIDTH)
+    s = _summary(np.linalg.solve(A, calib.H_inv), dist, 3.0 * frame.shape[1] / REF_WIDTH, valid)
     return s["confidence"], s["mean_dist"]

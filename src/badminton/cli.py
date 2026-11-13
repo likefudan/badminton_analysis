@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--hint", help="自动标定时指定要哪片场地：场地内任意一点的像素坐标 x,y（画面里有多片场地时用）")
     s.add_argument("--frames", type=int, default=5, help="自动标定取几帧做中值（去掉走动的人），默认 5；1 = 只用一帧")
     s.add_argument("--every", type=float, help="自动标定后每隔这么多秒再对一次线，报告机位漂移")
+    s.add_argument("--lens", default="auto",
+                   help="镜头畸变（0.5x 超广角会把直线拍弯）：auto = 从球场线估计，只有明显改善时才采用（默认）；"
+                        "none = 不校正；k1 或 k1,k2 = 直接给参数；也可以给同一台手机、同一镜头之前标定出的 court.json，沿用它的镜头参数")
 
     s = sub.add_parser("skeleton", help="第 1 步：输出叠加骨架的视频和每帧的姿态数据")
     s.add_argument("video")
@@ -213,6 +216,7 @@ def cmd_sdr(a) -> int:
 
 def cmd_calibrate(a) -> int:
     import cv2
+    import numpy as np
 
     from .calibrate import click_points, parse_points
     from .court import CourtCalibration
@@ -223,14 +227,27 @@ def cmd_calibrate(a) -> int:
     idx = int(a.time * (info.fps or 30))
     if info.frames:
         idx = min(idx, info.frames - 1)
+    try:
+        lens = _lens_option(a.lens)
+    except ValueError as e:
+        print(e)
+        return 2
     if a.auto:
-        return _calibrate_auto(a, info, idx)
+        return _calibrate_auto(a, info, idx, lens)
     frame = read_frame(a.video, idx)
     points = parse_points(a.points) if a.points else click_points(frame)
     if not points:
         print("已取消")
         return 1
-    calib = CourtCalibration(points, (frame.shape[1], frame.shape[0]))
+    size = (frame.shape[1], frame.shape[0])
+    if lens == "auto":
+        from .autocal import estimate_lens
+
+        try:
+            lens = estimate_lens(frame, CourtCalibration(points, size))
+        except (ValueError, np.linalg.LinAlgError):  # too few or degenerate points: reported below, without a lens
+            lens = None
+    calib = CourtCalibration(points, size, lens)
     out = Path(a.output or Path(a.video).with_suffix(".court.json"))
     calib.save(out)
     preview = frame.copy()
@@ -239,6 +256,7 @@ def cmd_calibrate(a) -> int:
     cv2.imwrite(str(out.with_suffix(".png")), preview)
     print(f"已保存 {out}（预览图 {out.with_suffix('.png')}）")
     print(f"平均重投影误差 {calib.reprojection_error_px:.1f} 像素")
+    _print_lens(calib, a.lens)
     suspect = calib.suspect_point()
     if suspect and calib.reprojection_error_px > 3 and suspect[1] < calib.reprojection_error_px / 2:
         print(f"  {suspect[0]} 可能点偏了：去掉它后其余点的误差降到 {suspect[1]:.1f} 像素，建议重点")
@@ -247,7 +265,37 @@ def cmd_calibrate(a) -> int:
     return 0
 
 
-def _calibrate_auto(a, info, idx: int) -> int:
+def _lens_option(spec: str):
+    """--lens: 'auto', None, or a Lens (from numbers or from another court.json)."""
+    from .lens import parse_lens
+
+    if spec.strip().lower() == "auto":
+        return "auto"
+    if spec.endswith(".json"):
+        from .court import CourtCalibration
+
+        if not Path(spec).exists():
+            raise ValueError(f"找不到 {spec}")
+        return CourtCalibration.load(spec).lens
+    return parse_lens(spec)
+
+
+def _print_lens(calib, spec: str) -> None:
+    import numpy as np
+
+    lens = calib.lens
+    if lens is None:
+        if spec.strip().lower() == "auto":
+            print("镜头畸变：球场线没有明显弯曲，不做校正")
+        return
+    w, h = calib.frame_size
+    corner = float(np.hypot(*(lens.undistort([(0.0, 0.0)], (w, h))[0] - (0.0, 0.0))))
+    how = "从球场线估计" if spec.strip().lower() == "auto" else "按 --lens 给定"
+    print(f"镜头畸变（{how}）：k1={lens.k1:.4f}, k2={lens.k2:.4f}，画面角上的点校正 {corner:.0f} 像素；"
+          f"同一台手机同一镜头的其他视频可以用 --lens {lens.k1:.4f},{lens.k2:.4f} 沿用")
+
+
+def _calibrate_auto(a, info, idx: int, lens="auto") -> int:
     """calibrate --auto: fit the court to the white lines, no clicking."""
     import cv2
     import numpy as np
@@ -268,7 +316,7 @@ def _calibrate_auto(a, info, idx: int) -> int:
     hint = tuple(float(v) for v in a.hint.split(",")) if a.hint else None
     out = Path(a.output or Path(a.video).with_suffix(".court.json"))
     try:
-        res = auto_calibrate(frame, hint)
+        res = auto_calibrate(frame, hint, lens=lens)
     except AutoCalibrationError as e:
         print(f"自动标定失败：{e}")
         bad = getattr(e, "result", None)
@@ -290,6 +338,7 @@ def _calibrate_auto(a, info, idx: int) -> int:
     print(f"已保存 {out}（预览图 {out.with_suffix('.png')}，请看一眼绿线是否压在白线上）")
     print(f"置信度 {res.confidence:.0%}（投影的球场线落在白线上的比例），"
           f"对上 {res.lines_found}/{res.lines_visible} 条线，离白线平均 {res.mean_distance_px:.1f} 像素")
+    _print_lens(calib, a.lens)
     cam_side = calib.to_image(np.array([(0.0, 0.0)]))[0]
     print(f"近端左角在画面 ({cam_side[0]:.0f}, {cam_side[1]:.0f})；如果选错了场地，用 --hint x,y 指定")
     if a.every:
