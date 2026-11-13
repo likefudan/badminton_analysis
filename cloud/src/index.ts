@@ -63,6 +63,13 @@ type VideoRow = {
   annot_updated_at: string | null;
   labels_changed_at: string | null;
   labels_synced_at: string | null;
+  strokes_status: "none" | "queued" | "preparing" | "ready" | "failed";
+  strokes_stage: string;
+  strokes_error: string;
+  strokes_lease_until: string | null;
+  strokes_updated_at: string | null;
+  stroke_labels_changed_at: string | null;
+  stroke_labels_synced_at: string | null;
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -156,7 +163,17 @@ async function describe(env: Env, v: VideoRow) {
   const labelCounts = await env.DB.prepare("SELECT status, COUNT(*) AS n FROM labels WHERE video_id = ? GROUP BY status")
     .bind(v.id)
     .all<{ status: string; n: number }>();
+  const strokeCount = await env.DB.prepare("SELECT COUNT(*) AS n FROM stroke_labels WHERE video_id = ?").bind(v.id).first<{ n: number }>();
   return {
+    strokes: {
+      status: v.strokes_status,
+      stage: v.strokes_stage,
+      error: v.strokes_error,
+      updatedAt: v.strokes_updated_at,
+      labels: strokeCount?.n ?? 0,
+      labelsChangedAt: v.stroke_labels_changed_at,
+      labelsSyncedAt: v.stroke_labels_synced_at,
+    },
     annot: {
       status: v.annot_status,
       stage: v.annot_stage,
@@ -290,7 +307,9 @@ async function deleteVideo(env: Env, id: string): Promise<Response> {
   }
   await deleteResults(env, id);
   await deleteAnnotFiles(env, id);
+  await deletePrefix(env, strokesKey(id, ""));
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM stroke_labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM video_parts WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM videos WHERE id = ?").bind(id),
@@ -375,6 +394,29 @@ async function claimJob(req: Request, env: Env): Promise<Response> {
       .bind(new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), USER_ID, now.toISOString())
       .first<VideoRow>();
     if (a) return json({ video: await describe(env, a), task: "annotate" });
+  }
+  if (tasks.includes("strokes")) {
+    const a = await env.DB.prepare(
+      `UPDATE videos SET strokes_status = 'preparing', strokes_stage = '已领取', strokes_error = '', strokes_lease_until = ?, strokes_updated_at = ?
+       WHERE id = (
+         SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
+           AND (strokes_status = 'queued' OR (strokes_status = 'preparing' AND strokes_lease_until < ?))
+         ORDER BY strokes_updated_at LIMIT 1)
+       RETURNING *`,
+    )
+      .bind(new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), USER_ID, now.toISOString())
+      .first<VideoRow>();
+    if (a) return json({ video: await describe(env, a), task: "strokes" });
+  }
+  if (tasks.includes("stroke-labels")) {
+    const l = await env.DB.prepare(
+      `SELECT * FROM videos WHERE user_id = ? AND stroke_labels_changed_at IS NOT NULL
+         AND (stroke_labels_synced_at IS NULL OR stroke_labels_synced_at < stroke_labels_changed_at) AND stroke_labels_changed_at < ?
+       ORDER BY stroke_labels_changed_at LIMIT 1`,
+    )
+      .bind(USER_ID, new Date(now.getTime() - labelSyncDelay(env)).toISOString())
+      .first<VideoRow>();
+    if (l) return json({ video: await describe(env, l), task: "stroke-labels" });
   }
   if (tasks.includes("labels")) {
     // 停手一分钟后再同步，标注过程中不用每一下都同步
@@ -854,7 +896,10 @@ async function deleteAnnot(env: Env, id: string): Promise<Response> {
 }
 
 async function deleteAnnotFiles(env: Env, id: string): Promise<void> {
-  const prefix = annotKey(id, "");
+  await deletePrefix(env, annotKey(id, ""));
+}
+
+async function deletePrefix(env: Env, prefix: string): Promise<void> {
   for (let cursor: string | undefined; ; ) {
     const list = await env.BUCKET.list({ prefix, cursor });
     if (list.objects.length) await env.BUCKET.delete(list.objects.map((o) => o.key));
@@ -953,6 +998,131 @@ async function labelsSynced(req: Request, env: Env, id: string): Promise<Respons
   return json({ ok: true });
 }
 
+// ---------- 手机上标注击球类型 ----------
+// 网页点「准备击球类型标注」→ Mac 节点跑 badminton strokes，把每一拍前后 1.4 秒剪成一段（一个文件，一段段首尾相接）
+// 传到 strokes/ 下 → 网页逐拍看、选主类型和附加标记 → 存进 stroke_labels → 节点写回 .strokes.labels.csv。
+
+const strokesKey = (id: string, name: string) => `strokes/${USER_ID}/${id}/${name}`;
+const STROKE_TYPES = new Set(["放网", "挡网", "杀球", "点杀", "挑球", "防守挑球", "高远球", "平高球", "平抽", "后场抽平", "吊球",
+  "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知"]);
+const STROKE_TAGS = ["劈杀", "劈吊", "收吊", "搓球", "直线", "对角"];
+
+async function requestStrokes(env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
+  if (v.strokes_status === "preparing") throw new HttpError(409, "Mac 正在准备，稍等");
+  await env.DB.prepare(
+    "UPDATE videos SET strokes_status = 'queued', strokes_stage = '', strokes_error = '', strokes_lease_until = NULL, strokes_updated_at = ? WHERE id = ?",
+  )
+    .bind(new Date().toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+async function deleteStrokes(env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  if (v.strokes_status === "preparing") throw new HttpError(409, "Mac 正在准备，稍等");
+  await deletePrefix(env, strokesKey(id, ""));
+  await env.DB.prepare("UPDATE videos SET strokes_status = 'none', strokes_stage = '', strokes_error = '', strokes_updated_at = ? WHERE id = ?")
+    .bind(new Date().toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+async function updateStrokesJob(req: Request, env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const status = body?.status;
+  if (status !== "preparing" && status !== "ready" && status !== "failed") throw new HttpError(400, "status 不对");
+  if (v.strokes_status !== "preparing") throw new HttpError(409, "这个任务现在不在准备中");
+  const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.strokes_stage;
+  const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
+  const now = new Date();
+  await env.DB.prepare("UPDATE videos SET strokes_status = ?, strokes_stage = ?, strokes_error = ?, strokes_lease_until = ?, strokes_updated_at = ? WHERE id = ?")
+    .bind(status, stage, error, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+const strokesType = (name: string) => (name.endsWith(".json") ? "application/json" : name.endsWith(".mp4") ? "video/mp4" : "application/octet-stream");
+
+async function putStrokesFile(req: Request, env: Env, id: string, name: string): Promise<Response> {
+  await getVideo(env, id);
+  const size = Number(req.headers.get("content-length"));
+  if (!req.body || !Number.isInteger(size) || size <= 0) throw new HttpError(400, "没有内容");
+  const object = await env.BUCKET.put(strokesKey(id, name), req.body, { httpMetadata: { contentType: strokesType(name) } });
+  return json({ name, size: object.size });
+}
+
+type StrokeLabelRow = { frame: number; player_id: string; type: string; tags: string; note: string };
+const strokeLabelJson = (r: StrokeLabelRow) => ({
+  player_id: r.player_id === "" ? null : /^\d+$/.test(r.player_id) ? Number(r.player_id) : r.player_id,
+  type: r.type, tags: r.tags ? r.tags.split(";") : [], note: r.note,
+});
+const csvCell = (v: unknown) => {
+  const t = v === null || v === undefined ? "" : String(v);
+  return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+};
+
+// ?format=csv：网页上直接下载（列和 Mac 上的 .strokes.labels.csv 一样）
+async function getStrokeLabels(env: Env, id: string, url: URL): Promise<Response> {
+  const v = await getVideo(env, id);
+  const rows = await env.DB.prepare("SELECT frame, player_id, type, tags, note FROM stroke_labels WHERE video_id = ? ORDER BY frame")
+    .bind(id)
+    .all<StrokeLabelRow>();
+  if (url.searchParams.get("format") === "csv") {
+    const lines = ["frame,player_id,type,tags,note", ...rows.results.map((r) => [r.frame, r.player_id, r.type, r.tags, r.note].map(csvCell).join(","))];
+    const name = (v.filename.replace(/\.[^.]*$/, "") || "video").replace(/[^A-Za-z0-9._-]/g, "_");
+    return new Response("\ufeff" + lines.join("\r\n") + "\r\n", {
+      headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="${name}.strokes.labels.csv"`, "cache-control": "no-store" },
+    });
+  }
+  return json({ labels: Object.fromEntries(rows.results.map((r) => [r.frame, strokeLabelJson(r)])), changedAt: v.stroke_labels_changed_at });
+}
+
+// items: [{frame, player_id, type, tags: [...], note}] 或 [{frame, delete: true}]。先全部检查。
+async function putStrokeLabels(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
+  const items = Array.isArray(body?.items) ? (body.items as Record<string, unknown>[]) : null;
+  if (!items || !items.length || items.length > MAX_LABEL_ITEMS) throw new HttpError(400, "标注列表不对");
+  const now = new Date().toISOString();
+  const stmts: D1PreparedStatement[] = [];
+  for (const it of items) {
+    const frame = Number(it?.frame);
+    if (!Number.isInteger(frame) || frame < 0 || frame > 10_000_000) throw new HttpError(400, "帧号不对");
+    if (it.delete === true) {
+      stmts.push(env.DB.prepare("DELETE FROM stroke_labels WHERE video_id = ? AND frame = ?").bind(id, frame));
+      continue;
+    }
+    const type = String(it.type ?? "");
+    if (!STROKE_TYPES.has(type)) throw new HttpError(400, "击球类型不对：" + type.slice(0, 20));
+    const tags = Array.isArray(it.tags) ? it.tags.map(String) : [];
+    if (tags.some((t) => !STROKE_TAGS.includes(t))) throw new HttpError(400, "附加标记不对");
+    const ordered = STROKE_TAGS.filter((t) => tags.includes(t)).join(";");
+    const pid = it.player_id === null || it.player_id === undefined ? "" : String(it.player_id).slice(0, 20);
+    const note = typeof it.note === "string" ? it.note.trim().slice(0, 300) : "";
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO stroke_labels (video_id, frame, player_id, type, tags, note, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (video_id, frame) DO UPDATE SET player_id = excluded.player_id, type = excluded.type, tags = excluded.tags,
+           note = excluded.note, updated_at = excluded.updated_at`,
+      ).bind(id, frame, pid, type, ordered, note, now),
+    );
+  }
+  stmts.push(env.DB.prepare("UPDATE videos SET stroke_labels_changed_at = ? WHERE id = ?").bind(now, id));
+  for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));
+  return json({ ok: true, changedAt: now });
+}
+
+async function strokeLabelsSynced(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { changedAt?: unknown } | null;
+  const at = typeof body?.changedAt === "string" ? body.changedAt : new Date(0).toISOString();
+  await env.DB.prepare("UPDATE videos SET stroke_labels_synced_at = ? WHERE id = ?").bind(at, id).run();
+  return json({ ok: true });
+}
+
 async function listVideos(env: Env): Promise<Response> {
   const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .bind(USER_ID)
@@ -1017,6 +1187,25 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (match && m === "PUT") return putLabels(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/labels\/synced$/);
   if (match && m === "POST") return labelsSynced(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/strokes$/);
+  if (match && m === "POST") return requestStrokes(env, match[1]);
+  if (match && m === "DELETE") return deleteStrokes(env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/strokes\/job$/);
+  if (match && m === "POST") return updateStrokesJob(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/strokes\/files\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);
+  if (match && m === "GET") return serveObject(req, env, strokesKey((await getVideo(env, match[1])).id, match[2]));
+  if (match && m === "PUT") return putStrokesFile(req, env, match[1], match[2]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/strokes\/files\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})\/multipart$/);
+  if (match && (m === "POST" || m === "PUT")) {
+    await getVideo(env, match[1]);
+    const name = match[2];
+    return multipart(req, env, strokesKey(match[1], name), strokesType(name), url, async (size) => json({ name, size }));
+  }
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/stroke-labels$/);
+  if (match && m === "GET") return getStrokeLabels(env, match[1], url);
+  if (match && m === "PUT") return putStrokeLabels(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/stroke-labels\/synced$/);
+  if (match && m === "POST") return strokeLabelsSynced(req, env, match[1]);
   throw new HttpError(404, "没有这个接口");
 }
 

@@ -485,7 +485,8 @@ function statusText(v) {
   return "已上传";
 }
 const busy = (v) => v.status === "uploaded" && v.job && (v.job.status === "queued" || v.job.status === "processing");
-const annotBusy = (v) => v.annot && (v.annot.status === "queued" || v.annot.status === "preparing");
+const annotBusy = (v) => (v.annot && (v.annot.status === "queued" || v.annot.status === "preparing")) ||
+  (v.strokes && (v.strokes.status === "queued" || v.strokes.status === "preparing"));
 
 
 // 卡片右下角的小标签：一眼看出这段录像到哪一步了
@@ -675,12 +676,17 @@ function route() {
   const h = location.hash || "#/";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
   const lm = h.match(/^#\/label\/([0-9a-f-]{36})$/);
-  const name = m ? "vDetail" : lm ? "vLabel" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
+  const sm = h.match(/^#\/strokes\/([0-9a-f-]{36})$/);
+  const name = m ? "vDetail" : lm ? "vLabel" : sm ? "vStrokes" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
-  document.querySelector("main").classList.toggle("wide", Boolean(lm));
-  document.body.classList.toggle("labeling", Boolean(lm));
+  document.body.classList.toggle("labeling", Boolean(lm || sm));
+  document.querySelector("main").classList.toggle("wide", Boolean(lm || sm));
   if (m) openDetail(m[1]);
   else closeDetail();
+  if (sm) {
+    $("sBack").href = "#/v/" + sm[1];
+    Strokes.open(sm[1]);
+  } else Strokes.close();
   if (lm) {
     $("lBack").href = "#/v/" + lm[1];
     Label.open(lm[1]);
@@ -1142,6 +1148,31 @@ function renderAnnot(v) {
   $("aClear").hidden = !(a.status === "ready" || a.status === "failed");
   $("aClear").textContent = "删除图片";
   delete $("aClear").dataset.armed;
+
+  const k = v.strokes || { status: "none", labels: 0 };
+  const ks = $("kState");
+  ks.className = k.status === "failed" ? "bad" : "quiet";
+  ks.textContent = {
+    none: ready ? "点「准备击球类型标注」：家里的 Mac 会识别每一拍的类型，再把每拍剪成一小段传上来。" : "这段录像分析完之后才能标注。",
+    queued: nodeOnline() ? "排队中，Mac 马上开始准备" : "排队中。家里的 Mac 现在离线，上线后开始准备",
+    preparing: "Mac 正在准备：" + (k.stage || "开始"),
+    ready: "小视频准备好了" + (k.stage ? "：" + k.stage : "") + "。",
+    failed: "准备失败",
+  }[k.status] || "";
+  $("kError").hidden = !(k.status === "failed" && k.error);
+  $("kError").textContent = k.status === "failed" ? k.error || "" : "";
+  const ksynced = k.labelsChangedAt && k.labelsSyncedAt && k.labelsSyncedAt >= k.labelsChangedAt;
+  $("kCounts").textContent = k.labels ? `已标 ${k.labels} 拍。` + (ksynced ? "已同步到 Mac 上的 .strokes.labels.csv。" : "停手一分钟后会同步到 Mac 上的 .strokes.labels.csv。") : "";
+  $("kOpen").hidden = k.status !== "ready";
+  $("kOpen").href = "#/strokes/" + v.id;
+  $("kOpen").textContent = k.labels ? "接着标注击球类型" : "开始标注击球类型";
+  $("kPrepare").hidden = !(ready && (k.status === "none" || k.status === "failed"));
+  $("kPrepare").textContent = k.status === "failed" ? "重新准备" : "准备击球类型标注";
+  $("kCsv").hidden = !k.labels;
+  $("kCsv").href = `${API}/videos/${v.id}/stroke-labels?format=csv`;
+  $("kClear").hidden = !(k.status === "ready" || k.status === "failed");
+  $("kClear").textContent = "删除小视频";
+  delete $("kClear").dataset.armed;
 }
 
 async function annotAction(path, method, body, done) {
@@ -1150,8 +1181,9 @@ async function annotAction(path, method, body, done) {
     log(done);
   } catch (e) {
     log("标注：" + e.message);
-    $("aError").hidden = false;
-    $("aError").textContent = e.message;
+    const box = $(path.startsWith("/strokes") ? "kError" : "aError");
+    box.hidden = false;
+    box.textContent = e.message;
     return;
   }
   refreshList();
@@ -1159,6 +1191,12 @@ async function annotAction(path, method, body, done) {
 $("aPrepare").onclick = () => annotAction("/annot", "POST", {}, "已请 Mac 准备标注材料");
 // 微调换了权重后：同样这些回合，用新模型重新预测（标注保留），在标注页对比准确率
 $("aFresh").onclick = () => annotAction("/annot", "POST", { fresh: true }, "已请 Mac 用新模型重新预测");
+$("kPrepare").onclick = () => annotAction("/strokes", "POST", {}, "已请 Mac 准备击球类型标注");
+$("kClear").onclick = () => {
+  const btn = $("kClear");
+  if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次：删除小视频（标注保留）"; return; }
+  annotAction("/strokes", "DELETE", null, "击球小视频已删除，标注保留");
+};
 $("aClear").onclick = () => {
   const btn = $("aClear");
   if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次：删除图片（标注保留）"; return; }

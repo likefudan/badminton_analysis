@@ -666,7 +666,7 @@ def result_name(path: Path, stem: str) -> str:
 # least sure about (`badminton annotate-pack`) and uploads them. Labels made on the page come
 # back with the "labels" task and are written next to the recording as <video>.labels.csv.
 
-TASKS = ("process", "annotate", "labels")
+TASKS = ("process", "annotate", "labels", "strokes", "stroke-labels")
 
 
 def local_recording(cfg: Config, video: dict) -> tuple[Path, Path]:
@@ -788,6 +788,110 @@ def sync_labels(api: Api, cfg: Config, video: dict) -> None:
         print(f"  同步标注失败：{e}")
 
 
+# ---------- stroke types on the phone ----------
+# "strokes": `badminton annotate-strokes` cuts a short clip of every hit (the model's type as a
+# start) and uploads it; "stroke-labels": what was labelled on the page is written next to the
+# recording as <video>.strokes.labels.csv (frame,player_id,type,tags,note).
+
+
+def pack_strokes(work: Path, out_dir: Path, court: Path, analysis_dir: Path | None, singles: bool,
+                 on_frames, log: list[str]) -> int:
+    args = ["annotate-strokes", str(work), "-o", str(out_dir), "--court", str(court)]
+    if analysis_dir:
+        args += ["--analysis-dir", str(analysis_dir)]
+    if singles:
+        args.append("--singles")
+    return run_step(args, log, None, on_frames)
+
+
+def prepare_strokes(api: Api, cfg: Config, video: dict, strokes_fn=None) -> None:
+    vid = video["id"]
+    stop = threading.Event()
+    stage = {"text": "开始"}
+
+    def send(status: str, **extra) -> None:
+        api.json("POST", f"/videos/{vid}/strokes/job", {"status": status, "stage": stage["text"], **extra})
+
+    def heartbeat() -> None:
+        while not stop.wait(20):
+            try:
+                send("preparing")
+            except Exception as e:
+                print(f"  汇报进度失败：{e}")
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+    log: list[str] = []
+    try:
+        job_dir, work = local_recording(cfg, video)
+        if not work.exists():
+            raise StepFailed("这台 Mac 上找不到这段录像的原片，没法切视频")
+        court = work.with_suffix(".court.json")
+        if not court.exists():
+            raise StepFailed("这段录像还没有球场标定，先在网站上处理一遍")
+        options = video.get("options") or {}
+        movement = find_rallies(job_dir, work, options)
+        last = {"t": 0.0}
+
+        def on_frames(done: int, total: int, minutes_left: float | None) -> None:
+            if time.time() - last["t"] < 5:
+                return
+            last["t"] = time.time()
+            stage["text"] = f"切每一拍的小视频 {done * 100 // max(total, 1)}%"
+            try:
+                send("preparing")
+            except Exception:
+                pass
+
+        stage["text"] = "识别击球类型、切小视频"
+        send("preparing")
+        out_dir = job_dir / "strokes"
+        analysis_dir = movement.parent if movement else next(
+            (d for d in (job_dir / "analysis", job_dir / "analysis-doubles") if d.is_dir()), None)
+        code = (strokes_fn or pack_strokes)(work, out_dir, court, analysis_dir,
+                                            options.get("mode") != "doubles", on_frames, log)
+        state_file, clip = out_dir / "strokes.state.json", out_dir / "strokes.mp4"
+        if code != 0 or not state_file.exists() or not clip.exists():
+            raise StepFailed("准备击球类型标注失败")
+        state = json.loads(state_file.read_text())
+        stage["text"] = f"上传小视频 {clip.stat().st_size / 1e6:.0f} MB"
+        send("preparing")
+        api.upload_file(f"/videos/{vid}/strokes/files/strokes.mp4", clip, "strokes.mp4")
+        api.upload_file(f"/videos/{vid}/strokes/files/strokes.state.json", state_file, "strokes.state.json")
+        stop.set()
+        n_review = sum(1 for r in state["strokes"] if r.get("needs_review"))
+        stage["text"] = f"{len(state['strokes'])} 拍，其中 {n_review} 拍模型没把握"
+        api.retrying(lambda: send("ready"), "汇报完成")
+        print("  击球类型标注材料已上传：" + stage["text"])
+    except Exception as e:
+        stop.set()
+        detail = str(e) if isinstance(e, StepFailed) else f"{type(e).__name__}: {e}"
+        print(f"  失败：{detail}")
+        try:
+            send("failed", error=(detail + "\n\n" + "\n".join(log[-12:])).strip())
+        except Exception as e2:
+            print(f"  汇报失败状态时出错：{e2}")
+    finally:
+        stop.set()
+
+
+def sync_stroke_labels(api: Api, cfg: Config, video: dict) -> None:
+    vid = video["id"]
+    try:
+        data = api.json("GET", f"/videos/{vid}/stroke-labels")
+        job_dir, work = local_recording(cfg, video)
+        if not job_dir.exists():
+            print(f"  {video['filename']}：这台 Mac 上没有这段录像，击球类型标注先留在网站上")
+        else:
+            from .stroke_pack import write_labels_csv
+
+            out = work.with_name(work.stem + ".strokes.labels.csv")
+            n = write_labels_csv(out, data.get("labels") or {})
+            print(f"{time.strftime('%H:%M:%S')} 击球类型标注已同步到 {out}（{n} 拍）")
+        api.json("POST", f"/videos/{vid}/stroke-labels/synced", {"changedAt": data.get("changedAt")})
+    except Exception as e:
+        print(f"  同步击球类型标注失败：{e}")
+
+
 # ---------- the loop ----------
 
 def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
@@ -885,7 +989,8 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         stop.set()
 
 
-def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=analyse, pack_fn=None) -> int:
+def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=analyse, pack_fn=None,
+        strokes_fn=None) -> int:
     api = Api(cfg)
     try:
         api.json("GET", "/me")
@@ -906,10 +1011,15 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
         video, task = got.get("video"), got.get("task") or "process"
         if video and task == "labels":  # cheap and frequent: no hurry, wait as usual afterwards
             sync_labels(api, cfg, video)
+        elif video and task == "stroke-labels":
+            sync_stroke_labels(api, cfg, video)
         elif video:
             if task == "annotate":
                 print(f"{time.strftime('%H:%M:%S')} 准备标注材料 {video['filename']}（{video['id']}）")
                 prepare_annotation(api, cfg, video, pack_fn)
+            elif task == "strokes":
+                print(f"{time.strftime('%H:%M:%S')} 准备击球类型标注 {video['filename']}（{video['id']}）")
+                prepare_strokes(api, cfg, video, strokes_fn)
             else:
                 print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
                 process(api, cfg, video, analyse_fn)

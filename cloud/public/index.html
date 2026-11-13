@@ -166,6 +166,31 @@
     #lRallies { margin: 8px 0; }
     #lRallies button { padding: 4px 8px; font-size: 12px; }
   }
+  #sVideo { display: block; width: 100%; border-radius: 8px; background: #000; }
+  #sSide h2 { font-size: 13px; color: var(--quiet); font-weight: 400; margin: 10px 0 4px; }
+  .pickgrid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pickgrid button, #sSpeeds button { width: auto; flex: none; padding: 7px 11px; border-radius: 16px; font-size: 14px; font-weight: 400;
+    background: var(--card); color: var(--ink); border: 1px solid var(--line); }
+  .pickgrid button.on, #sSpeeds button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #sNote { margin: 10px 0 4px; }
+  #sModel { margin: 4px 0; font-size: 14px; }
+  #sWhere { margin: 8px 0 0; }
+  @media (orientation: landscape) and (min-width: 600px) and (min-height: 541px) {
+    #sStage { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; align-items: start; }
+  }
+  @media (orientation: landscape) and (max-height: 540px) {
+    #vStrokes { display: grid; grid-template-columns: minmax(0, 58%) minmax(0, 1fr); grid-template-rows: auto auto 1fr; height: 100vh; height: 100dvh; column-gap: 8px; }
+    #vStrokes[hidden] { display: none; }
+    #sStage { display: contents; }
+    #sPic { grid-column: 1; grid-row: 1 / 4; align-self: center; }
+    #sVideo { border-radius: 0; max-height: 100dvh; }
+    #vStrokes .top { grid-column: 2; grid-row: 1; margin: 4px 0 0; min-height: 0; }
+    #vStrokes .top h1 { display: none; }
+    #sMsg { grid-column: 2; grid-row: 2; margin: 0; }
+    #sSide { grid-column: 2; grid-row: 3; overflow-y: auto; min-height: 0; padding: 0 4px 8px 0; }
+    .pickgrid button, #sSpeeds button { padding: 5px 8px; font-size: 13px; }
+    #sSide .lbtns button { padding: 10px 4px; font-size: 14px; }
+  }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -259,6 +284,14 @@
           <a class="pick" id="aOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注</a>
           <div class="row"><button id="aPrepare" hidden>准备标注</button></div>
           <div class="row"><button class="plain" id="aFresh" hidden>用新模型重新预测</button><button class="plain" id="aClear" hidden>删除图片</button></div>
+          <h3 style="margin-top:22px">击球类型</h3>
+          <p class="quiet">每一拍剪成一小段慢放，选它是什么球（杀球、吊球……），再加上劈杀、对角这类标记。已经按模型的判断选好，模型没把握的排在前面。</p>
+          <p id="kState"></p>
+          <p id="kError" class="bad" hidden></p>
+          <div id="kCounts" class="quiet"></div>
+          <a class="pick" id="kOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注击球类型</a>
+          <div class="row"><button id="kPrepare" hidden>准备击球类型标注</button></div>
+          <div class="row"><a class="plain pick" id="kCsv" style="text-decoration:none;background:none;color:var(--accent);border:1px solid var(--line);font-weight:400" hidden>下载 CSV</a><button class="plain" id="kClear" hidden>删除小视频</button></div>
         </div>
         <div id="tProcess" hidden>
           <p id="dError" class="bad" hidden></p>
@@ -309,6 +342,35 @@
       </div>
     </div>
 
+    <!-- 标注击球类型 -->
+    <div class="view" id="vStrokes" hidden>
+      <div class="top"><a id="sBack">‹ 返回</a><h1>标注击球类型</h1><span id="sSave" class="quiet"></span></div>
+      <p class="quiet" id="sMsg"></p>
+      <div id="sStage" hidden>
+        <div id="sPic"><video id="sVideo" playsinline muted preload="auto"></video></div>
+        <div id="sSide">
+          <p class="quiet" id="sWhere"></p>
+          <p id="sModel"></p>
+          <div class="chips" id="sSpeeds"></div>
+          <h2>主类型</h2>
+          <div class="pickgrid" id="sTypes"></div>
+          <h2>附加标记（可多选）</h2>
+          <div class="pickgrid" id="sTags"></div>
+          <h2>击球人</h2>
+          <div class="pickgrid" id="sPlayers"></div>
+          <input type="text" id="sNote" maxlength="300" placeholder="备注（可以不写）">
+          <p class="quiet" id="sState"></p>
+          <div class="lbtns">
+            <button id="sPrev" class="plain">‹ 上一拍</button>
+            <button id="sSave2">保存，下一拍</button>
+            <button id="sNext" class="plain">下一拍 ›</button>
+          </div>
+          <div class="row"><button class="plain" id="sReplay">重播</button><button class="plain" id="sOrder"></button><button class="plain" id="sClear" hidden>清除这拍</button></div>
+          <p class="quiet" style="margin-top:10px">黄框是模型认为的击球人，红边那一帧是击球的瞬间。<a id="sCsv">下载已标的 CSV</a></p>
+        </div>
+      </div>
+    </div>
+
     <!-- 设置 -->
     <div class="view" id="vSettings" hidden>
       <div class="top"><a href="#/">‹ 返回</a><h1>设置</h1></div>
@@ -336,6 +398,7 @@
   </div>
 </main>
 <script src="label.js"></script>
+<script src="stroke.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
