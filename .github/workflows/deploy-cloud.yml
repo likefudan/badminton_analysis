@@ -126,3 +126,8 @@ jobs:
           check "首页" 200 "$SITE/"
           check "未登录 /api/v1/me" 401 "$SITE/api/v1/me"
           check "登录后 /api/v1/me" 200 -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me"
+
+      - name: 线上分片上传检查（传完即删）
+        env:
+          BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
+        run: node test/live-smoke.mjs
