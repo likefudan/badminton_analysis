@@ -169,6 +169,17 @@ def _resolve_dir(tracknet_dir: str | os.PathLike | None) -> Path:
     return d
 
 
+def _load_checkpoint(path: Path) -> dict:
+    import torch
+
+    safe = getattr(torch.serialization, "safe_globals", None)
+    if safe is None:  # torch before 2.5 has no weights_only allow-list
+        return torch.load(path, map_location="cpu")
+    numpy_scalar = [(getattr(np, "_core", None) or np.core).multiarray.scalar, np.dtype, type(np.dtype(np.float64))]
+    with safe(numpy_scalar):
+        return torch.load(path, map_location="cpu")
+
+
 def convert_models(tracknet_dir: str | os.PathLike | None, out_dir: Path = CACHE_DIR) -> tuple[Path, Path]:
     """TrackNetV3 checkpoints -> fp16 Core ML packages (once; needs torch + coremltools)."""
     import coremltools as ct
@@ -180,8 +191,7 @@ def convert_models(tracknet_dir: str | os.PathLike | None, out_dir: Path = CACHE
     for name, shape_fn in (("TrackNet", None), ("InpaintNet", None)):
         # weights_only (safe) by default. A checkpoint written by TrackNetV3's train.py (a
         # fine-tuned one) also holds its best validation accuracy as a numpy scalar.
-        with torch.serialization.safe_globals([(getattr(np, "_core", None) or np.core).multiarray.scalar, np.dtype, type(np.dtype(np.float64))]):
-            ckpt = torch.load(d / "ckpts" / f"{name}_best.pt", map_location="cpu")
+        ckpt = _load_checkpoint(d / "ckpts" / f"{name}_best.pt")
         p = ckpt["param_dict"]
         if name == "TrackNet":
             assert p["bg_mode"] == "concat" and p["seq_len"] == SEQ_LEN, p
