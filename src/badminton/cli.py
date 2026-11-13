@@ -167,6 +167,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--include-unreviewed", action="store_true", help="没人看过的机器预标注也导出（只用来试流程，不要拿来训练）")
     s.add_argument("--full-size", action="store_true", help="帧按视频原始分辨率保存（默认缩到模型输入的 512x288，和推理时完全一样）")
 
+    s = sub.add_parser("annotate-pack", help="为手机网页上的标注准备材料：挑模型最没把握的几个回合，切成图片，连同预测写进一个目录")
+    s.add_argument("video")
+    s.add_argument("-o", "--out-dir", required=True, help="输出目录（rally-<k>.bin 和 state.json）；里面已有 state.json 时沿用上次的回合")
+    s.add_argument("--court", help="球场标定，默认 <视频名>.court.json（有的话）")
+    s.add_argument("--rallies", help="回合列表：badminton movement 生成的 .movement.json；没有就按球出现的时段切")
+    s.add_argument("--count", type=int, default=3, help="挑几个回合（默认 3）")
+    s.add_argument("--fresh", action="store_true", help="不用缓存的预测，重新跑一遍 TrackNetV3（换了权重会自动重跑）")
+    s.add_argument("--tracknet-dir", help="TrackNetV3 文件夹（只在第一次转换模型时需要）")
+
     s = sub.add_parser("review", help="第 4 步：AI 赛后点评（大模型只读程序算出的数字，不看视频）")
     s.add_argument("inputs", nargs="+", metavar="ANALYSIS_JSON", help="movement.json，可再加 positioning.json")
     s.add_argument("--ask", help="追问一个问题（沿用同一份数据和已有的点评）")
@@ -219,8 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
-            "annotate-export": cmd_annotate_export, "positioning": cmd_positioning, "analyze": cmd_analyze,
-            "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes}[a.cmd](a)
+            "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "positioning": cmd_positioning,
+            "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -1054,6 +1063,18 @@ def cmd_annotate(a) -> int:
         store.save()
     c = store.counts()
     print(f"已保存：确认 {c['human']} 帧，批量接受 {c['bulk']} 帧，拿不准 {c['skip']} 帧，机器预标注 {c['machine']} 帧")
+    return 0
+
+
+def cmd_annotate_pack(a) -> int:
+    from .annotate_pack import pack
+    from .pipeline import print_progress
+
+    video = Path(a.video)
+    court = a.court or (video.with_suffix(".court.json") if video.with_suffix(".court.json").exists() else None)
+    state = pack(video, a.out_dir, court, a.rallies, a.fresh, a.count, a.tracknet_dir, print_progress)
+    frames = sum(len(r["offsets"]) for r in state["rallies"])
+    print(f"准备好 {len(state['rallies'])} 个回合、{frames} 帧，放在 {a.out_dir}")
     return 0
 
 

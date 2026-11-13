@@ -56,7 +56,7 @@ before(async () => {
     stdio: "ignore", env: { ...process.env, CI: "1" },
   });
   server = spawn("npx", ["wrangler", "dev", "--local", "--port", String(PORT), "--persist-to", state,
-    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key",
+    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "NODE_TOKEN:node-key", "--var", "LABEL_SYNC_DELAY_S:0",
     "--var", "AI_API_KEY:test-ai-key", "--var", `AI_ENDPOINT_ANTHROPIC:http://127.0.0.1:${AI_PORT}/anthropic`,
     "--var", `AI_ENDPOINT_OPENAI:http://127.0.0.1:${AI_PORT}/openai`, "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
   for (let i = 0; i < 120; i++) {
@@ -337,4 +337,93 @@ test("AI 报告：网站拿节点传上来的统计摘要去问模型，存成�
   const claude = info.usage.find((x) => x.model === "claude-sonnet-5-5");
   assert.deepEqual([claude.calls, claude.inputTokens, claude.outputTokens, claude.unpricedCalls], [3, 3000, 1500, 0]);
   assert.ok(Math.abs(claude.costUsd - (0.007 + 2 * (1000 * 3 + 500 * 15) / 1e6)) < 1e-9);
+});
+
+test("标注：网页请求、节点领取切图任务、传图、网页按 Range 读帧、存标注、节点同步", async () => {
+  const json = { "content-type": "application/json" };
+  const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
+  const tasks = ["annotate", "labels"]; // 不领分析任务，别的测试留下的排队录像不影响这里
+  const data = randomBytes(1000);
+  const v = await (await post("/videos", { filename: "label.mp4", size: data.length, contentType: "video/mp4" })).json();
+  await call(`/videos/${v.id}/parts/1`, { method: "PUT", body: data });
+  await post(`/videos/${v.id}/complete`);
+  let st = await (await call(`/videos/${v.id}`)).json();
+  assert.equal(st.annot.status, "none");
+  assert.deepEqual(st.annot.labels, {});
+
+  // 旧节点（不带 tasks）领不到标注任务
+  assert.equal((await post(`/videos/${v.id}/annot`, { fresh: true })).status, 200);
+  const old = await (await post("/node/claim", { node: "old-mac" })).json();
+  assert.ok(!old.video || old.task === "process");
+  if (old.video) await post(`/videos/${old.video.id}/job`, { status: "done" });
+
+  const got = await (await post("/node/claim", { node: "mac", tasks })).json();
+  assert.equal(got.task, "annotate");
+  assert.equal(got.video.id, v.id);
+  assert.equal(got.video.annot.status, "preparing");
+  assert.deepEqual(got.video.annot.options, { fresh: true });
+  assert.equal((await (await post("/node/claim", { node: "mac", tasks })).json()).video, null);
+  assert.equal((await post(`/videos/${v.id}/annot`)).status, 409); // 准备中不能再请求
+
+  // 传图：小文件直接传，大文件分片
+  const pack = randomBytes(5 * 1024 * 1024 + 300);
+  const base = `/videos/${v.id}/annot/files/rally-0.bin`;
+  const { uploadId } = await (await post(base + "/multipart")).json();
+  const q = `uploadId=${encodeURIComponent(uploadId)}`;
+  const parts = [];
+  for (const [i, body] of [pack.subarray(0, 5 * 1024 * 1024), pack.subarray(5 * 1024 * 1024)].entries()) {
+    parts.push(await (await call(`${base}/multipart?${q}&part=${i + 1}`, { method: "PUT", body })).json());
+  }
+  assert.equal((await post(`${base}/multipart?${q}`, { parts })).status, 200);
+  const state = { rallies: [{ start: 10, end: 12, pack: "rally-0.bin", offsets: [[0, 100], [100, 100], [200, 100]] }] };
+  assert.equal((await call(`/videos/${v.id}/annot/files/state.json`, { method: "PUT", body: JSON.stringify(state) })).status, 200);
+  st = await (await post(`/videos/${v.id}/annot/job`, { status: "preparing", stage: "上传图片" })).json();
+  assert.equal(st.annot.stage, "上传图片");
+  st = await (await post(`/videos/${v.id}/annot/job`, { status: "ready", stage: "1 个回合，3 帧" })).json();
+  assert.equal(st.annot.status, "ready");
+  assert.equal((await post(`/videos/${v.id}/annot/job`, { status: "preparing" })).status, 409);
+
+  // 网页读 state.json 和一段帧
+  assert.deepEqual(await (await call(`/videos/${v.id}/annot/files/state.json`)).json(), state);
+  const part = await call(base, { headers: { range: "bytes=100-299" } });
+  assert.equal(part.status, 206);
+  assert.deepEqual(Buffer.from(await part.arrayBuffer()), pack.subarray(100, 300));
+  assert.equal((await call(`/videos/${v.id}/annot/files/missing.bin`)).status, 404);
+
+  // 存标注：一条不对就整批不写
+  const put = (items) => call(`/videos/${v.id}/labels`, { method: "PUT", headers: json, body: JSON.stringify({ items }) });
+  assert.equal((await put([{ frame: 10, visibility: 1, x: 5, y: 6, status: "machine" }])).status, 400);
+  assert.equal((await put([{ frame: 10, visibility: 1, x: 5, y: 6 }, { frame: -1, visibility: 0 }])).status, 400);
+  assert.equal((await put([{ frame: 10, visibility: 1, x: -5, y: 6 }])).status, 400);
+  assert.equal((await put([])).status, 400);
+  let res = await put([
+    { frame: 10, visibility: 1, x: 100.25, y: 50.5, status: "human" },
+    { frame: 11, visibility: 1, x: 7, y: 8, status: "skip" },   // 看不清：不管给了什么都是没球、0,0
+    { frame: 12, visibility: 0, x: 9, y: 9, status: "bulk" },
+  ]);
+  assert.equal(res.status, 200);
+  res = await put([{ frame: 12, delete: true }, { frame: 10, visibility: 1, x: 101, y: 50, status: "human" }]);
+  const { changedAt } = await res.json();
+  const labels = await (await call(`/videos/${v.id}/labels`)).json();
+  assert.deepEqual(labels.labels, { 10: [1, 101, 50, "human"], 11: [0, 0, 0, "skip"] });
+  assert.equal(labels.changedAt, changedAt);
+  st = await (await call(`/videos/${v.id}`)).json();
+  assert.deepEqual(st.annot.labels, { human: 1, skip: 1 });
+
+  // 节点同步标注，同步完就不再领到
+  await new Promise((r) => setTimeout(r, 20));
+  const sync = await (await post("/node/claim", { node: "mac", tasks })).json();
+  assert.equal(sync.task, "labels");
+  assert.equal(sync.video.id, v.id);
+  assert.equal((await post(`/videos/${v.id}/labels/synced`, { changedAt })).status, 200);
+  assert.equal((await (await post("/node/claim", { node: "mac", tasks })).json()).video, null);
+  st = await (await call(`/videos/${v.id}`)).json();
+  assert.equal(st.annot.labelsSyncedAt, changedAt);
+
+  // 删图片，标注留着；删录像，全部清掉
+  assert.equal((await call(`/videos/${v.id}/annot`, { method: "DELETE" })).status, 200);
+  assert.equal((await call(`/videos/${v.id}/annot/files/state.json`)).status, 404);
+  assert.deepEqual((await (await call(`/videos/${v.id}/labels`)).json()).labels, labels.labels);
+  assert.equal((await call(`/videos/${v.id}`, { method: "DELETE" })).status, 200);
+  assert.equal((await call(`/videos/${v.id}/labels`)).status, 404);
 });

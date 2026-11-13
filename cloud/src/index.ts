@@ -13,6 +13,7 @@ export interface Env {
   AI_ENDPOINT_ANTHROPIC?: string; // Claude 走的地址（后面补 /v1/messages），默认 https://api.anthropic.com
   AI_ENDPOINT_OPENAI?: string; // 其它模型走的地址（后面补 /chat/completions）
   AI_MODELS?: string; // 可选：JSON 数组 [{id, label, format}]，替换内置的模型列表
+  LABEL_SYNC_DELAY_S?: string;
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -27,6 +28,8 @@ const USER_ID = "owner"; // 第一版只有一个用户
 const LEASE_MS = 10 * 60 * 1000;        // 处理节点这么久没有消息，任务可以被重新领取
 const KEEP_RESULT_BYTES = 10 * 1024 ** 3; // 云端只留最近这么多结果，更早的只在 Mac 上
 const SESSION_COOKIE = "ba_session";
+// 网页上停手这么久（默认 60 秒）后，Mac 节点把标注同步回去；测试里设成 0
+const labelSyncDelay = (env: Env) => (env.LABEL_SYNC_DELAY_S !== undefined && env.LABEL_SYNC_DELAY_S !== "" ? Number(env.LABEL_SYNC_DELAY_S) : 60) * 1000;
 
 type VideoRow = {
   id: string;
@@ -52,6 +55,14 @@ type VideoRow = {
   job_progress: string;
   job_started_at: string | null;
   title: string;
+  annot_status: "none" | "queued" | "preparing" | "ready" | "failed";
+  annot_stage: string;
+  annot_error: string;
+  annot_options: string;
+  annot_lease_until: string | null;
+  annot_updated_at: string | null;
+  labels_changed_at: string | null;
+  labels_synced_at: string | null;
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -142,7 +153,20 @@ async function describe(env: Env, v: VideoRow) {
   )
     .bind(v.id)
     .all<UsageRow>();
+  const labelCounts = await env.DB.prepare("SELECT status, COUNT(*) AS n FROM labels WHERE video_id = ? GROUP BY status")
+    .bind(v.id)
+    .all<{ status: string; n: number }>();
   return {
+    annot: {
+      status: v.annot_status,
+      stage: v.annot_stage,
+      error: v.annot_error,
+      options: JSON.parse(v.annot_options || "{}"),
+      updatedAt: v.annot_updated_at,
+      labels: Object.fromEntries(labelCounts.results.map((c) => [c.status, c.n])),
+      labelsChangedAt: v.labels_changed_at,
+      labelsSyncedAt: v.labels_synced_at,
+    },
     ai: usage.results.reverse().map(usageJson),
     job: {
       status: v.job_status,
@@ -265,7 +289,9 @@ async function deleteVideo(env: Env, id: string): Promise<Response> {
     await env.BUCKET.delete(v.r2_key);
   }
   await deleteResults(env, id);
+  await deleteAnnotFiles(env, id);
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM video_parts WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM videos WHERE id = ?").bind(id),
   ]);
@@ -318,20 +344,50 @@ async function nodeSeen(env: Env, name: string, now: Date): Promise<void> {
 async function claimJob(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const node = typeof body?.node === "string" ? body.node.slice(0, 80) : "node";
+  // 新的节点会说自己能做哪些事；旧节点不说，只给它分析任务
+  const tasks = Array.isArray(body?.tasks) ? (body.tasks as unknown[]) : ["process"];
   const now = new Date();
-  const row = await env.DB.prepare(
-    `UPDATE videos SET job_status = 'processing', job_stage = '已领取', job_error = '', job_progress = '', job_node = ?,
-       job_lease_until = ?, job_updated_at = ?, job_started_at = ?
-     WHERE id = (
-       SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
-         AND (job_status = 'queued' OR (job_status = 'processing' AND job_lease_until < ?))
-       ORDER BY completed_at LIMIT 1)
-     RETURNING *`,
-  )
-    .bind(node, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), now.toISOString(), USER_ID, now.toISOString())
-    .first<VideoRow>();
   await nodeSeen(env, node, now);
-  return json({ video: row ? await describe(env, row) : null });
+  if (tasks.includes("process")) {
+    const row = await env.DB.prepare(
+      `UPDATE videos SET job_status = 'processing', job_stage = '已领取', job_error = '', job_progress = '', job_node = ?,
+         job_lease_until = ?, job_updated_at = ?, job_started_at = ?
+       WHERE id = (
+         SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
+           AND (job_status = 'queued' OR (job_status = 'processing' AND job_lease_until < ?))
+         ORDER BY completed_at LIMIT 1)
+       RETURNING *`,
+    )
+      .bind(node, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), now.toISOString(), USER_ID, now.toISOString())
+      .first<VideoRow>();
+    if (row) return json({ video: await describe(env, row), task: "process" });
+  }
+  // 没有录像要分析时：先切标注用的图，再把网页上的标注同步回 Mac
+  if (tasks.includes("annotate")) {
+    const a = await env.DB.prepare(
+      `UPDATE videos SET annot_status = 'preparing', annot_stage = '已领取', annot_error = '', annot_lease_until = ?, annot_updated_at = ?
+       WHERE id = (
+         SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
+           AND (annot_status = 'queued' OR (annot_status = 'preparing' AND annot_lease_until < ?))
+         ORDER BY annot_updated_at LIMIT 1)
+       RETURNING *`,
+    )
+      .bind(new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), USER_ID, now.toISOString())
+      .first<VideoRow>();
+    if (a) return json({ video: await describe(env, a), task: "annotate" });
+  }
+  if (tasks.includes("labels")) {
+    // 停手一分钟后再同步，标注过程中不用每一下都同步
+    const l = await env.DB.prepare(
+      `SELECT * FROM videos WHERE user_id = ? AND labels_changed_at IS NOT NULL
+         AND (labels_synced_at IS NULL OR labels_synced_at < labels_changed_at) AND labels_changed_at < ?
+       ORDER BY labels_changed_at LIMIT 1`,
+    )
+      .bind(USER_ID, new Date(now.getTime() - labelSyncDelay(env)).toISOString())
+      .first<VideoRow>();
+    if (l) return json({ video: await describe(env, l), task: "labels" });
+  }
+  return json({ video: null });
 }
 
 // 节点汇报进度（同时续租）或结束任务。
@@ -416,10 +472,13 @@ async function putResult(req: Request, env: Env, id: string, name: string): Prom
 // 大的结果文件（视频）分片传。uploadId 和各片的 etag 由节点自己记着，服务器不存状态。
 async function resultMultipart(req: Request, env: Env, id: string, name: string, url: URL): Promise<Response> {
   await getVideo(env, id);
-  const key = resultKey(id, name);
+  return multipart(req, env, resultKey(id, name), resultType(name), url, (size) => recordResult(env, id, name, size));
+}
+
+async function multipart(req: Request, env: Env, key: string, contentType: string, url: URL, done: (size: number) => Promise<Response>): Promise<Response> {
   const uploadId = url.searchParams.get("uploadId");
   if (req.method === "POST" && !uploadId) {
-    const upload = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType: resultType(name) } });
+    const upload = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType } });
     return json({ uploadId: upload.uploadId }, 201);
   }
   if (!uploadId) throw new HttpError(400, "缺少 uploadId");
@@ -433,7 +492,7 @@ async function resultMultipart(req: Request, env: Env, id: string, name: string,
   const body = (await req.json().catch(() => null)) as { parts?: { partNumber: number; etag: string }[] } | null;
   if (!body?.parts?.length) throw new HttpError(400, "缺少分片列表");
   const object = await upload.complete(body.parts);
-  return recordResult(env, id, name, object.size);
+  return done(object.size);
 }
 
 async function getResult(req: Request, env: Env, id: string, name: string): Promise<Response> {
@@ -761,6 +820,139 @@ async function enforceRetention(env: Env): Promise<void> {
   }
 }
 
+// ---------- 手机上标注球的位置 ----------
+// 网页点「标注球位置」→ Mac 节点挑模型最没把握的几个回合、切成图片（每个回合一个文件，state.json 记每帧的起止位置
+// 和模型的预测）传到 annot/ 下 → 网页按 Range 一次取几帧 → 每标一帧存进 labels 表 → 节点同步回 .labels.csv。
+
+const annotKey = (id: string, name: string) => `annot/${USER_ID}/${id}/${name}`;
+const LABEL_STATUSES = new Set(["human", "bulk", "skip"]); // 网页只写人看过的；machine 只在 Mac 上
+const MAX_LABEL_ITEMS = 5000;
+
+async function requestAnnot(req: Request, env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
+  if (v.annot_status === "preparing") throw new HttpError(409, "Mac 正在准备，稍等");
+  const body = (await req.json().catch(() => null)) as { fresh?: unknown } | null;
+  const options = JSON.stringify({ fresh: body?.fresh === true });
+  await env.DB.prepare(
+    "UPDATE videos SET annot_status = 'queued', annot_stage = '', annot_error = '', annot_options = ?, annot_lease_until = NULL, annot_updated_at = ? WHERE id = ?",
+  )
+    .bind(options, new Date().toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+// 删掉切好的图（标注本身留着）
+async function deleteAnnot(env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  if (v.annot_status === "preparing") throw new HttpError(409, "Mac 正在准备，稍等");
+  await deleteAnnotFiles(env, id);
+  await env.DB.prepare("UPDATE videos SET annot_status = 'none', annot_stage = '', annot_error = '', annot_updated_at = ? WHERE id = ?")
+    .bind(new Date().toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+async function deleteAnnotFiles(env: Env, id: string): Promise<void> {
+  const prefix = annotKey(id, "");
+  for (let cursor: string | undefined; ; ) {
+    const list = await env.BUCKET.list({ prefix, cursor });
+    if (list.objects.length) await env.BUCKET.delete(list.objects.map((o) => o.key));
+    if (!list.truncated) break;
+    cursor = list.cursor;
+  }
+}
+
+// 节点汇报准备进度（同时续租），或以 ready / failed 结束
+async function updateAnnotJob(req: Request, env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const status = body?.status;
+  if (status !== "preparing" && status !== "ready" && status !== "failed") throw new HttpError(400, "status 不对");
+  if (v.annot_status !== "preparing") throw new HttpError(409, "这个标注任务现在不在准备中");
+  const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.annot_stage;
+  const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
+  const now = new Date();
+  await env.DB.prepare("UPDATE videos SET annot_status = ?, annot_stage = ?, annot_error = ?, annot_lease_until = ?, annot_updated_at = ? WHERE id = ?")
+    .bind(status, stage, error, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), id)
+    .run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+const annotType = (name: string) => (name.endsWith(".json") ? "application/json" : "application/octet-stream");
+
+async function putAnnotFile(req: Request, env: Env, id: string, name: string): Promise<Response> {
+  await getVideo(env, id);
+  const size = Number(req.headers.get("content-length"));
+  if (!req.body || !Number.isInteger(size) || size <= 0) throw new HttpError(400, "没有内容");
+  const object = await env.BUCKET.put(annotKey(id, name), req.body, { httpMetadata: { contentType: annotType(name) } });
+  return json({ name, size: object.size });
+}
+
+async function annotMultipart(req: Request, env: Env, id: string, name: string, url: URL): Promise<Response> {
+  await getVideo(env, id);
+  return multipart(req, env, annotKey(id, name), annotType(name), url, async (size) => json({ name, size }));
+}
+
+async function getAnnotFile(req: Request, env: Env, id: string, name: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  return serveObject(req, env, annotKey(v.id, name));
+}
+
+async function getLabels(env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  const rows = await env.DB.prepare("SELECT frame, visibility, x, y, status FROM labels WHERE video_id = ? ORDER BY frame")
+    .bind(id)
+    .all<{ frame: number; visibility: number; x: number; y: number; status: string }>();
+  return json({
+    labels: Object.fromEntries(rows.results.map((r) => [r.frame, [r.visibility, r.x, r.y, r.status]])),
+    changedAt: v.labels_changed_at,
+  });
+}
+
+// items: [{frame, visibility, x, y, status}] 或 [{frame, delete: true}]。先全部检查，有一条不对就一条都不写。
+async function putLabels(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
+  const items = Array.isArray(body?.items) ? (body.items as Record<string, unknown>[]) : null;
+  if (!items || !items.length || items.length > MAX_LABEL_ITEMS) throw new HttpError(400, "标注列表不对");
+  const now = new Date().toISOString();
+  const stmts: D1PreparedStatement[] = [];
+  for (const it of items) {
+    const frame = Number(it?.frame);
+    if (!Number.isInteger(frame) || frame < 0 || frame > 10_000_000) throw new HttpError(400, "帧号不对");
+    if (it.delete === true) {
+      stmts.push(env.DB.prepare("DELETE FROM labels WHERE video_id = ? AND frame = ?").bind(id, frame));
+      continue;
+    }
+    const status = String(it.status ?? "human");
+    if (!LABEL_STATUSES.has(status)) throw new HttpError(400, "标注状态不对：" + status.slice(0, 20));
+    const visible = status !== "skip" && Boolean(it.visibility);
+    const x = visible ? Number(it.x) : 0;
+    const y = visible ? Number(it.y) : 0;
+    if (!isFinite(x) || !isFinite(y) || x < 0 || y < 0 || x > 20000 || y > 20000) throw new HttpError(400, "位置不对");
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO labels (video_id, frame, visibility, x, y, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (video_id, frame) DO UPDATE SET visibility = excluded.visibility, x = excluded.x, y = excluded.y,
+           status = excluded.status, updated_at = excluded.updated_at`,
+      ).bind(id, frame, visible ? 1 : 0, Math.round(x * 100) / 100, Math.round(y * 100) / 100, status, now),
+    );
+  }
+  stmts.push(env.DB.prepare("UPDATE videos SET labels_changed_at = ? WHERE id = ?").bind(now, id));
+  for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));
+  return json({ ok: true, changedAt: now });
+}
+
+// 节点同步完：记下同步到了哪一次改动（同步期间又有新改动的话，下次再同步）
+async function labelsSynced(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { changedAt?: unknown } | null;
+  const at = typeof body?.changedAt === "string" ? body.changedAt : new Date(0).toISOString();
+  await env.DB.prepare("UPDATE videos SET labels_synced_at = ? WHERE id = ?").bind(at, id).run();
+  return json({ ok: true });
+}
+
 async function listVideos(env: Env): Promise<Response> {
   const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .bind(USER_ID)
@@ -810,6 +1002,21 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (match && m === "PUT") return putResult(req, env, match[1], match[2]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/results\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})\/multipart$/);
   if (match && (m === "POST" || m === "PUT")) return resultMultipart(req, env, match[1], match[2], url);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/annot$/);
+  if (match && m === "POST") return requestAnnot(req, env, match[1]);
+  if (match && m === "DELETE") return deleteAnnot(env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/annot\/job$/);
+  if (match && m === "POST") return updateAnnotJob(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/annot\/files\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);
+  if (match && m === "GET") return getAnnotFile(req, env, match[1], match[2]);
+  if (match && m === "PUT") return putAnnotFile(req, env, match[1], match[2]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/annot\/files\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})\/multipart$/);
+  if (match && (m === "POST" || m === "PUT")) return annotMultipart(req, env, match[1], match[2], url);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/labels$/);
+  if (match && m === "GET") return getLabels(env, match[1]);
+  if (match && m === "PUT") return putLabels(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/labels\/synced$/);
+  if (match && m === "POST") return labelsSynced(req, env, match[1]);
   throw new HttpError(404, "没有这个接口");
 }
 

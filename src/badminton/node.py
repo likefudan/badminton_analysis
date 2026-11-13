@@ -161,8 +161,10 @@ class Api:
     # ---- results ----
 
     def upload_result(self, video_id: str, path: Path, name: str) -> None:
+        self.upload_file(f"/videos/{video_id}/results/{name}", path, name)
+
+    def upload_file(self, base: str, path: Path, name: str) -> None:
         size = path.stat().st_size
-        base = f"/videos/{video_id}/results/{name}"
         if size <= SINGLE_PUT_LIMIT:
             data = path.read_bytes()
             self.retrying(lambda: self.request("PUT", base, data, {"content-type": "application/octet-stream"},
@@ -659,6 +661,133 @@ def result_name(path: Path, stem: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
 
 
+# ---------- shuttle labelling on the phone ----------
+# The page asks for frames to label ("annotate" task): the node packs the rallies the model is
+# least sure about (`badminton annotate-pack`) and uploads them. Labels made on the page come
+# back with the "labels" task and are written next to the recording as <video>.labels.csv.
+
+TASKS = ("process", "annotate", "labels")
+
+
+def local_recording(cfg: Config, video: dict) -> tuple[Path, Path]:
+    """(job dir, the video the analysis ran on): the SDR copy of an HDR recording, else the original."""
+    job_dir = cfg.work_dir / video["id"]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", video["filename"]) or "video.mov"
+    local = job_dir / safe
+    sdr = local.with_name(local.stem + "_sdr.mp4")
+    return job_dir, sdr if sdr.exists() else local
+
+
+def find_rallies(job_dir: Path, work: Path, options: dict) -> Path | None:
+    first = "analysis-doubles" if options.get("mode") == "doubles" else "analysis"
+    for d in (first, "analysis", "analysis-doubles"):
+        p = job_dir / d / f"{work.stem}.movement.json"
+        if p.exists():
+            return p
+    return None
+
+
+def pack_annotation(work: Path, out_dir: Path, court: Path | None, movement: Path | None, fresh: bool,
+                    on_frames, log: list[str]) -> int:
+    args = ["annotate-pack", str(work), "-o", str(out_dir)]
+    if court:
+        args += ["--court", str(court)]
+    if movement:
+        args += ["--rallies", str(movement)]
+    if fresh:
+        args.append("--fresh")
+    return run_step(args, log, None, on_frames)
+
+
+def prepare_annotation(api: Api, cfg: Config, video: dict, pack_fn=None) -> None:
+    vid = video["id"]
+    annot = video.get("annot") or {}
+    stop = threading.Event()
+    stage = {"text": "开始"}
+
+    def send(status: str, **extra) -> None:
+        api.json("POST", f"/videos/{vid}/annot/job", {"status": status, "stage": stage["text"], **extra})
+
+    def heartbeat() -> None:
+        while not stop.wait(20):
+            try:
+                send("preparing")
+            except Exception as e:
+                print(f"  汇报进度失败：{e}")
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+    log: list[str] = []
+    try:
+        job_dir, work = local_recording(cfg, video)
+        if not work.exists():
+            raise StepFailed("这台 Mac 上找不到这段录像的原片，没法切图")
+        court = work.with_suffix(".court.json")
+        out_dir = job_dir / "annotate"
+        last = {"t": 0.0}
+
+        def on_frames(done: int, total: int, minutes_left: float | None) -> None:
+            if time.time() - last["t"] < 5:
+                return
+            last["t"] = time.time()
+            stage["text"] = f"逐帧找球 {done * 100 // max(total, 1)}%" + (f"，还要约 {minutes_left:.0f} 分钟" if minutes_left else "")
+            try:
+                send("preparing")
+            except Exception:
+                pass
+
+        stage["text"] = "找球、挑回合、切图"
+        send("preparing")
+        code = (pack_fn or pack_annotation)(work, out_dir, court if court.exists() else None,
+                                            find_rallies(job_dir, work, video.get("options") or {}),
+                                            bool((annot.get("options") or {}).get("fresh")), on_frames, log)
+        state_file = out_dir / "state.json"
+        if code != 0 or not state_file.exists():
+            raise StepFailed("切图失败")
+        state = json.loads(state_file.read_text())
+        packs = [out_dir / r["pack"] for r in state["rallies"]]
+        total = sum(p.stat().st_size for p in packs)
+        sent = 0
+        for p in packs:  # the frames first, state.json last: the page only sees a complete set
+            stage["text"] = f"上传图片 {sent / 1e6:.0f} / {total / 1e6:.0f} MB"
+            send("preparing")
+            api.upload_file(f"/videos/{vid}/annot/files/{p.name}", p, p.name)
+            sent += p.stat().st_size
+        api.upload_file(f"/videos/{vid}/annot/files/state.json", state_file, "state.json")
+        stop.set()
+        stage["text"] = f"{len(packs)} 个回合，{sum(len(r['offsets']) for r in state['rallies'])} 帧"
+        api.retrying(lambda: send("ready"), "汇报完成")
+        print("  标注材料已上传：" + stage["text"])
+    except Exception as e:
+        stop.set()
+        detail = str(e) if isinstance(e, StepFailed) else f"{type(e).__name__}: {e}"
+        print(f"  失败：{detail}")
+        try:
+            send("failed", error=(detail + "\n\n" + "\n".join(log[-12:])).strip())
+        except Exception as e2:
+            print(f"  汇报失败状态时出错：{e2}")
+    finally:
+        stop.set()
+
+
+def sync_labels(api: Api, cfg: Config, video: dict) -> None:
+    """Write the labels made on the page into <video>.labels.csv on this Mac."""
+    vid = video["id"]
+    try:
+        data = api.json("GET", f"/videos/{vid}/labels")
+        job_dir, work = local_recording(cfg, video)
+        state_file = job_dir / "annotate" / "state.json"
+        if not state_file.exists() or not work.exists():
+            print(f"  {video['filename']}：这台 Mac 上没有标注材料，标注先留在网站上")
+        else:
+            from .annotate_pack import write_labels_from_cloud  # needs numpy: imported late
+
+            done = write_labels_from_cloud(work, json.loads(state_file.read_text()), data.get("labels") or {})
+            print(f"{time.strftime('%H:%M:%S')} 标注已同步到 {done['csv']}（共 {done['frames']} 帧，这次变了 {done['changed']} 帧）")
+        api.json("POST", f"/videos/{vid}/labels/synced", {"changedAt": data.get("changedAt")})
+    except Exception as e:
+        print(f"  同步标注失败：{e}")
+
+
 # ---------- the loop ----------
 
 def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
@@ -756,7 +885,7 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         stop.set()
 
 
-def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=analyse) -> int:
+def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=analyse, pack_fn=None) -> int:
     api = Api(cfg)
     try:
         api.json("GET", "/me")
@@ -770,13 +899,20 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
     print(f"处理节点 {cfg.name} 已连接 {cfg.url}，原片和结果放在 {cfg.work_dir}。Ctrl+C 退出。")
     while True:
         try:
-            video = api.json("POST", "/node/claim", {"node": cfg.name}).get("video")
+            got = api.json("POST", "/node/claim", {"node": cfg.name, "tasks": list(TASKS)})
         except (ApiError, urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             print(f"查询任务失败：{e}")
-            video = None
-        if video:
-            print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
-            process(api, cfg, video, analyse_fn)
+            got = {}
+        video, task = got.get("video"), got.get("task") or "process"
+        if video and task == "labels":  # cheap and frequent: no hurry, wait as usual afterwards
+            sync_labels(api, cfg, video)
+        elif video:
+            if task == "annotate":
+                print(f"{time.strftime('%H:%M:%S')} 准备标注材料 {video['filename']}（{video['id']}）")
+                prepare_annotation(api, cfg, video, pack_fn)
+            else:
+                print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
+                process(api, cfg, video, analyse_fn)
             continue
         if once:
             return 0
