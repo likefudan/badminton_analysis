@@ -216,7 +216,7 @@ git clone https://github.com/qaz812345/TrackNetV3.git ~/codebase/third_party/Tra
 export TRACKNETV3_DIR=~/codebase/third_party/TrackNetV3
 
 badminton shuttle match.mp4 --overlay
-#   生成 match.shuttle.csv（每帧：Frame, Visibility, X, Y）和画了轨迹的 match.shuttle.mp4
+#   生成 match.shuttle.csv（每帧：Frame, Visibility, X, Y, Source）和画了轨迹的 match.shuttle.mp4
 ```
 
 转换好的模型缓存在 `~/.cache/badminton/`，以后不再需要 TrackNetV3 文件夹。
@@ -411,6 +411,24 @@ badminton cut match.mp4 -o match_analysis/
 - iPhone 的 HDR 原片可以直接剪，但颜色会发灰，最好剪 `badminton sdr` 转好的版本；空间音频轨（apple_apac）会自动跳过，用普通的那条音轨。
 - 回合很多的长视频分批剪（每批 12 段）再无损拼接，不会一次打开几百个输入。
 
+## 击球时刻和击球人（第 6 步原型）
+
+```bash
+badminton skeleton match.mp4 --court match.court.json --stride 1
+```
+
+```bash
+badminton shuttle match.mp4 --court match.court.json
+```
+
+```bash
+badminton hits match.mp4 --court match.court.json
+```
+
+用球轨迹的转折和手腕速度找出每一拍的时刻和击球人，写出 `match.hits.json`（每个数值带「实测 / 插值 / 推算 / 人工」来源标记）、`match.hits.csv` 和逐拍核对页面 `match.hits.html`。骨架要逐帧跑（`--stride 1`）。
+
+在 `data/singles.mp4`（转播单打，66 拍对照）上，±0.1 秒内 F1 是 91.3%，击球人 57/58 正确；参数是在这同一段上调的，手机录像和双打还没有对照。击球声实测后没有采用。做法、数字的限制、人工核对的办法和来源标记的定义见 [docs/hits.md](docs/hits.md)。
+
 ## 代码结构
 
 | 文件 | 内容 |
@@ -441,6 +459,10 @@ badminton cut match.mp4 -o match_analysis/
 | `scripts/tracknet_finetune.py` | 从发布的权重开始微调：准备好之后原样运行 TrackNetV3 的 `train.py` |
 | `src/badminton/review.py` | 第 4 步：统计摘要、数据质量说明、提示词、Anthropic API 调用、Markdown / HTML 报告 |
 | `src/badminton/cut.py` | 剪掉死球时间：精简视频和最长回合集锦 |
+| `src/badminton/hits.py`、`hits_review.html` | 第 6 步原型：击球时刻和击球人、对照打分、逐拍核对页面 |
+| `src/badminton/provenance.py` | 数据来源标记：实测、插值、推算、人工 |
+| `scripts/hit_sound_probe.py` | 击球声实验：声音起点和击球时刻对得上的比例（没有采用） |
+| `labels/hits/` | 击球对照标注（`Frame, Player, Note`） |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 
 运行测试：`pytest`。测试用合成的摄像机和假的姿态模型，不需要下载模型。

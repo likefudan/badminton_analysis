@@ -176,10 +176,18 @@ def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
     return out
 
 
-def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0) -> list:
-    """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, short gaps."""
+def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
+                         measured: list | None = None) -> list:
+    """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, short gaps.
+
+    If `measured` is a list it is filled with one bool per row: True where the
+    position is a blob TrackNet found in that frame, False where the row is a
+    short gap filled by interpolation (or has no shuttle)."""
     w, h = frame_size
     static = static_map(candidates)
     mask = airspace_mask(calib) if calib is not None else None
-    path = fill_short_gaps(choose_path(candidates, (w / 512, h / 288), static, mask))
+    chosen = choose_path(candidates, (w / 512, h / 288), static, mask)
+    path = fill_short_gaps(chosen)
+    if measured is not None:
+        measured[:] = [bool(v) for v in chosen[:, 0] > 0]
     return [(f + start_frame, int(v), int(round(x)), int(round(y))) for f, (v, x, y) in enumerate(path)]

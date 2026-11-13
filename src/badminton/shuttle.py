@@ -293,6 +293,7 @@ class ShuttleTiming:
     median_s: float = 0.0  # one-off: background image before the first frame
     wall_s: float = 0.0  # frame loop + inpaint, wall clock
     frames: int = 0
+    measured: np.ndarray | None = None  # per returned row: TrackNet itself saw the shuttle in that frame
 
     def summary(self) -> str:
         parts = "，".join(f"{k} {1000 * v / max(1, self.frames):.1f}" for k, v in self.seconds.items())
@@ -457,6 +458,7 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     tm.frames = n
 
     xs, ys, vis = np.array(xs[:n], float), np.array(ys[:n], float), np.array(vis[:n], int)
+    seen = vis.astype(bool)  # before InpaintNet fills gaps: what TrackNet itself saw
     if inpaint and n >= INPAINT_LEN:
         t0 = time.perf_counter()
         xs, ys, vis = _inpaint(inpaintnet, xs, ys, vis, w, h)
@@ -464,9 +466,20 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     tm.wall_s = time.perf_counter() - wall
     if frame_step > 1:
         rows = expand_rows(xs, ys, vis, frame_step, max_frames or (n_total - start_frame))
+        tm.measured = np.array([f % frame_step == 0 and bool(seen[f // frame_step]) for f, *_ in rows], bool)
     else:
         rows = [(i, int(vis[i]), int(xs[i]), int(ys[i])) for i in range(n)]
+        tm.measured = seen[:n].copy()
     return [(f + start_frame, v, x, y) for f, v, x, y in rows], tm
+
+
+def row_sources(rows, measured) -> list[str]:
+    """Source tag per row (see provenance.py): "measured" where the model saw the
+    shuttle in that frame, "interpolated" where the position was filled in
+    (InpaintNet, skipped frames, short gaps of the chosen path), "" where there is none."""
+    from .provenance import INTERPOLATED, MEASURED
+
+    return [(MEASURED if m else INTERPOLATED) if r[1] else "" for r, m in zip(rows, measured)]
 
 
 def expand_rows(xs, ys, vis, step: int, n_frames: int) -> list:
@@ -514,9 +527,15 @@ def _inpaint(model, xs, ys, vis, w, h):
     return x, y, v
 
 
-def write_csv(rows, path: str | Path) -> None:
+def write_csv(rows, path: str | Path, sources: list[str] | None = None) -> None:
+    """Frame, Visibility, X, Y and, when `sources` is given (row_sources), a fifth
+    column Source saying whether the position was measured or interpolated."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         wr = csv.writer(f)
-        wr.writerow(["Frame", "Visibility", "X", "Y"])
-        wr.writerows(rows)
+        if sources is None:
+            wr.writerow(["Frame", "Visibility", "X", "Y"])
+            wr.writerows(rows)
+        else:
+            wr.writerow(["Frame", "Visibility", "X", "Y", "Source"])
+            wr.writerows([*r[:4], s] for r, s in zip(rows, sources))

@@ -169,6 +169,8 @@ class PlayerStats:
     airborne_frames: int
     rally_distances_m: list = field(default_factory=list)
     heatmap: dict = field(default_factory=dict)  # cells over the player's half, for drawing
+    # share of the in-play positions that were measured / interpolated (provenance.py)
+    position_sources: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -222,11 +224,33 @@ def player_stats(track, t: np.ndarray, in_play: np.ndarray, rallies) -> PlayerSt
         sprints=int(sprints), zones_pct={k: round(float(v), 1) for k, v in zones.items()},
         airborne_frames=int(track.airborne.sum()), rally_distances_m=rally_d,
         heatmap=heatmap(pos[play], track.side),
+        position_sources=_position_share(track, play),
     )
+
+
+def _position_share(track, play: np.ndarray) -> dict:
+    from .provenance import INTERPOLATED, MEASURED, share
+    from .tracking import position_sources
+
+    if not hasattr(track, "seen"):
+        return {}
+    s = share(position_sources(track)[play])
+    return {MEASURED: s[MEASURED], INTERPOLATED: s[INTERPOLATED]}
+
+
+# where each number in the saved JSON comes from (provenance.py); positions are
+# measured or interpolated frame by frame (see position_sources per player)
+VALUE_SOURCES = {
+    "rallies": "derived", "in_play_s": "derived", "distance_m": "derived", "mean_speed_mps": "derived",
+    "max_speed_mps": "derived", "sprints": "derived", "zones_pct": "derived", "rally_distances_m": "derived",
+    "heatmap": "derived", "airborne_frames": "derived", "name": "manual",
+}
 
 
 def analyse(tracking: Tracking) -> dict:
     """Rally segmentation + per-player stats. Returns a JSON-ready dict."""
+    from .provenance import legend
+
     t = tracking.time_s
     smoothed = [smooth_track(tr.xy, t, cov=getattr(tr, "meas_cov", None)) for tr in tracking.tracks]
     speeds = np.stack([np.hypot(v[:, 0], v[:, 1]) for _, v in smoothed], axis=1) if smoothed else np.zeros((len(t), 0))
@@ -238,6 +262,7 @@ def analyse(tracking: Tracking) -> dict:
         "in_play_s": round(float(sum(t[b - 1] - t[a] for a, b in rallies)), 2),
         "rallies": [{"start_s": round(float(t[a]), 2), "end_s": round(float(t[b - 1]), 2)} for a, b in rallies],
         "players": [p.to_json() for p in players],
+        "sources": {"legend": legend(), "values": VALUE_SOURCES},
         "_in_play": in_play,  # for drawing / checks; dropped when saving
         "_smoothed": smoothed,
     }

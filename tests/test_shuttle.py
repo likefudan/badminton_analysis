@@ -72,3 +72,28 @@ def test_load_models_from_a_folder_without_models(tmp_path):
 
     with pytest.raises(SystemExit, match="tracknetv3_tracknet"):
         load_models(model_dir=tmp_path)
+
+
+def test_csv_source_column(tmp_path):
+    from badminton.shuttle import row_sources, write_csv
+
+    rows = [(0, 1, 10, 20), (1, 1, 12, 22), (2, 0, 0, 0)]
+    src = row_sources(rows, [True, False, False])
+    assert src == ["measured", "interpolated", ""]
+    write_csv(rows, tmp_path / "a.csv", src)
+    assert (tmp_path / "a.csv").read_text().splitlines() == [
+        "Frame,Visibility,X,Y,Source", "0,1,10,20,measured", "1,1,12,22,interpolated", "2,0,0,0,"]
+    write_csv(rows, tmp_path / "b.csv")  # without sources: the old four columns
+    assert (tmp_path / "b.csv").read_text().splitlines()[0] == "Frame,Visibility,X,Y"
+
+
+def test_path_reports_which_rows_are_measured():
+    import numpy as np
+
+    from badminton.shuttle_path import rows_from_candidates
+
+    cands = [np.array([[20.0 + 12 * f, 100.0 + 3 * f, 0.9]]) if f not in (4, 5) else np.zeros((0, 3)) for f in range(40)]
+    measured: list = []
+    rows = rows_from_candidates(cands, (1920, 1080), measured=measured)
+    assert [r[1] for r in rows] == [1] * 40  # the two-frame gap is filled
+    assert measured == [f not in (4, 5) for f in range(40)]
