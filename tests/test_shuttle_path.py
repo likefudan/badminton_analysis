@@ -133,3 +133,52 @@ def test_still_stretch_above_the_horizon_is_kept(camera):
     p[15:] = (1, *apex)
     q = drop_still_runs(p, 5.0, on_floor=on_floor)
     assert not q[:12, 0].any() and q[15:, 0].all()
+
+
+def _flight(p0, v0, seconds: float, fps: float = 30.0) -> np.ndarray:
+    """3D points of a shuttle with gravity and drag (terminal speed 6.8 m/s), one per frame."""
+    g, k = 9.81, 9.81 / 6.8 ** 2
+    p, v, out, dt = np.array(p0, float), np.array(v0, float), [], 1.0 / fps / 20
+    for i in range(int(seconds * fps) * 20):
+        if i % 20 == 0:
+            out.append(p.copy())
+        v = v + dt * (np.array([0, 0, -g]) - k * np.linalg.norm(v) * v)
+        p = p + dt * v
+    return np.array(out)
+
+
+def test_flight_over_another_court_is_dropped():
+    """A low camera beside the court, like the phone clips: a clear over this court and one over the
+    court to its left (8 m over) land on overlapping pixels. Gravity at the top of each flight says
+    how far away it is: the far one is dropped, the near one kept whole (its top included)."""
+    from tests.conftest import Camera
+    from badminton.court import MARKERS, CourtCalibration
+    from badminton.shuttle_path import CourtDistance, other_court_flights, rows_from_candidates
+
+    w, h, fps = 1920, 1080, 30.0
+    cam = Camera(pos=(8.5, -1.5, 1.9), target=(2.0, 8.0, 1.5), f=900.0, size=(w, h))
+    names = ["near_left_corner", "near_right_corner", "far_left_corner", "far_right_corner",
+             "near_short_service_left", "far_short_service_right"]
+    calib = CourtCalibration({n: tuple(p) for n, p in zip(names, cam.project(np.array([MARKERS[n] for n in names])))},
+                             (w, h))
+    ours = _flight([3.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.8, fps)       # clear from the near half to the far
+    theirs = _flight([-8.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.8, fps)    # the same shot one court to the left
+    path = np.zeros((130, 3))
+    path[5:5 + len(ours)] = np.c_[np.ones(len(ours)), cam.project(ours)]
+    path[70:70 + len(theirs)] = np.c_[np.ones(len(theirs)), cam.project(theirs)]
+    path[:, 1:] += np.random.default_rng(0).normal(0, 0.7, (130, 2)) * path[:, :1]   # a pixel of noise
+
+    assert CourtDistance(calib).from_gravity(path[40, 1:], np.zeros(2)) is None   # no curvature: no answer
+    away = other_court_flights(path, calib, fps, w)
+    assert len(away) == 1
+    frames, k, dist, (near, far) = away[0]
+    assert 70 <= k < 70 + len(theirs) and dist > far
+    assert set(range(78, 70 + len(theirs) - 8)) <= set(frames) and min(frames) >= 70
+
+    # end to end: the candidates TrackNet would give (heatmap pixels)
+    cands = [np.array([[x * 512 / w, y * 288 / h, 0.9, 9, 9]], np.float32) if v else np.zeros((0, 5), np.float32)
+             for v, x, y in path]
+    rows = rows_from_candidates(cands, (w, h), calib, fps=fps)
+    seen = np.array([r[1] for r in rows])
+    assert seen[5:5 + len(ours)].all()                     # this court's clear, top included
+    assert seen[70:70 + len(theirs)].sum() < 0.2 * len(theirs)
