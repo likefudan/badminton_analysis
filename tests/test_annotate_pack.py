@@ -214,3 +214,28 @@ def test_node_reports_a_missing_recording(tmp_path):
         assert cloud.annot_jobs[-1]["status"] == "failed" and "找不到" in cloud.annot_jobs[-1]["error"]
     finally:
         cloud.server.shutdown()
+
+
+@pytest.mark.parametrize("measured", [None, np.array([True, False] * 45)])
+def test_predict_passes_what_tracknet_measured_to_the_path_selection(clip, monkeypatch, measured):
+    """The tracker reports `measured` as a numpy array (or not at all): both must work."""
+    from types import SimpleNamespace
+
+    from badminton import shuttle, shuttle_path
+
+    def track(video, tracknet_dir=None, progress=None, debug=None, **kw):
+        debug["candidates"] = [np.array([[10.0, 10.0, 0.9]]) for _ in range(N)]
+        return [(f, 1, 10.0, 10.0) for f in range(N)], SimpleNamespace(measured=measured)
+
+    got = {}
+
+    def rows_from_candidates(cands, size, calib=None, **kw):
+        got.update(kw)
+        return [(f, 1, 10.0, 10.0) for f in range(N)]
+
+    monkeypatch.setattr(shuttle, "track_shuttle", track)
+    monkeypatch.setattr(shuttle_path, "rows_from_candidates", rows_from_candidates)
+    path, raw, cands = an.predict(clip)
+    assert len(path) == N and len(cands) == N
+    assert got["measured"] == (None if measured is None else list(measured))
+    assert got["fps"] == FPS
