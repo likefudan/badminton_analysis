@@ -40,7 +40,20 @@ npm test           # 集成测试
 npm run typecheck
 ```
 
-## 第一次部署
+## 自动部署（GitHub Actions）
+
+`.github/workflows/deploy-cloud.yml` 在 `cloud/` 的改动合并到 main 时自动发布，也可以在 Actions 页面手动运行。
+它会按需创建 R2 桶和 D1 数据库、设置 7 天清理未完成分片上传的规则、跑迁移、发布、设置登录口令，最后检查线上首页和 `/api/v1/me`。
+
+需要在仓库 Settings → Secrets and variables → Actions 里加三个 secret：
+
+| secret | 内容 |
+| --- | --- |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare 令牌，权限：Workers Scripts 编辑、Workers R2 Storage 编辑、D1 编辑、llmat.dev 的 Workers Routes 编辑 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账号 ID |
+| `BA_ACCESS_TOKEN` | 网站登录口令，自己定 |
+
+## 手动部署
 
 需要 `llmat.dev` 在同一个 Cloudflare 账号下。
 
