@@ -242,6 +242,18 @@ const Label = (() => {
     advance();
   }
 
+  // 球没动（落在地上、停在网上）：和上一帧标的位置一样
+  function stillPoint() {
+    if (L.i === 0) return null;
+    const lab = L.labels.get(frameOf(L.r, L.i - 1));
+    return done(lab) && lab[0] ? { x: lab[1], y: lab[2] } : null;
+  }
+  function sameAsBefore() {
+    const pt = stillPoint();
+    if (!pt) return;
+    setLabel(frameOf(L.r, L.i), [1, pt.x, pt.y, "human"]);
+    advance();
+  }
   function noShuttle() { setLabel(frameOf(L.r, L.i), [0, 0, 0, "human"]); advance(); }
   function cantTell() { setLabel(frameOf(L.r, L.i), [0, 0, 0, "skip"]); advance(); }
   function clearFrame() { setLabel(frameOf(L.r, L.i), null); L.pending = null; draw(); renderRallies(); }
@@ -465,7 +477,48 @@ const Label = (() => {
     bulk.hidden = !todo;
     bulk.textContent = L.armed ? `再点一次：接受这回合 ${todo} 帧有把握的预测` : `这回合剩下有把握的 ${todo} 帧一键接受`;
     $l("lPrev").disabled = L.i === 0;
+    $l("lSame").disabled = !stillPoint();
+    scrubber();
     $l("lClear").hidden = !done(lab) && !L.pending;
+  }
+
+  // 拖动选帧的条：底下一条色带，绿 = 标了有球，灰 = 没有球/看不清，橙 = 模型没把握还没标
+  function scrubber() {
+    const R = rally(), n = R.offsets.length, range = $l("lRange");
+    if (Number(range.max) !== n - 1) range.max = String(n - 1);
+    if (!scrubbing) range.value = String(L.i);
+    const cv = $l("lStrip"), w = cv.clientWidth, dpr = window.devicePixelRatio || 1;
+    if (!w) return;
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(8 * dpr); }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, 8);
+    const bw = Math.max(w / n, 1);
+    for (let i = 0; i < n; i++) {
+      const lab = L.labels.get(R.start + i);
+      const c = done(lab) ? (lab[0] ? (lab[3] === "bulk" ? "#7ee787" : "#3fb950") : "#8b949e")
+        : R.unc[i] >= L.state.doubtful ? "rgba(255,140,0,.75)" : null;
+      if (!c) continue;
+      g.fillStyle = c;
+      g.fillRect(i * w / n, 0, bw, 8);
+    }
+  }
+  let scrubbing = false, scrubTimer = 0;
+  function onScrub() {
+    if (!L || !L.state) return;
+    scrubbing = true;
+    const i = Number($l("lRange").value), R = rally();
+    $l("lWhere").textContent = `回合 ${L.r + 1}/${L.state.rallies.length} · 第 ${i + 1}/${R.offsets.length} 帧`;
+    clearTimeout(scrubTimer);
+    // 拖的时候每停一下（0.12 秒）才换图，不然一路都在下载
+    scrubTimer = setTimeout(() => { if (L) go(L.r, i); }, 120);
+  }
+  function endScrub() {
+    if (!L || !L.state || !scrubbing) return;
+    clearTimeout(scrubTimer);
+    scrubbing = false;
+    $l("lRange").blur(); // 不然键盘快捷键会被滑条吃掉
+    go(L.r, Number($l("lRange").value));
   }
 
   function countDone(r) {
@@ -632,6 +685,9 @@ const Label = (() => {
     $l("lOk").onclick = () => confirm();
     $l("lNone").onclick = () => noShuttle();
     $l("lSkip").onclick = () => cantTell();
+    $l("lSame").onclick = () => sameAsBefore();
+    $l("lRange").addEventListener("input", onScrub);
+    $l("lRange").addEventListener("change", endScrub);
     $l("lPrev").onclick = () => go(L.r, L.i - 1);
     $l("lNext").onclick = () => { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); };
     $l("lClear").onclick = () => clearFrame();
@@ -659,13 +715,14 @@ const Label = (() => {
       draw();
     });
     window.addEventListener("resize", () => { if (L && L.state && !$l("vLabel").hidden) draw(); });
-    // 电脑上也能用键盘：空格/回车 = 对，n = 没有球，s = 看不清，左右方向键 = 上一帧/下一帧，Backspace = 清除
+    // 电脑上也能用键盘：空格/回车 = 对，n = 没有球，s = 看不清，m = 球没动，左右方向键 = 上一帧/下一帧，Backspace = 清除
     window.addEventListener("keydown", (e) => {
       if (!L || !L.state || $l("vLabel").hidden || e.target.tagName === "INPUT") return;
       const k = e.key;
       if (k === " " || k === "Enter") confirm();
       else if (k === "n" || k === "N") noShuttle();
       else if (k === "s" || k === "S") cantTell();
+      else if (k === "m" || k === "M") sameAsBefore();
       else if (e.shiftKey && k.startsWith("Arrow")) nudge(k === "ArrowLeft" ? -1 : k === "ArrowRight" ? 1 : 0, k === "ArrowUp" ? -1 : k === "ArrowDown" ? 1 : 0);
       else if (k === "ArrowLeft") go(L.r, L.i - 1);
       else if (k === "ArrowRight") { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); }

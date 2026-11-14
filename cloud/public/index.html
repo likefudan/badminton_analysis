@@ -130,6 +130,13 @@
   #lCanvas { display: block; width: 100%; border-radius: 8px; background: #000; touch-action: none; }
   #lLoupe { position: absolute; top: 6px; border: 2px solid #fff; border-radius: 8px; box-shadow: 0 1px 6px rgba(0,0,0,.5); touch-action: none; cursor: crosshair; }
   #lWhat { min-height: 1.5em; margin: 4px 0 8px; }
+  #lScrub { position: relative; height: 34px; margin: 4px 0 2px; }
+  #lStrip { position: absolute; left: 10px; right: 10px; top: 13px; height: 8px; width: calc(100% - 20px); border-radius: 4px; background: var(--line); }
+  #lRange { position: absolute; inset: 0; width: 100%; height: 34px; margin: 0; background: transparent; -webkit-appearance: none; appearance: none; touch-action: none; }
+  #lRange::-webkit-slider-runnable-track { height: 34px; background: transparent; }
+  #lRange::-moz-range-track { height: 34px; background: transparent; }
+  #lRange::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 30px; margin-top: 2px; border-radius: 6px; background: var(--accent); border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+  #lRange::-moz-range-thumb { width: 18px; height: 28px; border-radius: 6px; background: var(--accent); border: 2px solid #fff; }
   #lWhere { margin: 8px 0 0; font-variant-numeric: tabular-nums; }
   .lbtns { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
   .lbtns button { padding: 14px 6px; }
@@ -332,6 +339,7 @@
         </div>
         <div id="lSide">
           <p class="quiet" id="lWhere"></p>
+          <div id="lScrub"><canvas id="lStrip"></canvas><input type="range" id="lRange" min="0" max="0" value="0" step="1" aria-label="拖动选帧"></div>
           <p id="lWhat"></p>
           <div class="lbtns">
             <button id="lPrev" class="plain">‹ 上一帧</button>
@@ -339,6 +347,7 @@
             <button id="lNext" class="plain">下一帧 ›</button>
             <button id="lNone" class="plain">没有球</button>
             <button id="lSkip" class="plain">看不清</button>
+            <button id="lSame" class="plain">球没动</button>
             <button id="lClear" class="plain" hidden>清除</button>
           </div>
           <button id="lBulk" class="plain" hidden></button>
@@ -346,7 +355,7 @@
           <h2 style="margin-top:14px">模型准不准</h2>
           <div id="lAcc" class="quiet"></div>
           <details class="quiet" style="margin-top:10px"><summary>怎么标</summary>
-            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去）。角上的放大镜一直开着，翻到下一帧时对准上一帧球的位置（画面上虚线框就是它看的范围），左下角写「原图」时看到的是 4K 原始像素；在放大镜里点一下就把球放在那里，按住拖动可以很细地挪。也可以用方向键微调（按一下挪 1 个像素，按住连续挪，中间的数字切换每次挪 1 或 5 个像素），看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。</p>
+            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去）。角上的放大镜一直开着，翻到下一帧时对准上一帧球的位置（画面上虚线框就是它看的范围），左下角写「原图」时看到的是 4K 原始像素；在放大镜里点一下就把球放在那里，按住拖动可以很细地挪。也可以用方向键微调（按一下挪 1 个像素，按住连续挪，中间的数字切换每次挪 1 或 5 个像素），看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。球落在地上不动时点「球没动」，直接用上一帧标的位置。帧数下面的滑条可以拖着快速选帧：绿色是标了有球的帧，灰色是没有球或看不清，橙色是模型很没把握、还没标的帧。</p>
             <p>「一键接受」把这回合里模型很有把握、你还没看过的帧直接按预测记下来（和电脑版一样记成“批量接受”），不算进上面的准确率。横过来拿手机，画面铺满屏幕，按钮在右边。</p>
           </details>
         </div>
