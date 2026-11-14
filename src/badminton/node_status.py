@@ -36,7 +36,13 @@ REPO = Path(__file__).resolve().parents[2]
 # the node's own recent output: what it printed, and the output of the step it is running
 LOG: collections.deque[str] = collections.deque(maxlen=200)
 
-_SECRET = re.compile(r"(?i)((?:token|secret|password|passwd|api[-_]?key|authorization)\w*[\"']?[=:\s]+(?:bearer\s+)?)(\S+)")
+_LOCK = threading.Lock()       # LOG is written by the job's threads and read by the reporter's
+
+# values that look like credentials are not sent: "token=…", "Authorization: Bearer …", "--api-key …"
+_SECRET = re.compile(
+    r"(?i)((?:token|secret|password|passwd|api[-_]?key|authorization)\w*[\"']?\s*[=:]\s*[\"']?(?:bearer\s+)?"
+    r"|--?[\w-]*(?:token|secret|password|passwd|api[-_]?key)[\w-]*\s+"
+    r"|\bbearer\s+)([^\s\"']+)")
 
 
 def clean(line: str) -> str:
@@ -46,7 +52,13 @@ def clean(line: str) -> str:
 def note(line: str) -> None:
     line = line.rstrip()
     if line.strip():
-        LOG.append(time.strftime("%H:%M:%S ") + clean(line))
+        with _LOCK:
+            LOG.append(time.strftime("%H:%M:%S ") + clean(line))
+
+
+def recent(n: int = LOG_LINES) -> list[str]:
+    with _LOCK:
+        return list(LOG)[-n:]
 
 
 class Tee:
@@ -360,7 +372,7 @@ class Reporter:
 
     def collect(self) -> dict:
         status: dict = {"name": self.name, "at": _iso(self.clock()), "startedAt": _iso(self.started),
-                        "version": self.version, "job": self.job, "log": list(LOG)[-LOG_LINES:],
+                        "version": self.version, "job": self.job, "log": recent(),
                         "watch": [str(w).replace(str(Path.home()), "~") for w in self.watch]}
         for key, fn in (("system", lambda: self.system_fn(self.work_dir)), ("tasks", self.tasks)):
             try:

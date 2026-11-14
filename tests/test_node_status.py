@@ -78,9 +78,14 @@ def test_log_tail_shows_a_redrawn_progress_bar_once_and_reads_the_epoch(tmp_path
 
 
 def test_secrets_do_not_leave_the_mac():
-    assert node_status.clean("curl -H 'Authorization: Bearer abc123'") == "curl -H 'Authorization: Bearer ***"
+    assert node_status.clean("curl -H 'Authorization: Bearer abc123'") == "curl -H 'Authorization: Bearer ***'"
     assert node_status.clean("run --api-key sk-123 --epochs 3") == "run --api-key *** --epochs 3"
     assert node_status.clean("TOKEN=hunter2 python x.py") == "TOKEN=*** python x.py"
+    assert node_status.clean('{"token": "abc", "n": 1}') == '{"token": "***", "n": 1}'
+    assert node_status.clean("sent with Bearer abc.def") == "sent with Bearer ***"
+    # ordinary log lines that only mention the words stay readable
+    for line in ("input tokens 900, output tokens 40", "口令不对，连不上", "Epoch [3 / 10] loss=4.9e-5"):
+        assert node_status.clean(line) == line
 
 
 def test_report_keeps_a_task_after_it_ends_and_flags_an_error(tmp_path):
