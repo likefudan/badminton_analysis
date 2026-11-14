@@ -56,6 +56,7 @@ INTERP_S = 0.2  # gaps of the track up to this long are bridged before scoring
 GAP_MAX_S = 0.47  # a contact may hide in a gap of the raw track up to this long
 MIN_GAP_S = 0.27  # two hits are at least this far apart (fastest exchanges ~0.3 s)
 RALLY_GAP_S = 2.5  # no hit for this long: the next one starts a new rally (any side may begin)
+MIN_RALLY_HITS = 2  # fewer hits than this between two pauses of RALLY_GAP_S: dead-ball handling, not play
 SAME_SIDE_MIN_S = 0.6  # two hits from the same side closer than this are impossible in one rally
 SAME_SIDE_COST = 1.0  # ...and further apart they cost this much evidence (a hit in between was missed)
 REF_BH_FRAC = 0.22  # body height / frame height assumed when no player is tracked
@@ -461,6 +462,28 @@ def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
     return hits
 
 
+def drop_lone_hits(hits: list[dict], fps: float, min_hits: int = MIN_RALLY_HITS) -> list[dict]:
+    """Drop hits that stand alone: no other hit within RALLY_GAP_S before or after.
+
+    Between rallies the shuttle is picked up from the floor, caught, tossed or
+    batted back to the server; each of these is a flight leaving or reaching a
+    hand, which is what a serve or a stroke looks like too. What sets them apart
+    is that nobody hits back: the "rally" has a single hit. A real one-hit rally
+    (an ace, a serve into the net) is rare and is lost with them. On IMG_0971 this
+    removed a pick-up and a catch after the first rally and nothing else; on
+    singles.mp4 it changes nothing and on BFMD it is neutral (docs/hits.md)."""
+    gap = RALLY_GAP_S * fps
+    out: list[dict] = []
+    group: list[dict] = []
+    for h in sorted(hits, key=lambda h: h["frame"]):
+        if group and h["frame"] - group[-1]["frame"] > gap:
+            out += group if len(group) >= min_hits else []
+            group = []
+        group.append(h)
+    out += group if len(group) >= min_hits else []
+    return out
+
+
 def hits_json(hits: list[dict], fps: float, video: str = "", inputs: dict | None = None,
               names: dict | None = None) -> dict:
     """The saved form: every value with its source (measured / interpolated / derived / manual)."""
@@ -576,7 +599,7 @@ def run(shuttle_csv, skeleton_npz, court=None, players_per_side: int = 1, opts: 
     players = player_signals(data, tracking, len(shuttle.xy))
     for p in players:
         p.name = (names or {}).get(str(p.id), p.name)
-    hits = detect_hits(shuttle, players, fps, frame_h, opts)
+    hits = drop_lone_hits(detect_hits(shuttle, players, fps, frame_h, opts), fps)
     return hits, {"fps": fps, "frame_h": frame_h, "shuttle": shuttle, "players": players, "tracking": tracking,
                   "stride": int(np.median(np.diff(data["frame"]))) if len(data["frame"]) > 1 else 1}
 
