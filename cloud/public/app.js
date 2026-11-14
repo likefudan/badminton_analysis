@@ -77,7 +77,9 @@ async function tryLogin() {
   let cfg = { google: false };
   try { cfg = await (await fetch(API + "/auth/config")).json(); } catch {}
   $("googleBtn").hidden = !cfg.google;
+  $("pwBox").hidden = cfg.google;  // 有 Google 登录就不再显示口令登录
   $("pwBox").open = !cfg.google;
+  $("claimBox").hidden = !cfg.claim;
   const code = new URLSearchParams(location.search).get("login_error");
   if (code) history.replaceState(null, "", location.pathname + location.hash);
   try {

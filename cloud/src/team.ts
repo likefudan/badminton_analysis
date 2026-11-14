@@ -24,6 +24,7 @@ const MAX_HELD = 3;                            // 标注员同时最多领几个
 const MAX_PENDING = 100;                       // 没被邀请的账号最多记这么多个
 const STROKES_PER_TASK = 20;
 
+const superAdmin = (env: Env) => (env.ADMIN_GOOGLE_EMAIL ?? "").trim().toLowerCase();
 const googleReady = (env: Env) => Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
 const cookieOf = (req: Request, name: string) => {
   const c = (req.headers.get("cookie") ?? "").split(/;\s*/).find((x) => x.startsWith(name + "="));
@@ -39,9 +40,8 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
   const tokenUser: Who = { email: "", name: "管理员", picture: "", role: "admin", status: "active", via: "token" };
   const header = req.headers.get("authorization") ?? "";
   if (header.startsWith("Bearer ")) {
-    if (!env.ACCESS_TOKEN) return null;
     const got = header.slice(7);
-    if (await sameSecret(got, env.ACCESS_TOKEN)) return tokenUser;
+    if (env.ACCESS_TOKEN && (await sameSecret(got, env.ACCESS_TOKEN))) return tokenUser;
     return env.NODE_TOKEN && (await sameSecret(got, env.NODE_TOKEN)) ? tokenUser : null;
   }
   const sid = cookieOf(req, SID_COOKIE);
@@ -69,6 +69,7 @@ export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture
 // 标注记在谁名下：用口令登录的算第一个管理员
 async function annotatorOf(env: Env, who: Who): Promise<string> {
   if (who.email) return who.email;
+  if (superAdmin(env)) return superAdmin(env);
   const admin = await env.DB.prepare("SELECT email FROM users WHERE role = 'admin' AND status = 'active' ORDER BY created_at LIMIT 1").first<{ email: string }>();
   return admin?.email ?? ""; // 还没有管理员：先空着，第一个管理员认领时补上
 }
@@ -135,7 +136,18 @@ async function googleCallback(req: Request, env: Env, url: URL): Promise<Respons
   const picture = typeof claims.picture === "string" && claims.picture.startsWith("https://") ? claims.picture.slice(0, 500) : "";
   const now = new Date();
   const known = await env.DB.prepare("SELECT email FROM users WHERE email = ?").bind(email).first();
-  if (known) {
+  if (email === superAdmin(env)) {
+    // 超级管理员：登录就是管理员，以前没有署名的标注记到它名下
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO users (email, name, picture, role, status, created_at, last_login_at) VALUES (?, ?, ?, 'admin', 'active', ?, ?)
+         ON CONFLICT (email) DO UPDATE SET name = CASE WHEN excluded.name = '' THEN name ELSE excluded.name END, picture = excluded.picture,
+           role = 'admin', status = 'active', last_login_at = excluded.last_login_at`,
+      ).bind(email, name, picture, now.toISOString(), now.toISOString()),
+      env.DB.prepare("UPDATE labels SET annotator = ? WHERE annotator = ''").bind(email),
+      env.DB.prepare("UPDATE stroke_labels SET annotator = ? WHERE annotator = ''").bind(email),
+    ]);
+  } else if (known) {
     await env.DB.prepare("UPDATE users SET name = CASE WHEN ? = '' THEN name ELSE ? END, picture = ?, last_login_at = ? WHERE email = ?")
       .bind(name, name, picture, now.toISOString(), email)
       .run();
@@ -181,7 +193,7 @@ async function claimAdmin(req: Request, env: Env, who: Who): Promise<Response> {
 // 不用登录就能访问的接口；不是这些就返回 null
 export async function publicApi(req: Request, env: Env, path: string, url: URL): Promise<Response | null> {
   const m = req.method;
-  if (path === "/auth/config" && m === "GET") return json({ google: googleReady(env) });
+  if (path === "/auth/config" && m === "GET") return json({ google: googleReady(env), claim: Boolean(env.ACCESS_TOKEN) && !superAdmin(env) });
   if (path === "/auth/google/start" && m === "GET") return googleStart(req, env, url);
   if (path === "/auth/google/callback" && m === "GET") return googleCallback(req, env, url);
   if (path === "/auth/logout" && m === "POST") return logout(req, env);
@@ -415,6 +427,9 @@ export async function guardLabelWrite(env: Env, who: Who, videoId: string, kind:
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 
 async function listUsers(env: Env): Promise<Response> {
+  // 超级管理员还没登录过也列出来
+  if (superAdmin(env))
+    await env.DB.prepare("INSERT OR IGNORE INTO users (email, role, status, created_at) VALUES (?, 'admin', 'active', ?)").bind(superAdmin(env), new Date().toISOString()).run();
   const users = await env.DB.prepare(
     `SELECT u.email, u.name, u.picture, u.role, u.status, u.created_at, u.last_login_at,
        (SELECT COUNT(*) FROM labels l WHERE l.annotator = u.email) AS frames,
@@ -425,7 +440,7 @@ async function listUsers(env: Env): Promise<Response> {
   ).all<Record<string, unknown>>();
   return json({
     users: users.results.map((u) => ({
-      email: u.email, name: u.name, picture: u.picture, role: u.role, status: u.status, createdAt: u.created_at, lastLoginAt: u.last_login_at,
+      email: u.email, owner: u.email === superAdmin(env), name: u.name, picture: u.picture, role: u.role, status: u.status, createdAt: u.created_at, lastLoginAt: u.last_login_at,
       frames: u.frames, strokes: u.strokes, held: u.held, finished: u.finished,
     })),
   });
@@ -447,6 +462,7 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
   const role = body?.role === "admin" || body?.role === "annotator" ? body.role : old?.role ?? "annotator";
   const status = remove ? "disabled" : body?.status === "active" || body?.status === "disabled" ? body.status : old && old.status !== "pending" ? old.status : "active";
   const losesAdmin = old?.role === "admin" && old.status === "active" && (role !== "admin" || status !== "active");
+  if (email === superAdmin(env) && (remove || role !== "admin" || status !== "active")) throw new HttpError(409, "这是超级管理员，不能停用、降级或删除");
   if (losesAdmin) {
     if (email === who.email) throw new HttpError(409, "不能停用或降级自己");
     const admins = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND status = 'active'").first<{ n: number }>();

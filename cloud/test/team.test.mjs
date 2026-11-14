@@ -121,7 +121,7 @@ async function prepared() {
 }
 
 test("Google 登录、白名单、领任务、标注归属、超时放回、重新准备", async () => {
-  assert.deepEqual(await (await fetch(BASE + "/auth/config")).json(), { google: true });
+  assert.deepEqual(await (await fetch(BASE + "/auth/config")).json(), { google: true, claim: true });
 
   const vid = await prepared();
 
@@ -282,4 +282,53 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   // 退出
   assert.equal((await alice.post("/auth/logout")).status, 200);
   assert.equal((await alice.get("/me")).status, 401);
+});
+
+test("超级管理员：用 ADMIN_GOOGLE_EMAIL 登录直接是管理员，不能被停用、降级或删除", async () => {
+  // 另起一个设置了 ADMIN_GOOGLE_EMAIL 的网站
+  const port = 8793, base = `http://127.0.0.1:${port}/api/v1`, dir = mkdtempSync(join(tmpdir(), "ba-boss-"));
+  execFileSync("npx", ["wrangler", "d1", "migrations", "apply", "ba-db", "--local", "--persist-to", dir], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+  const site = spawn("npx", ["wrangler", "dev", "--local", "--port", String(port), "--inspector-port", "9333", "--persist-to", dir,
+    "--var", `ACCESS_TOKEN:${TOKEN}`, "--var", "ADMIN_GOOGLE_EMAIL:Boss@Example.com", "--var", "GOOGLE_CLIENT_ID:test-client", "--var", "GOOGLE_CLIENT_SECRET:test-secret",
+    "--var", `GOOGLE_AUTH_URL:http://127.0.0.1:${G_PORT}/auth`, "--var", `GOOGLE_TOKEN_URL:http://127.0.0.1:${G_PORT}/token`,
+    "--show-interactive-dev-session=false"], { stdio: "ignore", env: { ...process.env, CI: "1" } });
+  try {
+    let up = false;
+    for (let i = 0; i < 120 && !up; i++) {
+      try { up = (await fetch(base + "/me")).status === 401; } catch {}
+      if (!up) await new Promise((r) => setTimeout(r, 500));
+    }
+    assert.ok(up, "第二个 wrangler dev 没有起来");
+    const signIn = async (email) => {
+      const start = await fetch(base + "/auth/google/start", { redirect: "manual" });
+      const st = new URL(start.headers.get("location")).searchParams.get("state");
+      const back = await fetch(`${base}/auth/google/callback?code=${email}&state=${st}`, { redirect: "manual", headers: { cookie: cookieFrom(start, "ba_oauth") } });
+      const cookie = cookieFrom(back, "ba_sid");
+      return {
+        get: (path) => fetch(base + path, { headers: { cookie } }),
+        post: (path, body) => fetch(base + path, { method: "POST", headers: { cookie, "x-ba": "1", ...json }, body: JSON.stringify(body ?? {}) }),
+      };
+    };
+    const boss = await signIn("boss@example.com");
+    const me = await (await boss.get("/me")).json();
+    assert.deepEqual([me.email, me.role, me.status], ["boss@example.com", "admin", "active"]);
+    const users = (await (await boss.get("/admin/users")).json()).users;
+    assert.equal(users.find((u) => u.email === "boss@example.com").owner, true);
+    // 别人登录还是要等邀请
+    assert.equal((await (await (await signIn("eve@example.com")).get("/me")).json()).status, "pending");
+    // 另一个管理员也动不了超级管理员
+    assert.equal((await boss.post("/admin/users", { email: "dave@example.com", role: "admin" })).status, 200);
+    const dave = await signIn("dave@example.com");
+    assert.equal((await dave.get("/admin/users")).status, 200);
+    for (const body of [{ status: "disabled" }, { role: "annotator" }]) {
+      assert.equal((await dave.post("/admin/users", { email: "boss@example.com", ...body })).status, 409);
+    }
+    assert.equal((await dave.post("/admin/users/remove", { email: "boss@example.com" })).status, 409);
+    assert.equal((await boss.get("/me")).status, 200);
+    // 用口令写的标注记在超级管理员名下
+    assert.equal((await (await fetch(base + "/tasks", { headers: bearer })).json()).me, "boss@example.com");
+  } finally {
+    site.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

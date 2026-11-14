@@ -151,7 +151,8 @@ Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton
   （库里只存 SHA-256，30 天过期）；带 cookie 的写请求必须有 `x-ba: 1` 头。口令（`ACCESS_TOKEN`）仍然有效：Mac 节点用它，
   管理员也可以在登录页的「用口令登录」里用它。没有配置 Google 时网站只有口令登录。
 - **成员**：白名单。管理员在「成员」页填邮箱邀请；没被邀请的人登录后是 `pending`，出现在「申请加入」里，点「允许」放行。
-  第一个管理员：用 Google 登录后在「我是管理员」里输一次口令（以前没署名的标注记到这个账号名下）。
+  超级管理员：仓库 secret `ADMIN_GOOGLE_EMAIL` 里的邮箱，用它登录直接是管理员，别人不能停用、降级或删除它。
+  没有设置时，第一个管理员：用 Google 登录后在「我是管理员」里输一次口令（以前没署名的标注记到这个账号名下）。
   标注员只能用任务大厅和标注页，只能读自己领过任务的录像的标注材料。
 - **任务**（表 `tasks`）：标注材料准备好之后自动生成。球位置一个回合一个任务；击球类型约 20 拍一个任务。
   `open` → `claimed`（领取，2 小时没有保存自动放回，每次保存续期；标注员同时最多领 3 个）→ `submitted` → `approved`，
@@ -159,7 +160,7 @@ Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton
 - **标注归属**：`labels.annotator`、`stroke_labels.annotator` 记邮箱。标注员只能写自己手上任务范围里的帧；管理员不能写别人正在标的帧。
   网页下载的 CSV（`/videos/{id}/labels?format=csv`、`/videos/{id}/stroke-labels?format=csv`）多两列 `annotator,updated_at`；
   Mac 节点读到的 JSON 和它写的 `.labels.csv`、`.strokes.labels.csv` 没有变。
-- **配置**：仓库 secret `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`（部署流程写进 Worker）。在 Google Cloud 的 Google Auth Platform 里建
+- **配置**：仓库 secret `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`ADMIN_GOOGLE_EMAIL`（部署流程写进 Worker）。在 Google Cloud 的 Google Auth Platform 里建
   「Web 应用」客户端，已获授权的重定向 URI 填 `https://ba.llmat.dev/api/v1/auth/google/callback`，
   隐私权政策和服务条款填 `https://ba.llmat.dev/privacy`、`https://ba.llmat.dev/terms`。
 - **测试**：`test/team.test.mjs` 用一个假的 Google 把整个流程走一遍。

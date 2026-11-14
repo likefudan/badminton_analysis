@@ -19,6 +19,7 @@ export interface Env {
   // Google 登录（OAuth 客户端的 ID 和密钥）。没有设置时网站只能用口令登录。
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  ADMIN_GOOGLE_EMAIL?: string; // 超级管理员：用这个 Google 邮箱登录就是管理员，别人不能停用或降级它
   GOOGLE_AUTH_URL?: string;  // 只在测试里改：假的 Google
   GOOGLE_TOKEN_URL?: string;
 }

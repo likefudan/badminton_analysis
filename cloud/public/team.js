@@ -225,7 +225,7 @@ const Team = (() => {
       card(u, "用 Google 登录过，还没有被邀请", [button("允许", "", () => saveUser("/admin/users", { email: u.email, status: "active" })), remove(u, "拒绝")]));
     group("成员", users.filter((u) => u.status === "active"), (u) => {
       const self = me && u.email === me.email;
-      return card(u, (u.role === "admin" ? "管理员 · " : "") + stats(u), self ? [] : [
+      return card(u, (u.owner ? "超级管理员 · " : u.role === "admin" ? "管理员 · " : "") + stats(u), self || u.owner ? [] : [
         button("停用", "plain", () => saveUser("/admin/users", { email: u.email, status: "disabled" })),
         u.role === "admin" ? button("取消管理员", "plain", () => saveUser("/admin/users", { email: u.email, role: "annotator" }))
           : button("设为管理员", "plain", () => saveUser("/admin/users", { email: u.email, role: "admin" })),
