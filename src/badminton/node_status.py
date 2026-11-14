@@ -205,14 +205,14 @@ def open_files(pids: list[int], run=subprocess.run) -> dict[int, dict]:
     return out
 
 
-_PYTHON = re.compile(r"(?i)(^|/)python[\d.]*(\s|$)|\.app/Contents/MacOS/Python\s|(^|/)badminton(\s|$)")
+_PYTHON = re.compile(r"(?i)^(\S*/)?python[\d.]*(\s|$)")   # the program itself, not a shell whose command line mentions one
 _WORKER = re.compile(r"multiprocessing\.(spawn|resource_tracker|forkserver)|joblib|loky")
 
 
 def short_command(command: str) -> str:
     """The command without the interpreter's path: 'scripts/tracknet_finetune.py --epochs 10 …'."""
     words = command.split()
-    if words and _PYTHON.search(words[0] + " "):
+    if words and _PYTHON.search(words[0]):
         words = words[1:]
     if words:
         words[0] = re.sub(r"^.*/\.venv/bin/", "", words[0])

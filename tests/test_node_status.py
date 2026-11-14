@@ -23,12 +23,16 @@ PROCESSES = [
     proc(300, 1, f"{PY} -m http.server"),                                         # Python, but somewhere else
     proc(400, 1, "/usr/sbin/cfprefsd agent"),
     proc(500, 1, f"{PY} -m pytest tests", age=3.0),                               # too young to be worth listing
+    proc(600, 1, "/bin/zsh -c source ~/.zshrc && nohup .venv/bin/badminton node >> node.log"),   # a shell, not a job
+    proc(700, 1, "/Users/me/.venv/bin/python3.12 scripts/bst_trial.py"),
 ]
 FILES = {
     200: {"cwd": REPO + "/data/exp/run", "out": REPO + "/data/exp/train.log"},
     201: {"cwd": REPO + "/data/exp/run"},
     300: {"cwd": "/Users/me/Downloads"},
     500: {"cwd": REPO},
+    600: {"cwd": REPO, "out": REPO + "/node.log"},
+    700: {"cwd": REPO},
 }
 
 
@@ -40,12 +44,13 @@ def test_background_jobs_are_found_without_the_node_its_steps_and_helper_process
         return FILES
 
     tasks = node_status.find_tasks([Path(REPO)], own_pid=100, processes=PROCESSES, files=files)
-    assert [t["pid"] for t in tasks] == [200]
+    assert [t["pid"] for t in tasks] == [200, 700]
+    assert tasks[1]["command"] == "scripts/bst_trial.py"
     t = tasks[0]
     assert t["command"] == "scripts/tracknet_finetune.py --epochs 10"   # without the interpreter's long path
     assert t["log"] == REPO + "/data/exp/train.log"
     assert (t["cpu"], t["rssMb"], t["processes"]) == (100.0, 2300, 2)   # the data loader counts with its parent
-    assert 100 not in asked and 101 not in asked and 400 not in asked
+    assert not {100, 101, 400, 600} & set(asked)
 
 
 def test_ps_and_lsof_output_is_parsed():
