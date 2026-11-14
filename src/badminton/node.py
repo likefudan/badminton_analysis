@@ -520,7 +520,10 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
         progress.skip("shuttle", "没有骨架视频，画不了球的轨迹")
         return None
     stamp = out_dir / f"{work.stem}.shuttle.version"  # which tracking code made the files: a re-run after an update tracks again
-    fresh = stamp.exists() and stamp.read_text().strip() == SHUTTLE_VERSION
+    from .shuttle import tracknet_choice
+
+    version = f"{SHUTTLE_VERSION}+{tracknet_choice()}"  # another TrackNet model: track again too
+    fresh = stamp.exists() and stamp.read_text().strip() == version
     if fresh and combined.exists() and csv.exists() and combined.stat().st_mtime >= skeleton.stat().st_mtime:
         progress.skip("shuttle", "沿用上次的结果")
         return combined
@@ -546,7 +549,7 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
         print(f"  羽毛球追踪没有成功：{reason}")
         progress.skip("shuttle", f"这次没有成功，其它结果不受影响（{reason[:120]}）")
         return None
-    stamp.write_text(SHUTTLE_VERSION)
+    stamp.write_text(version)
     progress.done("shuttle", seen or None)
     return combined
 

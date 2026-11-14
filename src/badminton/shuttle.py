@@ -54,6 +54,21 @@ COOR_TH = 50 / math.sqrt(HEIGHT**2 + WIDTH**2)  # normalised coordinates below t
 INPAINT_BATCH = 64
 TRACKNET_BATCH = 2  # windows per Core ML call: M5, ALL: 25 ms/window at batch 1, 11 ms at 2 (no gain at 4)
 
+# Which TrackNet `badminton shuttle` uses by default. "released": converted from TrackNetV3's own
+# checkpoint (needs --tracknet-dir once). Any other key: a fine-tuned model published as a GitHub
+# Release asset (a zipped .mlpackage), downloaded once into CACHE_DIR/<key>/ and checked against
+# its sha256 (docs/tracknet_finetune.md). BADMINTON_TRACKNET=<key> picks another one; --model-dir
+# still overrides both. InpaintNet is always the released one.
+TRACKNET_DEFAULT = "tracknet-ft-v1"
+TRACKNET_RELEASES = {
+    "tracknet-ft-v1": {  # IMG_0971 (60 fps 4K phone video, doubles), 1247 labelled frames, epoch 8
+        "file": "tracknetv3_tracknet_fp16_b2.mlpackage.zip",
+        "sha256": "0822dc0b7ae0a7cd91e9153e99582063913acf40e982ec0bcc2d51fb2ebae548",
+        "size": 21057799,
+    },
+}
+RELEASE_URL = "https://github.com/likefudan/badminton_analysis/releases/download/{tag}/{file}"
+
 
 def ensemble_weight(seq_len: int) -> np.ndarray:
     """1, 2, ..., n/2, n/2, ..., 2, 1 normalised (reference get_ensemble_weight 'weight')."""
@@ -255,18 +270,85 @@ def _model_path(name: str, out_dir: Path = CACHE_DIR) -> Path:
     return out_dir / f"tracknetv3_{name.lower()}_fp16_b{batch}.mlpackage"
 
 
+def tracknet_choice() -> str:
+    """The TrackNet to use: BADMINTON_TRACKNET if set, else TRACKNET_DEFAULT."""
+    key = os.environ.get("BADMINTON_TRACKNET", "").strip() or TRACKNET_DEFAULT
+    if key != "released" and key not in TRACKNET_RELEASES:
+        raise SystemExit(f"BADMINTON_TRACKNET={key}：没有这个模型，可选 released、{'、'.join(TRACKNET_RELEASES)}")
+    return key
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def release_model(key: str, cache_dir: Path = CACHE_DIR, url: str = RELEASE_URL) -> Path:
+    """Path of the fine-tuned TrackNet `key`, downloaded and unpacked on first use.
+
+    The zip is checked against the sha256 in TRACKNET_RELEASES before anything is
+    unpacked; a mismatch stops with an error and leaves nothing behind. Unpacking
+    goes to a temporary folder that is renamed into place, so an interrupted
+    download never leaves a half model in the cache."""
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    rel = TRACKNET_RELEASES[key]
+    dest = cache_dir / key
+    model = _model_path("TrackNet", dest)
+    if model.exists():
+        return model
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src = url.format(tag=key, file=rel["file"])
+    print(f"第一次使用 {key}：下载微调的 TrackNet（{rel['size'] / 1e6:.0f} MB）{src}")
+    with tempfile.TemporaryDirectory(dir=dest.parent, prefix=f".{key}.") as tmp:
+        zpath = Path(tmp) / rel["file"]
+        with urllib.request.urlopen(src, timeout=60) as r, open(zpath, "wb") as f:
+            shutil.copyfileobj(r, f)
+        got = _sha256(zpath)
+        if got != rel["sha256"]:
+            raise SystemExit(f"下载的 {rel['file']} 校验不对（sha256 {got}，应为 {rel['sha256']}），没有使用")
+        unpacked = Path(tmp) / "unpacked"
+        with zipfile.ZipFile(zpath) as z:
+            for name in z.namelist():  # only the one .mlpackage folder, nothing outside it
+                if not name.startswith(model.name + "/") or ".." in Path(name).parts:
+                    raise SystemExit(f"{rel['file']} 里有意外的文件 {name}，没有使用")
+            z.extractall(unpacked)
+        if not (unpacked / model.name).is_dir():
+            raise SystemExit(f"{rel['file']} 里没有 {model.name}")
+        if dest.exists():
+            shutil.rmtree(dest)
+        (unpacked).rename(dest)
+    return model
+
+
 def load_models(tracknet_dir=None, compute_units: str = "ALL", model_dir: str | os.PathLike | None = None):
-    """The two Core ML models from the cache, or from `model_dir` (a folder written by
-    convert_models, e.g. a fine-tuned TrackNet: docs/tracknet_finetune.md)."""
+    """The two Core ML models: from `model_dir` (a folder written by convert_models,
+    e.g. a fine-tuned TrackNet: docs/tracknet_finetune.md), else the TrackNet chosen by
+    tracknet_choice() (a published fine-tuned one, downloaded once, or the released one
+    converted into the cache) with the released InpaintNet."""
     import coremltools as ct
 
-    out_dir = Path(model_dir).expanduser() if model_dir else CACHE_DIR
-    tn, ip = _model_path("TrackNet", out_dir), _model_path("InpaintNet", out_dir)
-    if not (tn.exists() and ip.exists()):
-        if model_dir:
+    if model_dir:
+        out_dir = Path(model_dir).expanduser()
+        tn, ip = _model_path("TrackNet", out_dir), _model_path("InpaintNet", out_dir)
+        if not (tn.exists() and ip.exists()):
             raise SystemExit(f"{out_dir} 里没有 {tn.name} 和 {ip.name}")
-        print("第一次使用：把 TrackNetV3 转换成 Core ML 模型（约半分钟）")
-        convert_models(tracknet_dir)
+    else:
+        tn, ip = _model_path("TrackNet"), _model_path("InpaintNet")
+        if not (tn.exists() and ip.exists()):
+            print("第一次使用：把 TrackNetV3 转换成 Core ML 模型（约半分钟）")
+            convert_models(tracknet_dir)
+        key = tracknet_choice()
+        if key != "released":
+            tn = release_model(key)
     cu = getattr(ct.ComputeUnit, compute_units)
     return ct.models.MLModel(str(tn), compute_units=cu), ct.models.MLModel(str(ip), compute_units=cu)
 
