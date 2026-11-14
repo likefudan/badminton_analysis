@@ -6,6 +6,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="羽毛球分析">
 <title>羽毛球分析</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/logo.svg">
 <style>
   :root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --ink: #1c1c1a; --quiet: #6b6b66; --line: #dcdcd6; --accent: #1f6feb; --good: #1a7f37; --bad: #cf222e; --warn: #9a6700; }
   @media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #222220; --ink: #ecece8; --quiet: #a3a39c; --line: #3a3a36; --accent: #58a6ff; --good: #3fb950; --bad: #f85149; --warn: #d29922; } }
@@ -222,22 +224,57 @@
     #sSide .lbtns button { padding: 10px 4px; font-size: 14px; }
   }
   [hidden] { display: none !important; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .brand img { width: 48px; height: 48px; }
+  .brand h1 { margin: 0; }
+  .legal { margin: 14px 0 0; } .legal a { color: var(--accent); }
+  /* 多人标注：任务大厅、成员页、标注页上的任务条 */
+  body.annotator .adminOnly { display: none !important; }
+  body:not(.annotator) .annotatorOnly { display: none !important; }
+  .tgroup { font-size: 13px; color: var(--quiet); margin: 16px 2px 6px; }
+  .task { display: flex; align-items: center; gap: 10px; }
+  .task .info { flex: 1; min-width: 0; }
+  .task .name { font-weight: 600; overflow-wrap: anywhere; }
+  .task .btns { display: flex; flex-direction: column; gap: 6px; flex: none; }
+  .task .btns button, .task .btns a { width: auto; padding: 7px 12px; font-size: 14px; border-radius: 8px; text-decoration: none; }
+  .task .mini { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; margin-top: 6px; }
+  .task .mini > div { height: 100%; background: var(--good); }
+  .taskbar { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 13px; color: var(--quiet); }
+  .taskbar span { flex: 1; }
+  .taskbar button { width: auto; flex: none; padding: 6px 12px; font-size: 14px; border-radius: 8px; }
 </style>
 </head>
 <body>
 <main>
   <section class="card" id="login" hidden>
-    <h1 style="margin-top:0">羽毛球分析</h1>
-    <h2>输入口令</h2>
-    <input type="password" id="token" autocomplete="current-password" placeholder="口令">
-    <button id="loginBtn">进入</button>
+    <div class="brand"><img src="/logo.svg" alt="BA"><h1>羽毛球分析</h1></div>
+    <a class="pick" id="googleBtn" href="/api/v1/auth/google/start" style="text-decoration:none" hidden>用 Google 账号登录</a>
     <p class="quiet" id="loginMsg"></p>
+    <details id="pwBox" class="quiet"><summary>用口令登录（管理员）</summary>
+      <input type="password" id="token" autocomplete="current-password" placeholder="口令" style="margin-top:8px">
+      <button id="loginBtn" class="plain">进入</button>
+    </details>
+    <p class="quiet legal">By signing in you agree to the <a href="/terms">Terms of Service</a> and <a href="/privacy">Privacy Policy</a>.</p>
+  </section>
+
+  <!-- 用 Google 登录了，但还没有被邀请 -->
+  <section class="card" id="pending" hidden>
+    <div class="brand"><img src="/logo.svg" alt="BA"><h1>羽毛球分析</h1></div>
+    <p>已登录：<b id="pendingWho"></b></p>
+    <p id="pendingMsg"></p>
+    <button class="plain" id="pendingLogout">换一个账号</button>
+    <details class="quiet" id="claimBox" style="margin-top:14px"><summary>我是管理员</summary>
+      <p>输入一次网站的口令，这个 Google 账号就成为管理员。</p>
+      <input type="password" id="claimPw" autocomplete="current-password" placeholder="口令">
+      <button id="claimBtn" class="plain">成为管理员</button>
+      <p class="bad" id="claimMsg"></p>
+    </details>
   </section>
 
   <div id="app" hidden>
     <!-- 首页：我的录像 -->
     <div class="view" id="vHome">
-      <div class="top"><h1>我的录像</h1><a href="#/settings">设置</a></div>
+      <div class="top"><h1>我的录像</h1><a href="#/tasks">标注任务</a><a href="#/team">成员</a><a href="#/settings">设置</a></div>
       <a class="pick" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
       <div class="chips" id="filters"></div>
       <div id="list"><div class="empty">读取中</div></div>
@@ -314,6 +351,7 @@
           <a class="pick" id="aOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注</a>
           <div class="row"><button id="aPrepare" hidden>准备标注</button></div>
           <div class="row"><button class="plain" id="aFresh" hidden>用新模型重新预测</button><button class="plain" id="aClear" hidden>删除图片</button></div>
+          <div class="row"><a class="plain pick" id="aCsv" style="text-decoration:none;background:none;color:var(--accent);border:1px solid var(--line);font-weight:400" hidden>下载 CSV（带标注人）</a></div>
           <h3 style="margin-top:22px">击球类型</h3>
           <p class="quiet">每一拍剪成一小段慢放，选它是什么球（杀球、吊球……），再加上劈杀、对角这类标记。已经按模型的判断选好，模型没把握的排在前面。</p>
           <p id="kState"></p>
@@ -335,9 +373,30 @@
       </section>
     </div>
 
+    <!-- 任务大厅：领标注任务 -->
+    <div class="view" id="vTasks" hidden>
+      <div class="top"><a href="#/" class="adminOnly">‹ 返回</a><h1>标注任务</h1><span class="quiet" id="tWho"></span><a id="tLogout" class="annotatorOnly">退出</a></div>
+      <p class="quiet">领一个任务就只有你能标这一段，别人不会重复标。领了之后 2 小时没有保存会自动放回大厅；每次保存都会重新计时。标完点「提交」。</p>
+      <p class="bad" id="tError" hidden></p>
+      <div id="tList"><div class="empty">读取中</div></div>
+    </div>
+
+    <!-- 成员和每个人的进度（管理员） -->
+    <div class="view" id="vTeam" hidden>
+      <div class="top"><a href="#/">‹ 返回</a><h1>成员</h1></div>
+      <section class="card">
+        <h2>邀请</h2>
+        <p class="quiet">填对方的 Google 邮箱。对方打开网站用 Google 登录就能领任务。没被邀请的人登录后会出现在下面的「申请加入」里，点「允许」也可以。</p>
+        <div class="row"><input type="text" id="mEmail" inputmode="email" autocapitalize="off" placeholder="name@gmail.com"><button id="mAdd" style="flex:none;width:auto;padding:10px 16px">邀请</button></div>
+        <p class="bad" id="mError" hidden></p>
+      </section>
+      <div id="mList"><div class="empty">读取中</div></div>
+    </div>
+
     <!-- 标注球的位置 -->
     <div class="view" id="vLabel" hidden>
       <div class="top"><a id="lBack">‹ 返回</a><h1>标注球的位置</h1><span id="lSave" class="quiet"></span></div>
+      <div class="taskbar" id="lTaskBar" hidden><span></span><button>提交任务</button></div>
       <p class="quiet" id="lMsg"></p>
       <div id="lStage" hidden>
         <div id="lPic"><canvas id="lCanvas"></canvas><canvas id="lLoupe" hidden></canvas>
@@ -377,6 +436,7 @@
     <!-- 标注击球类型 -->
     <div class="view" id="vStrokes" hidden>
       <div class="top"><a id="sBack">‹ 返回</a><h1>标注击球类型</h1><span id="sSave" class="quiet"></span></div>
+      <div class="taskbar" id="sTaskBar" hidden><span></span><button>提交任务</button></div>
       <p class="quiet" id="sMsg"></p>
       <div id="sStage" hidden>
         <div id="sPic"><video id="sVideo" playsinline muted preload="auto"></video></div>
@@ -440,6 +500,7 @@
 <script src="label.js"></script>
 <script src="stroke.js"></script>
 <script src="status.js"></script>
+<script src="team.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

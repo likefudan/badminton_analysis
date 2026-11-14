@@ -84,6 +84,12 @@ test("首页和脚本能打开", async () => {
   assert.equal(page.status, 200);
   assert.match(await page.text(), /选择录像/);
   assert.equal((await fetch(`http://127.0.0.1:${PORT}/app.js`)).status, 200);
+  // 条款、隐私和 logo 不用登录就能看
+  for (const [path, text] of [["/terms", /Terms of Service/], ["/privacy", /Privacy Policy/], ["/terms.html", /Terms of Service/], ["/logo.svg", /<svg/]]) {
+    const res = await fetch(`http://127.0.0.1:${PORT}${path}`);
+    assert.equal(res.status, 200, path);
+    assert.match(await res.text(), text);
+  }
 });
 
 test("分片上传、断点续传、合并、下载、删除", async () => {
@@ -474,7 +480,10 @@ test("击球类型：请求、节点准备、读小视频、存标注、下载 C
   });
   const csv = await call(`/videos/${v.id}/stroke-labels?format=csv`);
   assert.match(csv.headers.get("content-disposition"), /game_1\.strokes\.labels\.csv/);
-  assert.equal((await csv.text()).replace(/^﻿/, ""), 'frame,player_id,type,tags,note\r\n10,,发短球,,\r\n60,3,吊球,劈吊;对角,"很快, ""假动作"""\r\n98,,不是击球,,\r\n');
+  // 后两列是标注人（这里还没有管理员账号，是空的）和时间
+  const stamp = "\\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z";
+  assert.match((await csv.text()).replace(/^﻿/, ""), new RegExp(
+    `^frame,player_id,type,tags,note,annotator,updated_at\\r\\n10,,发短球,,,,${stamp}\\r\\n60,3,吊球,劈吊;对角,"很快, ""假动作""",,${stamp}\\r\\n98,,不是击球,,,,${stamp}\\r\\n$`));
   st = await (await call(`/videos/${v.id}`)).json();
   assert.equal(st.strokes.labels, 3);
 

@@ -5,8 +5,12 @@ name: 部署 ba.llmat.dev
 #   CLOUDFLARE_API_TOKEN   权限：Workers Scripts 编辑、Workers R2 Storage 编辑、D1 编辑、
 #                          llmat.dev 的 Workers Routes 编辑
 #   CLOUDFLARE_ACCOUNT_ID
-#   BA_ACCESS_TOKEN        网站登录口令（自己定）
+#   BA_ACCESS_TOKEN        可选：网站的口令（旧的登录方式）。不设就不改 Worker 里已有的口令
 #   BA_NODE_TOKEN          可选：Mac 处理节点的钥匙（和 ~/.config/badminton/node.json 里的一致）
+#                          两个都没有时，部署后只做不用登录的检查
+#   GOOGLE_CLIENT_ID、GOOGLE_CLIENT_SECRET  可选：用 Google 登录（多人标注）。在 Google Cloud 建一个「Web 应用」OAuth 客户端，
+#                          重定向 URI 填 https://ba.llmat.dev/api/v1/auth/google/callback；没有就只能用口令登录
+#   ADMIN_GOOGLE_EMAIL     可选：超级管理员的 Google 邮箱，用它登录就是管理员
 #   AI_API_KEY 或 AZURE_API_KEY  可选：AI 报告用的模型的 API key（地址和模型名在 cloud/wrangler.toml 的 [vars]）；没有就不出报告
 on:
   push:
@@ -52,7 +56,6 @@ jobs:
           missing=""
           [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
           [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
-          [ -n "$BA_ACCESS_TOKEN" ] || missing="$missing BA_ACCESS_TOKEN"
           if [ -n "$missing" ]; then
             echo "::error::缺少仓库 secret:$missing"
             exit 1
@@ -109,7 +112,12 @@ jobs:
       - name: 设置登录口令
         env:
           BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
-        run: printf '%s' "$BA_ACCESS_TOKEN" | npx wrangler secret put ACCESS_TOKEN
+        run: |
+          if [ -n "$BA_ACCESS_TOKEN" ]; then
+            printf '%s' "$BA_ACCESS_TOKEN" | npx wrangler secret put ACCESS_TOKEN
+          else
+            echo "没有 BA_ACCESS_TOKEN，跳过（Worker 里已有的口令不变）"
+          fi
 
       - name: 设置处理节点的钥匙（有才设）
         env:
@@ -119,6 +127,24 @@ jobs:
             printf '%s' "$BA_NODE_TOKEN" | npx wrangler secret put NODE_TOKEN
           else
             echo "没有 BA_NODE_TOKEN，跳过"
+          fi
+
+      - name: 设置 Google 登录（有才设）
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          ADMIN_GOOGLE_EMAIL: ${{ secrets.ADMIN_GOOGLE_EMAIL }}
+        run: |
+          if [ -n "$GOOGLE_CLIENT_ID" ] && [ -n "$GOOGLE_CLIENT_SECRET" ]; then
+            printf '%s' "$GOOGLE_CLIENT_ID" | npx wrangler secret put GOOGLE_CLIENT_ID
+            printf '%s' "$GOOGLE_CLIENT_SECRET" | npx wrangler secret put GOOGLE_CLIENT_SECRET
+          else
+            echo "没有 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET，跳过（网站只能用口令登录）"
+          fi
+          if [ -n "$ADMIN_GOOGLE_EMAIL" ]; then
+            printf '%s' "$ADMIN_GOOGLE_EMAIL" | npx wrangler secret put ADMIN_GOOGLE_EMAIL
+          else
+            echo "没有 ADMIN_GOOGLE_EMAIL，跳过（第一个管理员用口令认领）"
           fi
 
       - name: 设置 AI 报告的 API key（有才设）
@@ -148,13 +174,26 @@ jobs:
           }
           check "首页" 200 "$SITE/"
           check "未登录 /api/v1/me" 401 "$SITE/api/v1/me"
-          check "登录后 /api/v1/me" 200 -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me"
-          echo "AI 报告是否可用：$(curl -s -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me" | grep -o '"review":[a-z]*' || true)"
+          KEY="${BA_NODE_TOKEN:-$BA_ACCESS_TOKEN}"
+          if [ -n "$KEY" ]; then
+            check "带钥匙的 /api/v1/me" 200 -H "Authorization: Bearer $KEY" "$SITE/api/v1/me"
+          else
+            echo "没有 BA_NODE_TOKEN 或 BA_ACCESS_TOKEN，跳过需要登录的检查"
+          fi
+          echo "Google 登录是否可用：$(curl -s "$SITE/api/v1/auth/config" || true)"
+          check "条款页" 200 -L "$SITE/terms"
+          check "隐私页" 200 -L "$SITE/privacy"
+          [ -z "$KEY" ] || echo "AI 报告是否可用：$(curl -s -H "Authorization: Bearer $KEY" "$SITE/api/v1/me" | grep -o '"review":[a-z]*' || true)"
           if [ -n "$BA_NODE_TOKEN" ]; then
             check "处理节点的钥匙 /api/v1/me" 200 -H "Authorization: Bearer $BA_NODE_TOKEN" "$SITE/api/v1/me"
           fi
 
       - name: 线上分片上传检查（传完即删）
         env:
-          BA_ACCESS_TOKEN: ${{ secrets.BA_ACCESS_TOKEN }}
-        run: node test/live-smoke.mjs
+          BA_ACCESS_TOKEN: ${{ secrets.BA_NODE_TOKEN || secrets.BA_ACCESS_TOKEN }}
+        run: |
+          if [ -n "$BA_ACCESS_TOKEN" ]; then
+            node test/live-smoke.mjs
+          else
+            echo "没有 BA_NODE_TOKEN 或 BA_ACCESS_TOKEN，跳过"
+          fi
