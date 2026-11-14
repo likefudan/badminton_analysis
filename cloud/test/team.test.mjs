@@ -159,6 +159,9 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
 
   // 任务：2 个回合 + 击球 45 拍分成 20 和 25；已经标完的回合直接算完成
   let list = await (await alice.get("/tasks")).json();
+  // 素材页：每段录像的材料状态和任务数
+  const mat = (await (await alice.get("/labeling/videos")).json()).videos.find((x) => x.id === vid);
+  assert.deepEqual([mat.annot.status, mat.annot.tasks, mat.strokes.tasks], ["ready", { approved: 1, open: 1 }, { open: 2 }]);
   const brief = (l) => l.tasks.map((t) => [t.kind, t.start, t.end, t.items, t.done, t.status]);
   assert.deepEqual(brief(list), [
     ["shuttle", 10, 12, 3, 3, "approved"], ["shuttle", 50, 53, 4, 0, "open"],
@@ -184,7 +187,7 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   assert.equal((await carol.get("/tasks")).status, 200);
 
   // 标注员：看不到录像、设置、成员，不能改标注材料；没领任务读不了材料
-  for (const path of ["/videos", `/videos/${vid}`, "/ai", "/status", "/admin/users"]) assert.equal((await bob.get(path)).status, 403, path);
+  for (const path of ["/videos", `/videos/${vid}`, "/ai", "/status", "/admin/users", "/labeling/videos"]) assert.equal((await bob.get(path)).status, 403, path);
   assert.equal((await bob.post("/admin/users", { email: "eve@example.com" })).status, 403);
   assert.equal((await bob.post(`/videos/${vid}/annot`)).status, 403);
   assert.equal((await bob.put(`/videos/${vid}/annot/files/state.json`, {})).status, 403);
@@ -320,6 +323,16 @@ test("超级管理员：用 ADMIN_GOOGLE_EMAIL 登录直接是管理员，不能
     assert.equal((await boss.post("/admin/users", { email: "dave@example.com", role: "admin" })).status, 200);
     const dave = await signIn("dave@example.com");
     assert.equal((await dave.get("/admin/users")).status, 200);
+    // 别的管理员只有标注这一边：能看素材和进度，不能看录像、上传、设置，也不能让 Mac 准备材料
+    assert.equal((await (await dave.get("/me")).json()).owner, false);
+    assert.equal(me.owner, true);
+    assert.deepEqual((await (await dave.get("/labeling/videos")).json()).videos, []);
+    assert.equal((await dave.get("/tasks")).status, 200);
+    for (const path of ["/videos", "/ai", "/status"]) assert.equal((await dave.get(path)).status, 403, path);
+    assert.equal((await dave.post("/videos", { filename: "a.mp4", size: 10 })).status, 403);
+    assert.equal((await dave.post("/videos/00000000-0000-0000-0000-000000000000/annot")).status, 403);
+    assert.equal((await dave.get("/videos/00000000-0000-0000-0000-000000000000/labels")).status, 404); // 过了权限，只是没有这段录像
+    assert.equal((await boss.get("/videos")).status, 200);
     for (const body of [{ status: "disabled" }, { role: "annotator" }]) {
       assert.equal((await dave.post("/admin/users", { email: "boss@example.com", ...body })).status, 409);
     }

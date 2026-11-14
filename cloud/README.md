@@ -145,7 +145,14 @@ Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton
 
 ## 多人标注：Google 登录和领任务
 
-代码在 `src/team.ts`（后端）和 `public/team.js`（任务大厅 `#/tasks`、成员页 `#/team`）。
+代码在 `src/team.ts`（后端）和 `public/team.js`。
+
+网站分成两边，顶部导航切换：
+- **分析**（`#/` 我的录像、`#/upload`、`#/v/<id>`）：上传录像、看结果。只有超级管理员能用（要用家里的 Mac 处理），
+  设置和 Mac 状态也只有它能看；让 Mac 准备标注材料也只有它能点。
+- **标注**（`#/tasks` 任务、`#/materials` 素材、`#/review` 审核）：任务所有成员都能用；素材（每段录像的标注材料、进度、CSV，
+  接口 `GET /labeling/videos`）和审核只有管理员能看。
+- 账号菜单（右上角头像）：成员 `#/team`（管理员）、设置、Mac 状态、退出。
 
 - **登录**：网站用 Google 登录（OAuth 授权码流程，只要 `openid email profile`）。登录后发一个随机的会话 cookie `ba_sid`
   （库里只存 SHA-256，30 天过期）；带 cookie 的写请求必须有 `x-ba: 1` 头。口令（`ACCESS_TOKEN`）仍然有效：Mac 节点用它，

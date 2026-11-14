@@ -1,15 +1,26 @@
-// 多人标注：任务大厅（#/tasks）、成员页（#/team，管理员）、标注页顶上的任务条。
+// 「标注」这一边：任务（#/tasks）、素材（#/materials，管理员）、审核（#/review，管理员）、标注页顶上的任务条；
+// 还有账号菜单里的成员页（#/team，管理员）。
 // 任务 = 一个回合的球位置，或约 20 拍的击球类型。领了之后只有自己能标这一段，标完提交。
 "use strict";
 
 const Team = (() => {
   const $t = (id) => document.getElementById(id);
-  let tasks = [], info = null, timer = 0, open = false, barTask = null;
+  let tasks = [], info = null, timer = 0, page = null, barTask = null, lastList = "tasks", materials = null;
+  const errBox = () => $t(page === "review" ? "rvError" : page === "materials" ? "mtError" : "tError");
   const post = (path, body) => api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
 
+  // 右上角的头像和账号菜单
   function setUser() {
-    $t("tWho").textContent = me && me.email ? me.name || me.email : "";
+    const name = (me && (me.name || me.email)) || "管理员";
+    const av = $t("navAvatar");
+    av.textContent = me && me.picture ? "" : name.slice(0, 1).toUpperCase();
+    av.style.backgroundImage = me && me.picture ? `url("${me.picture}")` : "";
+    $t("navName").textContent = name;
+    $t("navEmail").textContent = (me && me.email) || "";
+    $t("navRole").textContent = isOwner() ? "超级管理员" : isAdmin() ? "管理员" : "标注员";
   }
+  // 点菜单外面就收起来
+  document.addEventListener("click", (e) => { if (!$t("navMenu").contains(e.target)) $t("navMenu").open = false; });
 
   // ---------- 任务 ----------
 
@@ -33,28 +44,31 @@ const Team = (() => {
 
   async function refresh() {
     clearTimeout(timer);
+    const shown = page;
     try {
       await load();
-      $t("tError").hidden = true;
+      if (shown === "materials") materials = await api("/labeling/videos");
+      errBox().hidden = true;
     } catch (e) {
-      $t("tError").hidden = false;
-      $t("tError").textContent = "读取失败：" + e.message;
+      errBox().hidden = false;
+      errBox().textContent = "读取失败：" + e.message;
     }
-    if (!open) return;
+    if (page !== shown || !page) return;
     render();
-    timer = setTimeout(refresh, 20000);
+    const preparing = shown === "materials" && materials && materials.videos.some((v) => [v.annot.status, v.strokes.status].some((x) => x === "queued" || x === "preparing"));
+    timer = setTimeout(refresh, preparing ? 4000 : 20000);
   }
 
   async function act(t, action, body) {
     try {
       info = await post(`/tasks/${t.id}/${action}`, body);
       tasks = info.tasks;
-      $t("tError").hidden = true;
+      errBox().hidden = true;
       render();
       return true;
     } catch (e) {
-      $t("tError").hidden = false;
-      $t("tError").textContent = e.message;
+      errBox().hidden = false;
+      errBox().textContent = e.message;
       refresh();
       return false;
     }
@@ -100,53 +114,147 @@ const Team = (() => {
     return card;
   }
 
+  const unit = (t) => (t.kind === "shuttle" ? "帧" : "拍");
+  const prog = (t) => `已标 ${t.done}/${t.items} ${unit(t)}`;
+  function group(box, title, list, make) {
+    if (!list.length) return;
+    box.append(el("div", "tgroup", `${title}（${list.length}）`));
+    for (const t of list) box.append(make(t));
+  }
+
   function render() {
+    const waiting = tasks.filter((t) => t.status === "submitted").length;
+    for (const n of document.querySelectorAll("[data-review]")) n.textContent = isAdmin() && waiting ? String(waiting) : "";
+    if (page === "tasks") renderTasks();
+    else if (page === "review") renderReview();
+    else if (page === "materials") renderMaterials();
+  }
+
+  // 任务：我手上的、可以领的
+  function renderTasks() {
     const box = $t("tList");
     box.textContent = "";
-    const admin = isAdmin(), unit = (t) => (t.kind === "shuttle" ? "帧" : "拍");
-    const prog = (t) => `已标 ${t.done}/${t.items} ${unit(t)}`;
-    const group = (title, list, make) => {
-      if (!list.length) return;
-      box.append(el("div", "tgroup", `${title}（${list.length}）`));
-      for (const t of list) box.append(make(t));
-    };
-    group("我手上的", tasks.filter((t) => t.status === "claimed" && t.mine), (t) =>
-      row(t, `${prog(t)} · ${leaseText(t)}自动放回大厅`, [
+    group(box, "我手上的", tasks.filter((t) => t.status === "claimed" && t.mine), (t) =>
+      row(t, `${prog(t)} · ${leaseText(t)}自动放回`, [
         link("继续标注", linkOf(t)),
         submitButton(t),
         button("放弃", "plain danger", () => act(t, "release")),
       ]));
-    group("可以领取", tasks.filter((t) => t.status === "open"), (t) =>
+    group(box, "可以领取", tasks.filter((t) => t.status === "open"), (t) =>
       row(t, t.done ? `${prog(t)}（别人标了一部分）` : "还没有人标", [
         button("领取并开始", "", async () => { if (await act(t, "claim")) location.hash = linkOf(t); }),
       ]));
-    if (admin) {
-      group("别人正在标", tasks.filter((t) => t.status === "claimed" && !t.mine), (t) =>
-        row(t, `${who(t)} · ${prog(t)} · ${leaseText(t)}`, [link("查看", linkOf(t), "plain"), button("收回", "plain danger", () => act(t, "release"))]));
-      group("已提交，等你看", tasks.filter((t) => t.status === "submitted"), (t) =>
-        row(t, `${who(t)} · ${prog(t)} · ${fmtDate(new Date(t.submittedAt))}提交`, [
-          link("查看", linkOf(t), "plain"),
-          button("通过", "", () => act(t, "approve")),
-          button(t.assignee ? "退回重标" : "放回大厅", "plain", () => act(t, "return")),
-        ]));
-      group("已完成", tasks.filter((t) => t.status === "approved"), (t) =>
-        row(t, `${who(t) || "以前标的"} · ${prog(t)}`, [link("查看", linkOf(t), "plain"), button(t.assignee ? "退回重标" : "放回大厅", "plain", () => act(t, "return"))]));
-    } else {
-      group("我提交的", tasks.filter((t) => t.mine && t.status !== "claimed"), (t) =>
+    if (!isAdmin()) {
+      group(box, "我提交的", tasks.filter((t) => t.mine && t.status !== "claimed"), (t) =>
         row(t, `${prog(t)} · ${t.status === "approved" ? "管理员已通过" : "已提交"}`, []));
     }
-    if (!box.children.length) box.append(el("div", "empty", admin ? "还没有标注任务。在录像的「标注」里点「准备标注」，Mac 准备好之后任务会出现在这里。" : "现在没有可以领的任务，过一会儿再来看看。"));
+    if (!box.children.length) box.append(el("div", "empty", isAdmin() ? "现在没有可以领的任务。到「素材」里给录像准备标注材料，准备好之后任务会出现在这里。" : "现在没有可以领的任务，过一会儿再来看看。"));
   }
 
-  function openTasks() {
-    open = true;
-    setUser();
+  // 审核（管理员）：已提交等着看的、别人正在标的、已完成的
+  function renderReview() {
+    const box = $t("rvList");
+    box.textContent = "";
+    group(box, "已提交，等你看", tasks.filter((t) => t.status === "submitted"), (t) =>
+      row(t, `${who(t)} · ${prog(t)} · ${fmtDate(new Date(t.submittedAt))}提交`, [
+        link("查看", linkOf(t), "plain"),
+        button("通过", "", () => act(t, "approve")),
+        button(t.assignee ? "退回重标" : "放回任务里", "plain", () => act(t, "return")),
+      ]));
+    group(box, "正在标", tasks.filter((t) => t.status === "claimed"), (t) =>
+      row(t, `${t.mine ? "我" : who(t)} · ${prog(t)} · ${leaseText(t)}`, [link("查看", linkOf(t), "plain"), button("收回", "plain danger", () => act(t, "release"))]));
+    group(box, "已完成", tasks.filter((t) => t.status === "approved"), (t) =>
+      row(t, `${who(t) || "以前标的"} · ${prog(t)}`, [link("查看", linkOf(t), "plain"), button(t.assignee ? "退回重标" : "放回任务里", "plain", () => act(t, "return"))]));
+    if (!box.children.length) box.append(el("div", "empty", "还没有人领任务。"));
+  }
+
+  // ---------- 素材（管理员）：每段录像的标注材料 ----------
+
+  async function prepare(v, path, method, body) {
+    try {
+      await api(`/videos/${v.id}${path}`, { method, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+      $t("mtError").hidden = true;
+    } catch (e) {
+      $t("mtError").hidden = false;
+      $t("mtError").textContent = `${v.title || v.filename}：${e.message}`;
+    }
     refresh();
   }
-  function closeTasks() {
-    open = false;
-    clearTimeout(timer);
+  function armed(text, again, fn) {
+    const b = button(text, "plain danger", () => {
+      if (b.dataset.armed !== "1") { b.dataset.armed = "1"; b.textContent = again; return; }
+      fn();
+    });
+    return b;
   }
+  const taskLine = (c) => {
+    const parts = [["open", "待领"], ["claimed", "正在标"], ["submitted", "待审核"], ["approved", "完成"]].filter(([k]) => c[k]).map(([k, name]) => `${c[k]} 个${name}`);
+    return parts.length ? "任务：" + parts.join(" · ") : "";
+  };
+  function stateText(x, online, what) {
+    return {
+      none: "还没有准备",
+      queued: online ? "排队中，Mac 马上开始准备" : "排队中。家里的 Mac 现在离线，上线后开始准备",
+      preparing: "Mac 正在准备：" + (x.stage || "开始"),
+      ready: `${what}准备好了` + (x.stage ? "：" + x.stage : ""),
+      failed: "准备失败：" + (x.error || ""),
+    }[x.status] || "";
+  }
+
+  function renderMaterials() {
+    const box = $t("mtList");
+    box.textContent = "";
+    if (!materials) { box.append(el("div", "empty", "读取中")); return; }
+    const node = materials.node, online = node && new Date(materials.now) - new Date(node.seenAt) < 2 * 60 * 1000;
+    $t("mtNode").textContent = node ? (online ? `家里的 Mac 在线（${node.name}）` : `家里的 Mac 离线（${node.name}），上线后才会开始准备`) : "家里的 Mac 还没有连接过";
+    const owner = isOwner();
+    for (const v of materials.videos) {
+      const card = el("section", "card mat");
+      card.append(el("h2", "", v.title || v.filename));
+      card.append(el("div", "quiet", `${fmtDate(new Date(v.createdAt))}上传` + (v.analyzed ? "" : " · 还没分析完，分析完才能准备标注材料")));
+
+      const a = v.annot, c = a.labels || {}, n = (c.human || 0) + (c.bulk || 0) + (c.skip || 0);
+      card.append(el("h3", "", "球的位置"));
+      card.append(el("div", a.status === "failed" ? "bad" : "quiet", stateText(a, online, "图片")));
+      const line = [n ? `已标 ${n} 帧（亲手确认 ${c.human || 0}，一键接受 ${c.bulk || 0}，看不清 ${c.skip || 0}）` : "", taskLine(a.tasks)].filter(Boolean).join(" · ");
+      if (line) card.append(el("div", "quiet", line));
+      const acts = el("div", "acts");
+      if (owner && v.analyzed && (a.status === "none" || a.status === "failed")) acts.append(button(a.status === "failed" ? "重新准备" : "准备标注", "", () => prepare(v, "/annot", "POST", {})));
+      if (owner && v.analyzed && a.status === "ready") acts.append(button("用新模型重新预测", "plain", () => prepare(v, "/annot", "POST", { fresh: true })));
+      if (a.status === "ready") acts.append(link("整段打开", "#/label/" + v.id, "plain"));
+      if (n) { const d = link("下载 CSV", `${API}/videos/${v.id}/labels?format=csv`, "plain"); acts.append(d); }
+      if (owner && (a.status === "ready" || a.status === "failed")) acts.append(armed("删除图片", "再点一次：删除图片（标注保留）", () => prepare(v, "/annot", "DELETE")));
+      card.append(acts);
+
+      const k = v.strokes;
+      card.append(el("h3", "", "击球类型"));
+      card.append(el("div", k.status === "failed" ? "bad" : "quiet", stateText(k, online, "小视频")));
+      const kline = [k.labels ? `已标 ${k.labels} 拍` : "", taskLine(k.tasks)].filter(Boolean).join(" · ");
+      if (kline) card.append(el("div", "quiet", kline));
+      const kacts = el("div", "acts");
+      // 准备好了也能重新准备（比如 Mac 上的程序更新了）：已标的拍按帧号对应，不会丢
+      if (owner && v.analyzed && k.status !== "queued" && k.status !== "preparing")
+        kacts.append(button(k.status === "none" ? "准备击球类型标注" : k.status === "ready" ? "重新准备（已标的保留）" : "重新准备", k.status === "ready" ? "plain" : "", () => prepare(v, "/strokes", "POST", {})));
+      if (k.status === "ready") kacts.append(link("整段打开", "#/strokes/" + v.id, "plain"));
+      if (k.labels) kacts.append(link("下载 CSV", `${API}/videos/${v.id}/stroke-labels?format=csv`, "plain"));
+      if (owner && (k.status === "ready" || k.status === "failed")) kacts.append(armed("删除小视频", "再点一次：删除小视频（标注保留）", () => prepare(v, "/strokes", "DELETE")));
+      card.append(kacts);
+      box.append(card);
+    }
+    if (!materials.videos.length) box.append(el("div", "empty", "还没有传完的录像。"));
+  }
+
+  // 切到「标注」的某一页（tasks | review | materials），或者离开（null）
+  function show(name) {
+    clearTimeout(timer);
+    page = name;
+    if (!name) return;
+    if (name !== "materials") lastList = name;
+    setUser();
+    render();   // 先用手上的数据画，再去取新的
+    refresh();
+  }
+  const cameFrom = () => lastList;
 
   // 标注页用：按任务号取任务（从服务器拿最新的）
   async function task(id) {
@@ -251,5 +359,5 @@ const Team = (() => {
     if ($t("mError").hidden) $t("mEmail").value = "";
   };
 
-  return { setUser, openTasks, closeTasks, openTeam, task, showBar };
+  return { setUser, show, cameFrom, openTeam, task, showBar };
 })();

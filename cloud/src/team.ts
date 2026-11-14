@@ -12,6 +12,7 @@ export type Who = {
   role: "admin" | "annotator";
   status: "active" | "pending" | "disabled";
   via: "token" | "google";
+  owner: boolean;                // 超级管理员：只有它能上传和分析录像、让 Mac 准备标注材料（用口令的也算）
   mediaOnly?: boolean;           // 口令登录留下的只读 cookie：只用来取图片和视频，不算登录
 };
 
@@ -37,7 +38,7 @@ const secureFlag = (req: Request) => (new URL(req.url).protocol === "https:" ? "
 // ---------- 是谁 ----------
 
 export async function identify(req: Request, env: Env): Promise<Who | null> {
-  const tokenUser: Who = { email: "", name: "管理员", picture: "", role: "admin", status: "active", via: "token" };
+  const tokenUser: Who = { email: "", name: "管理员", picture: "", role: "admin", status: "active", via: "token", owner: true };
   const header = req.headers.get("authorization") ?? "";
   if (header.startsWith("Bearer ")) {
     const got = header.slice(7);
@@ -53,8 +54,9 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
        WHERE s.id_hash = ? AND s.expires_at > ?`,
     )
       .bind(await hashOf(sid), new Date().toISOString())
-      .first<Omit<Who, "via">>();
-    if (row) return { ...row, via: "google" };
+      .first<Omit<Who, "via" | "owner">>();
+    // 没有设置 ADMIN_GOOGLE_EMAIL 时，管理员都算超级管理员
+    if (row) return { ...row, via: "google", owner: row.role === "admin" && row.status === "active" && (!superAdmin(env) || row.email === superAdmin(env)) };
   }
   // 用口令登录的网页：图片和视频靠这个只读 cookie（值由口令算出）
   const legacy = cookieOf(req, LEGACY_COOKIE);
@@ -64,7 +66,7 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
 
 export const isAdmin = (who: Who) => who.role === "admin" && who.status === "active";
 
-export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture: who.picture, role: who.role, status: who.status, via: who.via });
+export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture: who.picture, role: who.role, status: who.status, via: who.via, owner: who.owner });
 
 // 标注记在谁名下：用口令登录的算第一个管理员
 async function annotatorOf(env: Env, who: Who): Promise<string> {

@@ -46,7 +46,7 @@ const Label = (() => {
       go(start.r, start.i);
       renderRallies();
     } catch (e) {
-      $l("lMsg").textContent = e.status === 404 ? "标注用的图片还没准备好：回到录像的「处理」里点「准备标注」。" : "读取失败：" + e.message;
+      $l("lMsg").textContent = e.status === 404 ? "标注用的图片还没准备好：到「标注 › 素材」里点「准备标注」。" : "读取失败：" + e.message;
     }
   }
 
