@@ -761,6 +761,8 @@ def prepare_annotation(api: Api, cfg: Config, video: dict, pack_fn=None) -> None
         stop.set()
         detail = str(e) if isinstance(e, StepFailed) else f"{type(e).__name__}: {e}"
         print(f"  失败：{detail}")
+        for line in log[-12:]:  # the step's own output, so node.log says why
+            print("    " + line)
         try:
             send("failed", error=(detail + "\n\n" + "\n".join(log[-12:])).strip())
         except Exception as e2:
@@ -866,6 +868,8 @@ def prepare_strokes(api: Api, cfg: Config, video: dict, strokes_fn=None) -> None
         stop.set()
         detail = str(e) if isinstance(e, StepFailed) else f"{type(e).__name__}: {e}"
         print(f"  失败：{detail}")
+        for line in log[-12:]:  # the step's own output, so node.log says why
+            print("    " + line)
         try:
             send("failed", error=(detail + "\n\n" + "\n".join(log[-12:])).strip())
         except Exception as e2:

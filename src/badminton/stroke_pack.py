@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -123,6 +124,7 @@ def encoder_args(clip_frames: int) -> list[list[str]]:
 
 def write_clips(video: Path, strokes: list[dict], out: Path, ctx: dict | None, width: int = WIDTH,
                 progress=None) -> dict:
+    """`progress(done, total, elapsed_s)` as pipeline.print_progress."""
     import cv2
 
     from .video import probe
@@ -139,6 +141,7 @@ def write_clips(video: Path, strokes: list[dict], out: Path, ctx: dict | None, w
     if not shutil.which("ffmpeg"):
         raise SystemExit("需要 ffmpeg 来写击球小视频")
     total = len(strokes) * n_clip
+    t0 = time.monotonic()
     for args in encoder_args(n_clip):
         tmp = out.with_name(out.name + ".tmp.mp4")
         proc = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -170,7 +173,7 @@ def write_clips(video: Path, strokes: list[dict], out: Path, ctx: dict | None, w
                     proc.stdin.write(small.tobytes())
                     done += 1
                     if progress and done % 30 == 0:
-                        progress(done, total)
+                        progress(done, total, time.monotonic() - t0)
             proc.stdin.close()
             err = proc.stderr.read().decode("utf-8", "replace")
             code = proc.wait()
@@ -181,7 +184,7 @@ def write_clips(video: Path, strokes: list[dict], out: Path, ctx: dict | None, w
         if code == 0 and tmp.exists() and tmp.stat().st_size:
             os.replace(tmp, out)
             if progress:
-                progress(total, total)
+                progress(total, total, time.monotonic() - t0)
             return {"fps": fps, "frames": n_clip, "hit": before, "size": [w, h], "video_size": [info.width, info.height]}
         print(f"编码失败（{args[1]}）：{err.strip()[-300:]}")
         tmp.unlink(missing_ok=True)
