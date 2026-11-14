@@ -5,6 +5,9 @@ about (the same ranking as `badminton annotate`), cuts their frames into JPEGs
 and writes them to DIR:
 
   rally-<k>.bin   the JPEGs of rally k one after another; state.json says where each starts
+  rally-<k>.hd.bin  per frame a full-resolution crop (CROP x CROP video pixels) around where
+                  the model puts the shuttle, for a sharp magnifier on the phone (only when
+                  the video is wider than the JPEGs)
   state.json      video size and fps, the chosen rallies, and per frame the prediction
                   (chosen path and top-1), the moving candidate blobs and the uncertainty
 
@@ -34,9 +37,11 @@ import numpy as np
 from . import __version__
 from . import annotate as an
 
-PACK_VERSION = 1
-WIDTH = 1280          # JPEG width on the phone; the shuttle is 3-6 px wide here in a 4K court video
-QUALITY = 85
+PACK_VERSION = 2
+WIDTH = 1920          # JPEG width on the phone; the shuttle is 5-9 px wide here in a 4K court video
+QUALITY = 82
+CROP = 768            # side of the full-resolution crop around the predicted shuttle (video pixels)
+CROP_QUALITY = 90
 RALLIES = 3           # how many rallies to offer
 MAX_RALLY_S = 20.0    # longer rallies only when there are not enough short ones (a phone labels ~1 frame/s)
 MAX_FRAMES = 3600     # all chosen rallies together
@@ -94,19 +99,49 @@ def choose_rallies(rallies: list, uncertainty: np.ndarray, fps: float, count: in
     return out
 
 
-def write_rally(video: Path, start: int, end: int, out: Path, width: int = WIDTH, quality: int = QUALITY) -> list:
-    """JPEGs of frames start..end appended to `out`; [(offset, length)] per frame."""
+def crop_centers(path: np.ndarray, start: int, end: int, size: tuple) -> list[tuple[float, float]]:
+    """Per frame start..end the point the full-resolution crop is centred on: the predicted shuttle,
+    or where it was last (next) seen in the rally when it is not predicted, else the middle."""
+    seen = [(f, float(path[f, 1]), float(path[f, 2])) for f in range(start, end + 1) if path[f, 0] > 0]
+    out = []
+    for f in range(start, end + 1):
+        if not seen:
+            out.append((size[0] / 2, size[1] / 2))
+            continue
+        g = min(seen, key=lambda r: (abs(r[0] - f), r[0] > f))
+        out.append((g[1], g[2]))
+    return out
+
+
+def crop_box(cx: float, cy: float, size: tuple, crop: int = CROP) -> tuple[int, int, int, int]:
+    """(x0, y0, w, h) of a crop x crop box around (cx, cy), kept inside the frame."""
+    w, h = min(crop, size[0]), min(crop, size[1])
+    x0 = int(round(min(max(cx - w / 2, 0), size[0] - w)))
+    y0 = int(round(min(max(cy - h / 2, 0), size[1] - h)))
+    return x0, y0, w, h
+
+
+def write_rally(video: Path, start: int, end: int, out: Path, width: int = WIDTH, quality: int = QUALITY,
+                centers: list | None = None, hd_out: Path | None = None, crop: int = CROP) -> tuple[list, list | None]:
+    """JPEGs of frames start..end appended to `out`; [(offset, length)] per frame. With `centers` and
+    `hd_out`, also a full-resolution crop per frame in `hd_out`: [(offset, length, x0, y0)] per frame."""
     import cv2
 
     cap = cv2.VideoCapture(str(video))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-    offsets = []
-    with open(out, "wb") as f:
-        for _ in range(start, end + 1):
+    offsets, hd = [], ([] if centers is not None and hd_out is not None else None)
+    with open(out, "wb") as f, (open(hd_out, "wb") if hd is not None else open(os.devnull, "wb")) as fh:
+        for k in range(start, end + 1):
             ok, img = cap.read()
             if not ok:
                 break
             h, w = img.shape[:2]
+            if hd is not None:
+                x0, y0, cw, ch = crop_box(*centers[k - start], (w, h), crop)
+                ok, buf = cv2.imencode(".jpg", img[y0:y0 + ch, x0:x0 + cw], [cv2.IMWRITE_JPEG_QUALITY, CROP_QUALITY])
+                data = buf.tobytes()
+                hd.append((fh.tell(), len(data), x0, y0))
+                fh.write(data)
             if w > width:
                 img = cv2.resize(img, (width, round(h * width / w)), interpolation=cv2.INTER_AREA)
             ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
@@ -114,12 +149,12 @@ def write_rally(video: Path, start: int, end: int, out: Path, width: int = WIDTH
             offsets.append((f.tell(), len(data)))
             f.write(data)
     cap.release()
-    return offsets
+    return offsets, hd
 
 
 def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None, movement: str | Path | None = None,
          fresh: bool = False, count: int = RALLIES, tracknet_dir=None, progress=None, predict=an.predict,
-         width: int = WIDTH) -> dict:
+         width: int = WIDTH, crop: int = CROP) -> dict:
     from .video import probe
 
     video, out_dir = Path(video), Path(out_dir)
@@ -160,13 +195,17 @@ def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None
     image_size = None
     for k, (a, b) in enumerate(chosen):
         name = f"rally-{k}.bin"
-        offsets = write_rally(video, a, b, out_dir / name, width)
+        hd_name = f"rally-{k}.hd.bin" if size[0] > width else None
+        centers = crop_centers(path, a, min(b, n - 1), size) if hd_name else None
+        offsets, hd = write_rally(video, a, b, out_dir / name, width, centers=centers,
+                                  hd_out=out_dir / hd_name if hd_name else None, crop=crop)
         b = a + len(offsets) - 1  # the video may end early
         if image_size is None:
             image_size = [min(width, size[0]), round(size[1] * min(width, size[0]) / size[0])]
         frames = range(a, b + 1)
         out_rallies.append({
             "start": a, "end": b, "pack": name, "offsets": [list(o) for o in offsets],
+            "hd_pack": hd_name, "hd": [list(o) for o in hd] if hd is not None else None,
             "uncertainty": round(float(unc[a:b + 1].mean()), 3) if b >= a else 0,
             "pred": [[int(path[f, 0] > 0), r1(path[f, 1]), r1(path[f, 2])] for f in frames],
             "raw": [[int(raw[f, 0] > 0), r1(raw[f, 1]), r1(raw[f, 2])] for f in frames] if raw is not None else None,
@@ -179,6 +218,7 @@ def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None
         "version": PACK_VERSION, "tool": "badminton annotate-pack", "tool_version": __version__,
         "video": {"file": video.name, "frames": n, "fps": fps, "size": list(size)},
         "image": image_size or [width, round(size[1] * width / max(size[0], 1))],
+        "crop": [min(crop, size[0]), min(crop, size[1])] if size[0] > width else None,
         "model": {"stamp": stamp, "predicted_at": predicted_at},
         "confident": an.CONFIDENT, "doubtful": an.DOUBTFUL,
         "all_rallies": [[int(a), int(b)] for a, b in rallies],

@@ -744,7 +744,7 @@ def prepare_annotation(api: Api, cfg: Config, video: dict, pack_fn=None) -> None
         if code != 0 or not state_file.exists():
             raise StepFailed("切图失败")
         state = json.loads(state_file.read_text())
-        packs = [out_dir / r["pack"] for r in state["rallies"]]
+        packs = [out_dir / r[k] for r in state["rallies"] for k in ("pack", "hd_pack") if r.get(k)]
         total = sum(p.stat().st_size for p in packs)
         sent = 0
         for p in packs:  # the frames first, state.json last: the page only sees a complete set
@@ -754,7 +754,7 @@ def prepare_annotation(api: Api, cfg: Config, video: dict, pack_fn=None) -> None
             sent += p.stat().st_size
         api.upload_file(f"/videos/{vid}/annot/files/state.json", state_file, "state.json")
         stop.set()
-        stage["text"] = f"{len(packs)} 个回合，{sum(len(r['offsets']) for r in state['rallies'])} 帧"
+        stage["text"] = f"{len(state['rallies'])} 个回合，{sum(len(r['offsets']) for r in state['rallies'])} 帧"
         api.retrying(lambda: send("ready"), "汇报完成")
         print("  标注材料已上传：" + stage["text"])
     except Exception as e:

@@ -7,13 +7,13 @@
 const Label = (() => {
   const CHUNK = 8;            // 一次请求取几帧
   const AHEAD = 3;            // 往后预取几个块
-  const KEEP_BLOBS = 320;     // 压缩的图最多留多少张（约 30 MB）
+  const KEEP_BLOBS = 480;     // 压缩的图最多留多少张（整帧和原图局部一起算，约 60 MB）
   const SNAP_PX = 16;         // 点在候选点这么近（屏幕像素）就吸到候选点上
   const DRAG_PX = 8;          // 手指移动超过这么多算拖动，不算点
   const FINE = 0.3;           // 拖动时点移动的比例：手指走 10 像素，点走 3 像素
-  const LOUPE_ZOOM = 4;       // 放大镜相对屏幕上画面的倍数
+  const LOUPE_SPAN = 1 / 20;  // 放大镜里看到的宽度占视频宽度的比例（4K 里是 192 个像素）
   const TRAIL = 6;            // 画出前面几帧的轨迹
-  const SIDE_PX = 165;        // 手机横屏时右边按钮栏的宽度
+  const SIDE_PX = 175;        // 手机横屏时右边按钮栏的宽度
   const PHONE_LANDSCAPE = window.matchMedia("(orientation: landscape) and (max-height: 540px)");
 
   let L = null;               // 当前在标的录像
@@ -25,6 +25,7 @@ const Label = (() => {
     if (L && L.id === id) { draw(); return; }
     close();
     L = { id, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
+          hd: null, hdKey: "", focus: null, last: null,
           queue: new Map(), saving: false, saveError: "", armed: false, msg: "" };
     $l("lMsg").textContent = "读取中";
     $l("lStage").hidden = true;
@@ -46,6 +47,7 @@ const Label = (() => {
 
   function close() {
     if (L && L.bitmap) L.bitmap.close?.();
+    if (L && L.hd) L.hd.bmp.close?.();
     L = null;
   }
 
@@ -62,27 +64,30 @@ const Label = (() => {
     return null;
   }
 
-  async function chunk(r, c) {
-    const key = r + ":" + c;
+  // kind "" = 整帧（缩小的），"hd" = 球附近的原图局部
+  async function chunk(r, c, kind = "") {
+    const key = kind + r + ":" + c;
     if (L.loading.has(key)) return L.loading.get(key);
     const R = L.state.rallies[r];
-    const a = c * CHUNK, b = Math.min(R.offsets.length, a + CHUNK) - 1;
+    const offs = kind ? R.hd : R.offsets, pack = kind ? R.hd_pack : R.pack;
+    if (!offs) return;
+    const a = c * CHUNK, b = Math.min(offs.length, a + CHUNK) - 1;
     if (a > b) return;
-    if (L.blobs.has(r + ":" + a) && L.blobs.has(r + ":" + b)) return;
-    const from = R.offsets[a][0], to = R.offsets[b][0] + R.offsets[b][1] - 1;
+    if (L.blobs.has(kind + r + ":" + a) && L.blobs.has(kind + r + ":" + b)) return;
+    const from = offs[a][0], to = offs[b][0] + offs[b][1] - 1;
     const id = L.id;
     const p = (async () => {
       for (let attempt = 0; ; attempt++) {
         try {
-          const res = await fetch(`${API}/videos/${id}/annot/files/${R.pack}`, {
+          const res = await fetch(`${API}/videos/${id}/annot/files/${pack}`, {
             headers: { authorization: "Bearer " + token, range: `bytes=${from}-${to}` },
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const buf = await res.arrayBuffer();
           if (!L || L.id !== id) return;
           for (let i = a; i <= b; i++) {
-            const [o, n] = R.offsets[i];
-            L.blobs.set(r + ":" + i, new Blob([buf.slice(o - from, o - from + n)], { type: "image/jpeg" }));
+            const [o, n] = offs[i];
+            L.blobs.set(kind + r + ":" + i, new Blob([buf.slice(o - from, o - from + n)], { type: "image/jpeg" }));
           }
           while (L.blobs.size > KEEP_BLOBS) L.blobs.delete(L.blobs.keys().next().value);
           return;
@@ -113,21 +118,73 @@ const Label = (() => {
     } catch (e) {
       if (L) { L.msg = "图片读取失败：" + e.message; draw(); }
     }
+    showHd(r, i);
     // 预取后面几块
     const c = Math.floor(i / CHUNK);
-    for (let k = 1; k <= AHEAD; k++) chunk(r, c + k)?.catch(() => {});
+    for (let k = 1; k <= AHEAD; k++) {
+      chunk(r, c + k)?.catch(() => {});
+      chunk(r, c + k, "hd")?.catch(() => {});
+    }
+  }
+
+  // 放大镜用的原图局部（只有视频比整帧图大时才有）
+  async function showHd(r, i) {
+    const R = L.state.rallies[r], key = r + ":" + i;
+    if (!R.hd || (L.hd && L.hdKey === key)) return;
+    try {
+      if (!L.blobs.has("hd" + key)) await chunk(r, Math.floor(i / CHUNK), "hd");
+      const blob = L && L.blobs.get("hd" + key);
+      if (!blob || L.r !== r || L.i !== i) return;
+      const bmp = await createImageBitmap(blob);
+      if (!L || L.r !== r || L.i !== i) { bmp.close?.(); return; }
+      L.hd?.bmp.close?.();
+      L.hd = { bmp, x0: R.hd[i][2], y0: R.hd[i][3] };
+      L.hdKey = key;
+      draw();
+    } catch (e) { /* 没有原图就用整帧图放大 */ }
   }
 
   function go(r, i) {
     const R = L.state.rallies[r];
+    remember();
     L.r = r;
     L.i = Math.max(0, Math.min(R.offsets.length - 1, i));
     L.pending = null;
+    L.focus = focusFor();
     L.armed = false;
     L.msg = "";
     showFrame();
     renderRallies();
   }
+
+  // 离开一帧时记下球在哪（标的点 / 正在改的点 / 预测），下一帧的放大镜先对准这里：球一帧里走不远
+  function remember() {
+    if (!L.state || !L.state.rallies[L.r]) return;
+    const pt = L.pending || labelPoint() || predPoint();
+    if (pt) L.last = { r: L.r, i: L.i, x: pt.x, y: pt.y };
+  }
+  function labelPoint(i = L.i) {
+    const lab = L.labels.get(frameOf(L.r, i));
+    return done(lab) && lab[0] ? { x: lab[1], y: lab[2] } : null;
+  }
+  function predPoint(i = L.i) {
+    const p = rally().pred[i];
+    return p && p[0] ? { x: p[1], y: p[2] } : null;
+  }
+  // 放大镜对准哪里：这帧标过的点；否则相邻几帧标过/看过的位置；否则模型的预测
+  function focusFor() {
+    const near = L.last && L.last.r === L.r && Math.abs(L.last.i - L.i) <= 3 ? L.last : null;
+    const pt = labelPoint() || near || predPoint() || L.last;
+    if (pt) return { x: pt.x, y: pt.y };
+    const [vw, vh] = L.state.video.size;
+    return { x: vw / 2, y: vh / 2 };
+  }
+  // 点挪到放大镜边上了，就把放大镜移过去
+  function follow(pt) {
+    const half = spanPx() / 2 * 0.7;
+    if (!L.focus || Math.abs(pt.x - L.focus.x) > half || Math.abs(pt.y - L.focus.y) > half) L.focus = { x: pt.x, y: pt.y };
+  }
+  const spanPx = () => L.state.video.size[0] * LOUPE_SPAN;
 
   // ---------- 保存 ----------
 
@@ -228,8 +285,12 @@ const Label = (() => {
       // 手机横屏：高度占满，右边留一栏放按钮
       w = Math.min(window.innerWidth - SIDE_PX, window.innerHeight * vw / vh);
     } else {
+      // 竖屏：宽度占满；横屏的平板、电脑：画面高度不超出屏幕（减去画面上面的标题）
       w = cv.parentElement.clientWidth;
-      if (window.innerWidth > window.innerHeight) w = Math.min(w, (window.innerHeight - 24) * vw / vh);
+      if (window.innerWidth > window.innerHeight) {
+        const top = cv.parentElement.getBoundingClientRect().top + window.scrollY;
+        w = Math.min(w, (window.innerHeight - Math.min(top, 80) - 12) * vw / vh);
+      }
     }
     w = Math.max(160, w);
     const h = w * vh / vw;
@@ -283,9 +344,15 @@ const Label = (() => {
     const lab = L.labels.get(f);
     if (L.pending) cross(g, L.pending.x * s, L.pending.y * s, "#2f81f7");
     else if (done(lab) && lab[0]) cross(g, lab[1] * s, lab[2] * s, lab[3] === "bulk" ? "#7ee787" : "#3fb950");
+    // 放大镜对准的范围
+    if (L.focus && L.bitmap) {
+      const half = spanPx() / 2 * s;
+      g.strokeStyle = "rgba(255,255,255,.55)"; g.lineWidth = 1; g.setLineDash([4, 3]);
+      g.strokeRect(L.focus.x * s - half, L.focus.y * s - half, half * 2, half * 2);
+      g.setLineDash([]);
+    }
     pad(s);
-    if (L.pending) loupe(L.pending, s, h);
-    else $l("lLoupe").hidden = true;
+    loupe(s, h);
     renderInfo();
   }
 
@@ -306,30 +373,53 @@ const Label = (() => {
     g.stroke();
   }
 
-  // 放大镜：点附近的一小块放大显示，放在离点远的那一角
-  function loupe(pt, s, h) {
-    const lc = $l("lLoupe");
-    if (!L.bitmap) { lc.hidden = true; return; }
-    // 放大镜在上、方向键在下，画面矮（手机竖屏）时放大镜缩小一点，两个不重叠
+  // 放大镜：一直开着，对准 L.focus（翻帧时沿用上一帧球的位置）。有原图局部就用原图，看到的是视频的原始像素；
+  // 在放大镜里点一下 = 把球放在那里，拖动 = 精细地挪。放在离点远的那一角。
+  function loupeGeom(s, h) {
     const padH = $l("lPad").hidden ? 0 : $l("lPad").offsetHeight;
-    const size = Math.round(Math.max(60, Math.min(150, h - padH - 18))), dpr = window.devicePixelRatio || 1;
+    const big = Math.min(h * 0.5, 360);
+    const size = Math.round(Math.max(80, Math.min(big, h - padH - 18)));
+    const span = spanPx();
+    return { size, span, z: size / span, x0: L.focus.x - span / 2, y0: L.focus.y - span / 2 };
+  }
+  function loupe(s, h) {
+    const lc = $l("lLoupe");
+    if (!L.bitmap || !L.focus) { lc.hidden = true; return; }
+    const { size, span, z, x0, y0 } = loupeGeom(s, h), dpr = window.devicePixelRatio || 1;
     lc.hidden = false;
-    lc.width = lc.height = size * dpr;
-    lc.style.width = lc.style.height = size + "px";
-    const cvW = $l("lCanvas").clientWidth;
-    lc.style.left = pt.x * s > cvW / 2 ? "6px" : "";
-    lc.style.right = pt.x * s > cvW / 2 ? "" : "6px";
+    if (lc.width !== size * dpr) { lc.width = lc.height = size * dpr; lc.style.width = lc.style.height = size + "px"; }
+    const cvW = $l("lCanvas").clientWidth, mark = basePoint() || L.focus;
+    const left = mark.x * s > cvW / 2;
+    lc.style.left = left ? "6px" : "";
+    lc.style.right = left ? "" : "6px";
     const g = lc.getContext("2d");
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.imageSmoothingEnabled = false;
-    const k = L.bitmap.width / L.state.video.size[0];   // 视频像素 → 图片像素
-    const span = size / (s * LOUPE_ZOOM) * k;           // 放大镜里看到的图片像素
     g.fillStyle = "#000"; g.fillRect(0, 0, size, size);
-    g.drawImage(L.bitmap, pt.x * k - span / 2, pt.y * k - span / 2, span, span, 0, 0, size, size);
+    // 先画缩小的整帧图（糊一点），原图局部覆盖在上面
+    const k = L.bitmap.width / L.state.video.size[0];
+    g.drawImage(L.bitmap, x0 * k, y0 * k, span * k, span * k, 0, 0, size, size);
+    const key = L.r + ":" + L.i;
+    let sharp = false;
+    if (L.hd && L.hdKey === key) {
+      const H = L.hd;
+      g.drawImage(H.bmp, (H.x0 - x0) * z, (H.y0 - y0) * z, H.bmp.width * z, H.bmp.height * z);
+      sharp = x0 >= H.x0 && y0 >= H.y0 && x0 + span <= H.x0 + H.bmp.width && y0 + span <= H.y0 + H.bmp.height;
+    }
+    const at = (x, y) => [(x - x0) * z, (y - y0) * z];
     const R = rally(), p = R.pred[L.i];
-    const z = size / span * k;                          // 视频像素 → 放大镜像素
-    if (p[0]) ring(g, size / 2 + (p[1] - pt.x) * z, size / 2 + (p[2] - pt.y) * z, 12, "#ff8c00", 2);
-    cross(g, size / 2, size / 2, "#2f81f7");
+    if (R.cand) {
+      g.strokeStyle = "rgba(255,255,255,.6)"; g.lineWidth = 1;
+      for (const [x, y] of R.cand[L.i] || []) { const [a, b] = at(x, y); g.beginPath(); g.arc(a, b, 9, 0, 7); g.stroke(); }
+    }
+    if (p[0]) { const [a, b] = at(p[1], p[2]); ring(g, a, b, 14, "#ff8c00", 2); }
+    const lab = L.labels.get(frameOf(L.r, L.i));
+    if (L.pending) { const [a, b] = at(L.pending.x, L.pending.y); cross(g, a, b, "#2f81f7"); }
+    else if (done(lab) && lab[0]) { const [a, b] = at(lab[1], lab[2]); cross(g, a, b, lab[3] === "bulk" ? "#7ee787" : "#3fb950"); }
+    if (L.state.crop) {
+      g.font = "11px -apple-system, sans-serif"; g.fillStyle = sharp ? "rgba(126,231,135,.9)" : "rgba(255,255,255,.7)";
+      g.fillText(sharp ? "原图" : L.hd && L.hdKey === key ? "部分原图" : "缩小图", 5, size - 6);
+    }
   }
 
   // 悬浮方向键：放在离点远的那一侧（和放大镜同侧），有点可以挪时才显示
@@ -348,12 +438,13 @@ const Label = (() => {
     el.style.right = right ? "6px" : "";
     $l("lStep").textContent = L.step === 1 ? "1" : String(L.step);
   }
-  // 挪 1 步 = 图片上 1 个像素（4K 视频里约 3 个像素）；切到 5 就是 5 倍
+  // 挪 1 步 = 视频的 1 个像素（有原图局部时）或整帧图的 1 个像素；切到 5 就是 5 倍
   function nudge(dx, dy) {
     const pt = basePoint();
     if (!pt) return;
-    const [vw, vh] = L.state.video.size, unit = vw / (L.bitmap ? L.bitmap.width : vw) * (L.step || 1);
+    const [vw, vh] = L.state.video.size, unit = (L.state.crop ? 1 : vw / (L.bitmap ? L.bitmap.width : vw)) * (L.step || 1);
     L.pending = { x: clamp(pt.x + dx * unit, 0, vw), y: clamp(pt.y + dy * unit, 0, vh) };
+    follow(L.pending);
     L.msg = "";
     draw();
   }
@@ -465,6 +556,7 @@ const Label = (() => {
     if (!touch.base) return;
     const s = layout().s, [vw, vh] = L.state.video.size;
     L.pending = { x: clamp(touch.base.x + dx * FINE / s, 0, vw), y: clamp(touch.base.y + dy * FINE / s, 0, vh) };
+    follow(L.pending);
     L.msg = "";
     draw();
     e.preventDefault();
@@ -484,6 +576,43 @@ const Label = (() => {
       if (d < best) { best = d; x = cx; y = cy; }
     }
     L.pending = { x, y };
+    L.focus = { x, y };
+    L.msg = "";
+    draw();
+  }
+
+  // 放大镜里：点一下把球放在那里，拖动按放大后的比例挪（很细）
+  let ltouch = null;
+  function loupePoint(e) {
+    const rect = $l("lLoupe").getBoundingClientRect(), { w, h, s } = layout(), G = loupeGeom(s, h);
+    return { x: G.x0 + (e.clientX - rect.left) / G.z, y: G.y0 + (e.clientY - rect.top) / G.z, z: G.z };
+  }
+  function onLoupeDown(e) {
+    if (!L || !L.state || !L.focus) return;
+    $l("lLoupe").setPointerCapture(e.pointerId);
+    ltouch = { x: e.clientX, y: e.clientY, base: basePoint(), dragging: false };
+    e.preventDefault();
+  }
+  function onLoupeMove(e) {
+    if (!ltouch) return;
+    const dx = e.clientX - ltouch.x, dy = e.clientY - ltouch.y;
+    if (!ltouch.dragging && Math.hypot(dx, dy) < DRAG_PX) return;
+    ltouch.dragging = true;
+    if (!ltouch.base) return;
+    const z = loupePoint(e).z, [vw, vh] = L.state.video.size;
+    L.pending = { x: clamp(ltouch.base.x + dx / z, 0, vw), y: clamp(ltouch.base.y + dy / z, 0, vh) };
+    L.msg = "";
+    draw();
+    e.preventDefault();
+  }
+  function onLoupeUp(e) {
+    if (!ltouch) return;
+    const t = ltouch;
+    ltouch = null;
+    if (t.dragging) { follow(L.pending); draw(); return; }
+    const pt = loupePoint(e), [vw, vh] = L.state.video.size;
+    L.pending = { x: clamp(pt.x, 0, vw), y: clamp(pt.y, 0, vh) };
+    follow(L.pending);
     L.msg = "";
     draw();
   }
@@ -495,6 +624,11 @@ const Label = (() => {
     cv.addEventListener("pointermove", onMove);
     cv.addEventListener("pointerup", onUp);
     cv.addEventListener("pointercancel", () => { touch = null; });
+    const lc = $l("lLoupe");
+    lc.addEventListener("pointerdown", onLoupeDown);
+    lc.addEventListener("pointermove", onLoupeMove);
+    lc.addEventListener("pointerup", onLoupeUp);
+    lc.addEventListener("pointercancel", () => { ltouch = null; });
     $l("lOk").onclick = () => confirm();
     $l("lNone").onclick = () => noShuttle();
     $l("lSkip").onclick = () => cantTell();
@@ -536,7 +670,7 @@ const Label = (() => {
       else if (k === "ArrowLeft") go(L.r, L.i - 1);
       else if (k === "ArrowRight") { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); }
       else if (k === "Backspace") clearFrame();
-      else if (k === "Escape") { L.pending = null; draw(); }
+      else if (k === "Escape") { L.pending = null; L.focus = focusFor(); draw(); }
       else return;
       e.preventDefault();
     });
