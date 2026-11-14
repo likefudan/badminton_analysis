@@ -50,7 +50,13 @@ PREDICT_VERSION = "2"  # raise when the path selection changes, so cached predic
 
 def model_stamp(tracknet_dir=None) -> str:
     """Which TrackNetV3 weights made a prediction: size and mtime of the checkpoint, hashed.
-    A fine-tuned checkpoint gives a new stamp, so cached predictions are redone."""
+    A fine-tuned checkpoint gives a new stamp, so cached predictions are redone; so does
+    another published TrackNet (BADMINTON_TRACKNET, shuttle.TRACKNET_DEFAULT)."""
+    from .shuttle import tracknet_choice
+
+    key = tracknet_choice()
+    if key != "released":
+        return f"v{PREDICT_VERSION}+{key}"
     try:
         from .shuttle import _resolve_dir
 
