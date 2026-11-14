@@ -63,7 +63,7 @@ badminton node --once     # 处理完排队中的就退出
 ## 手机上标注击球类型
 
 录像页「标注」里的「准备击球类型标注」：节点领到 `strokes` 任务，运行 `badminton annotate-strokes`（要有 `court.json`；没有 `<视频名>.strokes.json` 时先跑 `badminton strokes`，需要 BST 权重），把每一拍前 0.8 秒、后 0.6 秒剪成一样长的一段，首尾相接成 `strokes.mp4`（每段开头是关键帧，击球人有黄框，击球那一帧有红边），`strokes.state.json` 记每拍的帧号和模型的判断，传到 R2 的 `strokes/` 下。
-网页（`public/stroke.js`，`#/strokes/<编号>`）循环慢放当前这一段，主类型单选、附加标记多选（直线和对角互斥）、击球人、备注，模型没把握的排在前面。每拍存进 D1 的 `stroke_labels` 表；停手一分钟后节点领到 `stroke-labels` 任务，写成录像旁边的 `<视频名>.strokes.labels.csv`（列 `frame,player_id,type,tags,note`，tags 用 `;` 分隔）。网页上也能直接下载这个 CSV（`GET /videos/<编号>/stroke-labels?format=csv`）。
+网页（`public/stroke.js`，`#/strokes/<编号>`）循环慢放当前这一段，主类型单选（模型错把别的动作当成一拍时选「不是击球」）、附加标记多选（直线和对角互斥）、击球人、备注，模型没把握的排在前面。每拍存进 D1 的 `stroke_labels` 表；停手一分钟后节点领到 `stroke-labels` 任务，写成录像旁边的 `<视频名>.strokes.labels.csv`（列 `frame,player_id,type,tags,note`，tags 用 `;` 分隔）。网页上也能直接下载这个 CSV（`GET /videos/<编号>/stroke-labels?format=csv`）。
 
 ## 本地运行
 

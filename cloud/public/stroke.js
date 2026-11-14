@@ -8,6 +8,7 @@ const Strokes = (() => {
   let S = null;
   const $s = (id) => document.getElementById(id);
   const SPEEDS = [1, 0.5, 0.25];
+  const NOT_A_HIT = "不是击球";   // 模型以为这里有一拍，其实没有
 
   async function open(id) {
     if (S && S.id === id) { show(); return; }
@@ -20,6 +21,7 @@ const Strokes = (() => {
       const [state, labels] = await Promise.all([api(`/videos/${id}/strokes/files/strokes.state.json`), api(`/videos/${id}/stroke-labels`)]);
       if (!S || S.id !== id) return;
       S.state = state;
+      if (!state.types.includes(NOT_A_HIT)) state.types.push(NOT_A_HIT); // 旧的小视频包里还没有
       for (const [f, lab] of Object.entries(labels.labels || {})) S.labels.set(Number(f), lab);
       const v = $s("sVideo");
       v.src = `${API}/videos/${id}/strokes/files/strokes.mp4`;
@@ -148,9 +150,12 @@ const Strokes = (() => {
     $s("sCsv").href = `${API}/videos/${S.id}/stroke-labels?format=csv`;
   }
 
-  function save() {
+  function save(notHit = false) {
     const st = stroke();
-    const lab = { player_id: S.sel.player_id ?? null, type: S.sel.type, tags: S.state.tags.filter((t) => S.sel.tags.includes(t)), note: $s("sNote").value.trim() };
+    if (notHit) S.sel.type = NOT_A_HIT;
+    const no = S.sel.type === NOT_A_HIT;  // 不是击球：没有击球人，也没有附加标记
+    const lab = { player_id: no ? null : S.sel.player_id ?? null, type: S.sel.type, tags: no ? [] : S.state.tags.filter((t) => S.sel.tags.includes(t)),
+                  note: $s("sNote").value.trim() };
     S.labels.set(st.frame, lab);
     S.queue.set(st.frame, { frame: st.frame, ...lab });
     flush();
@@ -194,6 +199,7 @@ const Strokes = (() => {
   }
 
   $s("sSave2").onclick = () => S && S.state && save();
+  $s("sNotHit").onclick = () => S && S.state && save(true);
   $s("sPrev").onclick = () => S && go(S.k - 1);
   $s("sNext").onclick = () => S && go(S.k + 1);
   $s("sClear").onclick = () => S && clear();

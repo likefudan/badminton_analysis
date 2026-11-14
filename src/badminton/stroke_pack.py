@@ -33,7 +33,8 @@ BEFORE_S = 0.8        # clip starts this long before the hit
 AFTER_S = 0.6         # and ends this long after
 WIDTH = 960
 TYPES = ["放网", "挡网", "杀球", "点杀", "挑球", "防守挑球", "高远球", "平高球", "平抽", "后场抽平", "吊球",
-         "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知"]
+         "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知", "不是击球"]
+NOT_A_HIT = "不是击球"  # the model found a hit where there was none
 TAGS = ["劈杀", "劈吊", "收吊", "搓球", "直线", "对角"]
 CSV_COLUMNS = ["frame", "player_id", "type", "tags", "note"]
 
