@@ -1221,8 +1221,10 @@ function renderAnnot(v) {
   $("kOpen").hidden = k.status !== "ready";
   $("kOpen").href = "#/strokes/" + v.id;
   $("kOpen").textContent = k.labels ? "接着标注击球类型" : "开始标注击球类型";
-  $("kPrepare").hidden = !(ready && (k.status === "none" || k.status === "failed"));
-  $("kPrepare").textContent = k.status === "failed" ? "重新准备" : "准备击球类型标注";
+  // 准备好了也能重新准备（比如 Mac 上的程序更新了）：已标的拍按帧号对应，不会丢
+  $("kPrepare").hidden = !(ready && (k.status === "none" || k.status === "failed" || k.status === "ready"));
+  $("kPrepare").textContent = k.status === "none" ? "准备击球类型标注" : k.status === "ready" ? "重新准备小视频（已标的拍保留）" : "重新准备";
+  $("kPrepare").classList.toggle("plain", k.status === "ready");
   $("kCsv").hidden = !k.labels;
   $("kCsv").href = `${API}/videos/${v.id}/stroke-labels?format=csv`;
   $("kClear").hidden = !(k.status === "ready" || k.status === "failed");
