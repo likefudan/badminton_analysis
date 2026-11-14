@@ -65,7 +65,17 @@ def test_pack_cuts_one_clip_per_hit_with_a_key_frame_at_each_start(clip, analysi
     d, weights = analysis
     calls = []
     out = tmp_path / "out"
-    state = sp.pack(clip, out, clip.with_suffix(".court.json"), d, singles=False, weights=[weights], run=fake_run(calls))
+    seen = []
+
+    def progress(n, total, elapsed):  # the CLI passes pipeline.print_progress: (n, total, elapsed)
+        from badminton.pipeline import print_progress
+
+        print_progress(n, total, elapsed)
+        seen.append((n, total))
+
+    state = sp.pack(clip, out, clip.with_suffix(".court.json"), d, singles=False, weights=[weights], run=fake_run(calls),
+                    progress=progress)
+    assert seen and seen[-1] == (129, 129)
     assert calls == [2]
     assert (d / "game.strokes.json").exists()  # kept for the next time
     c = state["clip"]
