@@ -597,7 +597,9 @@ function renderNodeLine() {
   for (const id of ["nodeLine", "nodeLine2"]) {
     const line = $(id);
     line.textContent = "";
-    line.append(el("span", "dot " + (node ? (nodeOnline() ? "on" : "off") : "")), text);
+    const more = el("a", "", "看它在做什么 ›");
+    more.href = "#/mac";
+    line.append(el("span", "dot " + (node ? (nodeOnline() ? "on" : "off") : "")), text + " ", more);
   }
 }
 
@@ -670,14 +672,14 @@ setInterval(() => {
 }, 1000);
 
 
-// ---------- 页面切换：#/ 首页，#/upload 上传，#/v/<id> 一段录像，#/settings 设置 ----------
+// ---------- 页面切换：#/ 首页，#/upload 上传，#/v/<id> 一段录像，#/settings 设置，#/mac Mac 状态 ----------
 
 function route() {
   const h = location.hash || "#/";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
   const lm = h.match(/^#\/label\/([0-9a-f-]{36})$/);
   const sm = h.match(/^#\/strokes\/([0-9a-f-]{36})$/);
-  const name = m ? "vDetail" : lm ? "vLabel" : sm ? "vStrokes" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
+  const name = m ? "vDetail" : lm ? "vLabel" : sm ? "vStrokes" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : h === "#/mac" ? "vMac" : "vHome";
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
   document.body.classList.toggle("labeling", Boolean(lm || sm));
   document.querySelector("main").classList.toggle("wide", Boolean(lm || sm));
@@ -698,6 +700,8 @@ function route() {
     $("info").hidden = $("progress").hidden = $("upDone").hidden = true;
   }
   if (name === "vSettings") loadAi();
+  if (name === "vMac") Mac.open();
+  else Mac.close();
   if (name === "vHome") refreshList();
   window.scrollTo(0, 0);
 }

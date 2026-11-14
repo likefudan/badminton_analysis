@@ -1145,6 +1145,80 @@ async function listVideos(env: Env): Promise<Response> {
   });
 }
 
+// ---------- Mac 状态 ----------
+
+// 节点上报自己的状态：原样保存（节点写、网页读），只限制大小。
+async function putNodeStatus(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const node = typeof body?.node === "string" && body.node ? body.node.slice(0, 80) : "node";
+  if (!body?.status || typeof body.status !== "object") throw new HttpError(400, "缺少 status");
+  const text = JSON.stringify(body.status);
+  if (text.length > 200_000) throw new HttpError(413, "状态太大");
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO nodes (user_id, name, seen_at, status, status_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (user_id, name) DO UPDATE SET seen_at = excluded.seen_at, status = excluded.status, status_at = excluded.status_at`,
+  )
+    .bind(USER_ID, node, now, text, now)
+    .run();
+  return json({ ok: true });
+}
+
+// 「Mac 状态」页要的全部内容：节点上报的状态，加上云端自己知道的作业（正在做的、排队的、最近失败的）。
+async function macStatus(env: Env): Promise<Response> {
+  const nodes = await env.DB.prepare("SELECT name, seen_at, status, status_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 5")
+    .bind(USER_ID)
+    .all<{ name: string; seen_at: string; status: string; status_at: string | null }>();
+  const rows = await env.DB.prepare(
+    `SELECT * FROM videos WHERE user_id = ? AND status = 'uploaded' AND (
+       job_status IN ('queued', 'processing', 'failed') OR annot_status IN ('queued', 'preparing', 'failed')
+       OR strokes_status IN ('queued', 'preparing', 'failed'))
+     ORDER BY completed_at LIMIT 200`,
+  )
+    .bind(USER_ID)
+    .all<VideoRow>();
+  const now = new Date();
+  type Job = { videoId: string; name: string; kind: string; stage: string; error: string; updatedAt: string | null; startedAt?: string | null; node?: string; stale?: boolean };
+  const active: Job[] = [];
+  const queued: Job[] = [];
+  const failed: Job[] = [];
+  for (const v of rows.results) {
+    const kinds = [
+      { kind: "process", status: v.job_status, busy: "processing", stage: v.job_stage, error: v.job_error, at: v.job_updated_at, lease: v.job_lease_until },
+      { kind: "annotate", status: v.annot_status, busy: "preparing", stage: v.annot_stage, error: v.annot_error, at: v.annot_updated_at, lease: v.annot_lease_until },
+      { kind: "strokes", status: v.strokes_status, busy: "preparing", stage: v.strokes_stage, error: v.strokes_error, at: v.strokes_updated_at, lease: v.strokes_lease_until },
+    ];
+    for (const k of kinds) {
+      const job: Job = { videoId: v.id, name: v.title || v.filename, kind: k.kind, stage: k.stage, error: k.error.slice(0, 1500), updatedAt: k.at };
+      if (k.status === "queued") queued.push(job);
+      else if (k.status === "failed") failed.push(job);
+      else if (k.status === k.busy) {
+        // 租约过期 = 节点领了任务之后失联，下次有节点来问时会被重新领取
+        job.stale = k.lease !== null && k.lease < now.toISOString();
+        if (k.kind === "process") {
+          job.startedAt = v.job_started_at;
+          job.node = v.job_node;
+        }
+        active.push(job);
+      }
+    }
+  }
+  failed.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  return json({
+    now: now.toISOString(),
+    nodes: nodes.results.map((n) => {
+      let status: unknown = null;
+      try {
+        status = n.status ? JSON.parse(n.status) : null;
+      } catch {}
+      return { name: n.name, seenAt: n.seen_at, statusAt: n.status_at, status };
+    }),
+    active,
+    queued,
+    failed: failed.slice(0, 10),
+  });
+}
+
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {
   if (!(await authorized(req, env))) throw new HttpError(401, "口令不对");
   const m = req.method;
@@ -1165,6 +1239,8 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (path === "/ai" && m === "GET") return aiInfo(env);
   if (path === "/ai/settings" && m === "PUT") return saveAiSettings(req, env);
   if (path === "/node/claim" && m === "POST") return claimJob(req, env);
+  if (path === "/node/status" && m === "POST") return putNodeStatus(req, env);
+  if (path === "/status" && m === "GET") return macStatus(env);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job$/);
   if (match && m === "POST") return updateJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job\/retry$/);

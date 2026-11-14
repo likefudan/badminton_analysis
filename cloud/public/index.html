@@ -66,6 +66,18 @@
   .back { color: var(--accent); cursor: pointer; font-size: 14px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--quiet); margin-right: 6px; }
   .dot.on { background: var(--good); } .dot.off { background: var(--bad); }
+  .macline { margin: 0 0 8px; }
+  .mactask { padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .mactask:first-of-type { border-top: 0; padding-top: 0; }
+  .mactask .cmd { font: 13px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; margin-bottom: 4px; }
+  .mactask .path { word-break: break-all; }
+  .maclog { margin-top: 6px; }
+  .maclog summary { color: var(--accent); font-size: 13px; cursor: pointer; padding: 4px 0; }
+  .maclog pre { font: 11px/1.45 ui-monospace, Menlo, monospace; color: var(--quiet); white-space: pre-wrap; word-break: break-all; max-height: 320px; overflow: auto; margin: 4px 0 0; padding: 8px; background: var(--bg); border-radius: 8px; }
+  li.macjob { display: block; }
+  li.macjob a.name { color: var(--ink); font-weight: 600; text-decoration: none; word-break: break-all; }
+  #vMac dl { margin-bottom: 4px; }
+  #nodeLine a, #nodeLine2 a { color: var(--accent); text-decoration: none; white-space: nowrap; }
   #dProgress .sum { font-size: 15px; margin: 8px 0; font-variant-numeric: tabular-nums; }
   .steps { list-style: none; margin: 0 0 12px; padding: 0; }
   .steps li { display: grid; grid-template-columns: 22px 1fr auto; gap: 2px 6px; padding: 7px 0; border-top: 1px solid var(--line); align-items: baseline; }
@@ -393,6 +405,13 @@
     </div>
 
     <!-- 设置 -->
+    <!-- Mac 状态 -->
+    <div class="view" id="vMac" hidden>
+      <div class="top"><a href="#/">‹ 返回</a><h1>Mac 状态</h1></div>
+      <div id="macBody"></div>
+      <p class="quiet" id="macAt"></p>
+    </div>
+
     <div class="view" id="vSettings" hidden>
       <div class="top"><a href="#/">‹ 返回</a><h1>设置</h1></div>
       <section class="card">
@@ -420,6 +439,7 @@
 </main>
 <script src="label.js"></script>
 <script src="stroke.js"></script>
+<script src="status.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
