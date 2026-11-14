@@ -245,6 +245,12 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   const ranged = await fetch(`${BASE}/videos/${v.id}/results/rallies.mp4`, { headers: { cookie, range: "bytes=10-19" } });
   assert.equal(ranged.status, 206);
   assert.deepEqual(Buffer.from(await ranged.arrayBuffer()), clip.subarray(10, 20));
+  // ?download=1 saves it as a file named after the recording
+  const dl = await fetch(`${BASE}/videos/${v.id}/results/rallies.mp4?download=1`, { headers: { cookie } });
+  assert.equal(dl.status, 200);
+  assert.match(dl.headers.get("content-disposition"), /^attachment; filename=".*_rallies\.mp4"; filename\*=UTF-8''.*_rallies\.mp4$/);
+  await dl.arrayBuffer();
+  assert.equal((await fetch(`${BASE}/videos/${v.id}/results/rallies.mp4`, { headers: { cookie } })).headers.get("content-disposition"), null);
   assert.equal((await fetch(`${BASE}/videos/${v.id}/results/movement.1.png`, { headers: { cookie: "ba_session=nope" } })).status, 401);
   assert.equal((await fetch(`${BASE}/videos/${v.id}`, { method: "DELETE", headers: { cookie } })).status, 401);
 

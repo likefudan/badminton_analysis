@@ -116,6 +116,11 @@
   .field { margin: 10px 0; } .field label { display: block; color: var(--quiet); font-size: 13px; margin-bottom: 4px; }
   #prices input { padding: 6px; text-align: right; } #prices td, #prices th { padding: 4px; }
   .danger { color: var(--bad) !important; }
+  .saverow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 14px; }
+  .saverow .btnlink { width: auto; padding: 8px 14px; font-size: 14px; font-weight: 400; border-radius: 10px; text-decoration: none; }
+  .saverow a.btnlink { color: var(--accent); border: 1px solid var(--line); }
+  .saverow button.btnlink.ready { background: var(--good); }
+  .saverow .quiet { font-size: 12px; }
   /* ---------- 标注 ---------- */
   main.wide { max-width: 1400px; }
   #lPic { position: relative; touch-action: none; user-select: none; -webkit-user-select: none; }
