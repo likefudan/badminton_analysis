@@ -52,7 +52,8 @@ def fake_predict(calls):
 def test_pack_picks_the_unsure_rallies_and_cuts_their_frames(clip, tmp_path):
     calls = []
     out = tmp_path / "annot"
-    state = ap.pack(clip, out, movement=clip.with_suffix(".movement.json"), count=2, predict=fake_predict(calls), width=320)
+    state = ap.pack(clip, out, movement=clip.with_suffix(".movement.json"), count=2, predict=fake_predict(calls), width=320,
+                    crop=200)
     assert len(calls) == 1
     assert state["video"]["size"] == [W, H] and state["image"] == [320, 180]
     starts = [r["start"] for r in state["rallies"]]
@@ -70,6 +71,13 @@ def test_pack_picks_the_unsure_rallies_and_cuts_their_frames(clip, tmp_path):
     assert img[y // 2, x // 2].mean() > 150
     assert r["pred"][10] == [1, round(x + 80.0, 1), float(y)]  # predictions stay in video pixels
     assert max(r["unc"][5:15]) > state["confident"]
+    # a full-resolution crop around the prediction, for the magnifier
+    assert state["crop"] == [200, 200] and len(r["hd"]) == len(r["offsets"])
+    o, n, x0, y0 = r["hd"][10]
+    hd = cv2.imdecode(np.frombuffer((out / r["hd_pack"]).read_bytes()[o:o + n], np.uint8), cv2.IMREAD_COLOR)
+    assert hd.shape[:2] == (200, 200)
+    assert (x0, y0) == ap.crop_box(x + 80.0, y, (W, H), 200)[:2]
+    assert hd[y - y0, x - x0].mean() > 150  # the dot, at full resolution
     # the static blob at (600, 20) is in every frame: not offered as a candidate
     assert all(len(c) == 1 for c in r["cand"])
 
