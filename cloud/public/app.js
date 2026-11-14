@@ -799,7 +799,7 @@ async function renderDetail() {
         video.playsInline = true;
         video.preload = "metadata";
         video.src = resultUrl(v, r.name);
-        panes[where].append(video);
+        panes[where].append(video, saveRow(v, r));
       } else {
         const img = document.createElement("img");
         img.loading = "lazy";
@@ -815,6 +815,61 @@ async function renderDetail() {
   const empty = $("dOverviewEmpty");
   empty.hidden = have.has("movement.json") || have.has("review.md") || have.has("review.request.json");
   empty.textContent = waiting;
+}
+
+// 视频下面的「存到相册」「下载」。
+// iPhone 上：先把整个视频取到手机上，再点一下打开分享面板，选「存储视频」就进相册
+// （分享面板必须由一次点按直接打开，所以分两步）。不支持分享文件的浏览器只给「下载」。
+const MB = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + " MB";
+function canShareVideo() {
+  try { return !!(navigator.canShare && navigator.canShare({ files: [new File([""], "x.mp4", { type: "video/mp4" })] })); } catch { return false; }
+}
+function saveRow(v, r) {
+  const row = el("div", "saverow");
+  const dl = document.createElement("a");
+  dl.className = "plain btnlink";
+  dl.href = resultUrl(v, r.name) + "?download=1";
+  dl.textContent = "下载" + (r.size ? `（${MB(r.size)}）` : "");
+  if (canShareVideo()) {
+    const b = document.createElement("button");
+    b.className = "btnlink";
+    b.textContent = "存到相册";
+    const note = el("span", "quiet", "");
+    let file = null, busy = false;
+    b.onclick = async () => {
+      if (file) {
+        try { await navigator.share({ files: [file] }); note.textContent = "在弹出的面板里选「存储视频」"; }
+        catch (e) { if (e.name !== "AbortError") note.textContent = "没能打开分享：" + e.message + "，可以改用「下载」"; }
+        return;
+      }
+      if (busy) return;
+      busy = true;
+      try {
+        const res = await fetch(resultUrl(v, r.name), { credentials: "include", headers: { authorization: "Bearer " + token } });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const total = Number(res.headers.get("content-length")) || r.size || 0;
+        const reader = res.body.getReader(), parts = [];
+        let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value);
+          got += value.length;
+          b.textContent = total ? `取视频 ${Math.floor(got * 100 / total)}%` : `取视频 ${MB(got)}`;
+        }
+        const stem = (v.title || v.filename.replace(/\.[^.]*$/, "")).replace(/[\\/:*?"<>|]+/g, " ").trim() || "录像";
+        file = new File(parts, `${stem}_${r.name}`, { type: "video/mp4" });
+        b.textContent = "点这里存到相册";
+        b.classList.add("ready");
+        note.textContent = "视频已取到手机上";
+      } catch (e) {
+        b.textContent = "存到相册";
+        note.textContent = "取视频失败：" + e.message;
+      } finally { busy = false; }
+    };
+    row.append(b, dl, note);
+  } else row.append(dl);
+  return row;
 }
 
 // 改标题

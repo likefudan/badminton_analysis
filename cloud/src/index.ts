@@ -543,6 +543,14 @@ async function getResult(req: Request, env: Env, id: string, name: string): Prom
   // 报告是程序生成的 HTML：不让它跑脚本，也不让它被当成本站页面的一部分
   res.headers.set("content-security-policy", "sandbox; default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'");
   res.headers.set("x-content-type-options", "nosniff");
+  // ?download=1：让浏览器存成文件（手机上「下载」），文件名带上录像标题
+  if (new URL(req.url).searchParams.get("download")) {
+    const stem = (v.title || v.filename.replace(/\.[^.]*$/, "")).replace(/[\\/:*?"<>|\r\n]+/g, " ").trim().slice(0, 80) || "录像";
+    const file = `${stem}_${name}`;
+    const ascii = file.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+    res.headers.set("content-disposition", `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(file)}`);
+    res.headers.delete("content-security-policy"); // 存成文件，不会当网页打开；sandbox 会让浏览器丢掉文件名
+  }
   return res;
 }
 
