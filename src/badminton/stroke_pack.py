@@ -6,8 +6,9 @@ and writes to OUT:
 
   strokes.mp4         one clip per hit, all the same length, one after another:
                       clip k starts at k * clip.frames / clip.fps seconds, with a
-                      key frame there so the page can jump to it exactly. The
-                      hitter has a yellow box; the frame of the hit has a red edge.
+                      key frame there so the page can jump to it exactly. Every
+                      player has a white box with their number, the hitter the model
+                      chose a yellow one; the frame of the hit has a red edge.
   strokes.state.json  the clips' layout and per hit the model's type, probability,
                       alternatives, direction and whether it needs checking.
 
@@ -116,6 +117,21 @@ def hitter_box(ctx: dict | None, stroke: dict, frame: int) -> tuple | None:
     return None
 
 
+def player_boxes(ctx: dict | None, frame: int) -> list[tuple[int, tuple]]:
+    """(track id, box in video pixels) of every tracked player in the skeleton sample nearest to `frame`."""
+    if not ctx:
+        return []
+    data, tracking = ctx["data"], ctx["tracking"]
+    frames = np.asarray(data["frame"], int)
+    row = int(np.clip(np.searchsorted(frames, frame), 0, len(frames) - 1))
+    out = []
+    for t in tracking.tracks:
+        det = int(t.det_index[row])
+        if det >= 0:
+            out.append((t.id, tuple(float(v) for v in data["bbox"][row, det][:4])))
+    return out
+
+
 def encoder_args(clip_frames: int) -> list[list[str]]:
     """libx264 with a key frame at every clip start; the Mac's hardware encoder as a fallback."""
     return [["-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
@@ -165,10 +181,18 @@ def write_clips(video: Path, strokes: list[dict], out: Path, ctx: dict | None, w
                         img = last if last is not None else np.zeros((info.height, info.width, 3), np.uint8)
                     last = img
                     small = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-                    box = hitter_box(ctx, st, max(0, f))
-                    if box:
+                    # every player: thin white box and their number (the buttons on the page carry the same
+                    # number), the model's hitter yellow, so a wrong hitter is easy to correct
+                    for tid, box in player_boxes(ctx, max(0, f)):
                         x0, y0, x1, y1 = (round(v * s) for v in box)
-                        cv2.rectangle(small, (x0 - 4, y0 - 4), (x1 + 4, y1 + 4), (0, 220, 255), 2)
+                        hit = tid == st.get("player_id")
+                        color = (0, 220, 255) if hit else (235, 235, 235)
+                        cv2.rectangle(small, (x0 - 4, y0 - 4), (x1 + 4, y1 + 4), color, 2 if hit else 1)
+                        label = str(tid)
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        ty = max(th + 4, y0 - 8)
+                        cv2.rectangle(small, (x0 - 4, ty - th - 4), (x0 + tw + 2, ty + 3), (0, 0, 0), -1)
+                        cv2.putText(small, label, (x0 - 1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
                     if abs(k - before) <= 1:  # the hit
                         cv2.rectangle(small, (0, 0), (w - 1, h - 1), (40, 40, 230), 6)
                     proc.stdin.write(small.tobytes())
@@ -202,6 +226,11 @@ def pack(work: str | Path, out_dir: str | Path, court: str | Path, analysis_dir:
         raise SystemExit("这段录像里没有找到击球")
     clip = write_clips(work, strokes, out_dir / "strokes.mp4", ctx, progress=progress)
     players = {}
+    found = find_inputs(work, Path(analysis_dir) if analysis_dir else None)
+    names = json.loads(found["players"].read_text()) if found["players"] else {}
+    side_name = {0: "near", 1: "far"}
+    for t in (ctx["tracking"].tracks if ctx else []):  # everyone on court, not only the model's hitters
+        players[str(t.id)] = {"id": t.id, "name": names.get(str(t.id)) or "", "side": side_name.get(t.side)}
     for r in strokes:
         pid = r.get("player_id")
         if pid is not None and str(pid) not in players:
