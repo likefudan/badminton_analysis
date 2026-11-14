@@ -25,6 +25,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import node_status
+
 DEFAULT_URL = "https://ba.llmat.dev"
 CONFIG_PATH = Path.home() / ".config" / "badminton" / "node.json"
 RESULT_SUFFIXES = {".png", ".json", ".mp4"}
@@ -59,6 +61,7 @@ class Config:
     token: str
     work_dir: Path
     name: str
+    watch: tuple = ()   # directories whose background Python jobs are shown on the status page; default: this repository
 
     @classmethod
     def load(cls, url: str | None = None, work_dir: str | None = None, config: Path = CONFIG_PATH) -> "Config":
@@ -75,6 +78,7 @@ class Config:
             token=token,
             work_dir=Path(work_dir or saved.get("work_dir") or Path.home() / "badminton_uploads").expanduser(),
             name=saved.get("name") or platform.node() or "node",
+            watch=tuple(saved.get("watch") or ()),
         )
 
 
@@ -400,6 +404,7 @@ def run_step(args: list[str], log: list[str], on_line=None, on_frames=None) -> i
                 continue
             log.append(line)
             del log[:-60]
+            node_status.note("  | " + line)
             if on_line:
                 on_line(line)
     return proc.wait()
@@ -1005,7 +1010,22 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
         pass
+    plain_stdout = sys.stdout
+    sys.stdout = node_status.Tee(plain_stdout)  # the status page shows the last lines the node printed
     print(f"处理节点 {cfg.name} 已连接 {cfg.url}，原片和结果放在 {cfg.work_dir}。Ctrl+C 退出。")
+    status = node_status.Reporter(lambda data: api.json("POST", "/node/status", {"node": cfg.name, "status": data}, timeout=30),
+                                  cfg.name, cfg.work_dir, [Path(w) for w in cfg.watch] or None)
+    if not once:  # a single pass (tests, a manual run) has nothing to keep reporting
+        status.start(node_status.INTERVAL)
+    try:
+        return _loop(api, cfg, status, once, interval, analyse_fn, pack_fn, strokes_fn)
+    finally:
+        status.stop()
+        sys.stdout = plain_stdout
+
+
+def _loop(api: Api, cfg: Config, status: "node_status.Reporter", once: bool, interval: float, analyse_fn, pack_fn,
+          strokes_fn) -> int:
     while True:
         try:
             got = api.json("POST", "/node/claim", {"node": cfg.name, "tasks": list(TASKS)})
@@ -1013,21 +1033,26 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
             print(f"查询任务失败：{e}")
             got = {}
         video, task = got.get("video"), got.get("task") or "process"
-        if video and task == "labels":  # cheap and frequent: no hurry, wait as usual afterwards
-            sync_labels(api, cfg, video)
-        elif video and task == "stroke-labels":
-            sync_stroke_labels(api, cfg, video)
-        elif video:
-            if task == "annotate":
-                print(f"{time.strftime('%H:%M:%S')} 准备标注材料 {video['filename']}（{video['id']}）")
-                prepare_annotation(api, cfg, video, pack_fn)
-            elif task == "strokes":
-                print(f"{time.strftime('%H:%M:%S')} 准备击球类型标注 {video['filename']}（{video['id']}）")
-                prepare_strokes(api, cfg, video, strokes_fn)
-            else:
-                print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
-                process(api, cfg, video, analyse_fn)
-            continue
+        if video:
+            status.set_job(task, video)
+        try:
+            if video and task == "labels":  # cheap and frequent: no hurry, wait as usual afterwards
+                sync_labels(api, cfg, video)
+            elif video and task == "stroke-labels":
+                sync_stroke_labels(api, cfg, video)
+            elif video:
+                if task == "annotate":
+                    print(f"{time.strftime('%H:%M:%S')} 准备标注材料 {video['filename']}（{video['id']}）")
+                    prepare_annotation(api, cfg, video, pack_fn)
+                elif task == "strokes":
+                    print(f"{time.strftime('%H:%M:%S')} 准备击球类型标注 {video['filename']}（{video['id']}）")
+                    prepare_strokes(api, cfg, video, strokes_fn)
+                else:
+                    print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
+                    process(api, cfg, video, analyse_fn)
+                continue
+        finally:
+            status.set_job(None)
         if once:
             return 0
         time.sleep(interval)

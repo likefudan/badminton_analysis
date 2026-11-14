@@ -20,6 +20,7 @@ class FakeCloud:
         self.queued = True
         self.released = False
         self.jobs: list[dict] = []
+        self.statuses: list[dict] = []
         self.reviews = 0
         self.review_error = ""
         self.results: dict[str, bytes] = {}
@@ -69,6 +70,9 @@ class FakeCloud:
                 if self.path == "/api/v1/node/claim":
                     video, cloud.queued = (cloud.video if cloud.queued else None), False
                     return self.send({"video": video})
+                if self.path == "/api/v1/node/status":
+                    cloud.statuses.append(json.loads(data))
+                    return self.send({"ok": True})
                 if self.path.endswith("/original/release"):
                     cloud.released = True
                     return self.send({})
