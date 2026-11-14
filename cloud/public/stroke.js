@@ -84,7 +84,8 @@ const Strokes = (() => {
     if (pid === null || pid === undefined) return "不确定";
     const p = S.state.players.find((x) => String(x.id) === String(pid));
     const side = p && p.side === "near" ? "近端" : p && p.side === "far" ? "远端" : "";
-    return (p && p.name) || `${side}${pid} 号`;
+    // 号码和小视频里框上的数字一样
+    return `${pid} 号` + (p && p.name ? " " + p.name : side ? `（${side}）` : "");
   }
 
   function buildChoices() {
@@ -136,7 +137,8 @@ const Strokes = (() => {
     $s("sModel").textContent = `模型：${playerName(st.player_id)}，${st.type} ${Math.round((st.prob || 0) * 100)}%` +
       (st.direction ? `，${st.direction}` : "") + (alts ? `（也可能：${alts}）` : "") + (st.needs_review ? " · 没把握" : "");
     $s("sModel").className = st.needs_review ? "warn" : "quiet";
-    $s("sState").textContent = lab ? "已标：" + [lab.type, ...lab.tags].join(" · ") + (lab.note ? "（" + lab.note + "）" : "") : "还没标，下面已经按模型的判断选好";
+    const moved = String(S.sel.player_id ?? "") !== String(st.player_id ?? "") && S.sel.type !== NOT_A_HIT;
+    $s("sState").textContent = (moved ? "击球人和模型的不一样：模型的类型是按它以为的击球人判断的，请自己看一下类型。" : "") + (lab ? "已标：" + [lab.type, ...lab.tags].join(" · ") + (lab.note ? "（" + lab.note + "）" : "") : "还没标，下面已经按模型的判断选好");
     for (const b of $s("sTypes").children) b.classList.toggle("on", b.dataset.v === S.sel.type);
     for (const b of $s("sTags").children) b.classList.toggle("on", S.sel.tags.includes(b.dataset.v));
     const pid = S.sel.player_id === null || S.sel.player_id === undefined ? "" : String(S.sel.player_id);

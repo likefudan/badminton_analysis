@@ -42,7 +42,7 @@ def fake_run(calls):
         frames = np.arange(0, N, 2)
         bbox = np.zeros((len(frames), 1, 4))
         bbox[:, 0] = (100, 100, 200, 300)
-        track = SimpleNamespace(id=1, det_index=np.zeros(len(frames), int))
+        track = SimpleNamespace(id=1, side=0, det_index=np.zeros(len(frames), int))
         return results, {"fps": FPS, "data": {"frame": frames, "bbox": bbox}, "tracking": SimpleNamespace(tracks=[track])}
     return run
 
@@ -97,7 +97,9 @@ def test_pack_cuts_one_clip_per_hit_with_a_key_frame_at_each_start(clip, analysi
     assert frames[43 + 5][2, W // 2, 2] < 150  # not on the other frames
     first = frames[24]  # the hitter of the first stroke (player 1) has a yellow box
     assert first[96, 150, 1] > 170 and first[96, 150, 0] < 100
-    assert frames[43 + 5][96, 150, 1] < 150  # player 3 has no track: no box
+    # the second stroke's hitter is player 3 (no track here): player 1 still has a box, white, with its number
+    other = frames[43 + 5][96, 150]
+    assert other.min() > 180
 
     # strokes.json is reused when newer than the shuttle track
     calls.clear()
