@@ -1160,6 +1160,33 @@ async function listVideos(env: Env): Promise<Response> {
 // ---------- Mac 状态 ----------
 
 // 节点上报自己的状态：原样保存（节点写、网页读），只限制大小。
+// 「标注 › 素材」页：每段录像的标注材料准备得怎么样、标了多少、任务进度。不带分析结果。
+async function listLabelingVideos(env: Env): Promise<Response> {
+  const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? AND status = 'uploaded' ORDER BY created_at DESC LIMIT 100")
+    .bind(USER_ID)
+    .all<VideoRow>();
+  const counts = await env.DB.prepare("SELECT video_id, kind, status, COUNT(*) AS n FROM tasks WHERE active = 1 GROUP BY video_id, kind, status")
+    .all<{ video_id: string; kind: string; status: string; n: number }>();
+  const node = await env.DB.prepare("SELECT name, seen_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 1")
+    .bind(USER_ID)
+    .first<{ name: string; seen_at: string }>();
+  const tasksOf = (id: string, kind: string) =>
+    Object.fromEntries(counts.results.filter((c) => c.video_id === id && c.kind === kind).map((c) => [c.status, c.n]));
+  return json({
+    videos: await Promise.all(
+      rows.results.map(async (v) => {
+        const d = await describe(env, v);
+        return {
+          id: d.id, title: d.title, filename: d.filename, meta: d.meta, createdAt: d.createdAt, analyzed: ["done", "failed", "archived"].includes(d.job.status),
+          annot: { ...d.annot, tasks: tasksOf(v.id, "shuttle") }, strokes: { ...d.strokes, tasks: tasksOf(v.id, "stroke") },
+        };
+      }),
+    ),
+    node: node ? { name: node.name, seenAt: node.seen_at } : null,
+    now: new Date().toISOString(),
+  });
+}
+
 async function putNodeStatus(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const node = typeof body?.node === "string" && body.node ? body.node.slice(0, 80) : "node";
@@ -1243,13 +1270,16 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiKey(env)), ...meJson(who) });
   const team = await teamApi(req, env, path, who);
   if (team) return team;
-  if (!isAdmin(who)) {
+  if (!who.owner) {
+    // 不是超级管理员：只有标注这一边。管理员能看所有录像的标注材料和进度，标注员只能读自己领过任务的录像的
     if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+    if (isAdmin(who) && path === "/labeling/videos" && m === "GET") return listLabelingVideos(env);
     const allowed = path.match(ANNOTATOR_PATHS);
     const write = allowed && m === "PUT" && !allowed[2].includes("/");
-    if (!allowed || !(m === "GET" || write)) throw new HttpError(403, "只有管理员可以");
-    await requireTaskOn(env, who, allowed[1]);
+    if (!allowed || !(m === "GET" || write)) throw new HttpError(403, isAdmin(who) ? "只有超级管理员可以" : "只有管理员可以");
+    if (!isAdmin(who)) await requireTaskOn(env, who, allowed[1]);
   }
+  if (path === "/labeling/videos" && m === "GET") return listLabelingVideos(env);
   if (path === "/videos" && m === "POST") return createVideo(req, env);
   if (path === "/videos" && m === "GET") return listVideos(env);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);

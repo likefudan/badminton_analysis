@@ -37,7 +37,7 @@ const Strokes = (() => {
       go(first >= 0 ? first : 0);
       loop();
     } catch (e) {
-      $s("sMsg").textContent = e.status === 404 ? "击球小视频还没准备好：回到录像的「标注」里点「准备击球类型标注」。" : "读取失败：" + e.message;
+      $s("sMsg").textContent = e.status === 404 ? "击球小视频还没准备好：到「标注 › 素材」里点「准备击球类型标注」。" : "读取失败：" + e.message;
     }
   }
 

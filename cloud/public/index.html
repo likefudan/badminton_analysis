@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="羽毛球分析">
-<title>羽毛球分析</title>
+<meta name="apple-mobile-web-app-title" content="Badminton Analysis">
+<title>Badminton Analysis</title>
 <link rel="icon" href="/logo.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/logo.svg">
 <style>
@@ -230,7 +230,32 @@
   .legal { margin: 14px 0 0; } .legal a { color: var(--accent); }
   /* 多人标注：任务大厅、成员页、标注页上的任务条 */
   body.annotator .adminOnly { display: none !important; }
-  body:not(.annotator) .annotatorOnly { display: none !important; }
+  body:not(.owner) .ownerOnly { display: none !important; }
+  body.owner .notOwner { display: none; }
+  /* 顶部导航 */
+  #nav { display: flex; align-items: center; gap: 10px; margin: -4px 0 14px; }
+  body.labeling #nav { display: none; }
+  #nav .home { display: flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; font-weight: 700; flex: none; }
+  #nav .home img { width: 32px; height: 32px; display: block; }
+  #nav .home span { display: none; }
+  @media (min-width: 520px) { #nav .home span { display: inline; } }
+  #nav .areas { flex: 1; display: flex; justify-content: center; gap: 4px; }
+  #nav .areas a { padding: 7px 18px; border-radius: 18px; color: var(--quiet); text-decoration: none; font-weight: 600; }
+  #nav .areas a.on { background: var(--ink); color: var(--bg); }
+  #navMenu { position: relative; flex: none; }
+  #navMenu summary { list-style: none; cursor: pointer; }
+  #navMenu summary::-webkit-details-marker { display: none; }
+  #navAvatar { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 50%; background: var(--line) center/cover; color: var(--ink); font-weight: 700; font-size: 15px; }
+  #navMenu .menu { position: absolute; right: 0; top: 42px; z-index: 20; min-width: 210px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  #navMenu .menu a { display: block; padding: 9px 10px; border-radius: 8px; color: var(--ink); text-decoration: none; cursor: pointer; }
+  #navMenu .menu a:hover { background: var(--bg); }
+  #navMenu .who { display: flex; flex-direction: column; padding: 8px 10px 10px; border-bottom: 1px solid var(--line); margin-bottom: 6px; overflow-wrap: anywhere; }
+  .chips.subnav a { flex: none; padding: 6px 14px; border-radius: 16px; font-size: 14px; background: var(--card); color: var(--ink); border: 1px solid var(--line); text-decoration: none; }
+  .chips.subnav a.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .chips.subnav .n:not(:empty) { margin-left: 5px; padding: 0 6px; border-radius: 9px; background: var(--bad); color: #fff; font-size: 12px; }
+  .mat h3 { font-size: 14px; margin: 14px 0 2px; }
+  .mat .acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .mat .acts button, .mat .acts a { width: auto; flex: none; padding: 7px 12px; font-size: 14px; border-radius: 8px; text-decoration: none; }
   .tgroup { font-size: 13px; color: var(--quiet); margin: 16px 2px 6px; }
   .task { display: flex; align-items: center; gap: 10px; }
   .task .info { flex: 1; min-width: 0; }
@@ -247,7 +272,7 @@
 <body>
 <main>
   <section class="card" id="login" hidden>
-    <div class="brand"><img src="/logo.svg" alt="BA"><h1>羽毛球分析</h1></div>
+    <div class="brand"><img src="/logo.svg" alt="BA"><h1>Badminton Analysis</h1></div>
     <a class="pick" id="googleBtn" href="/api/v1/auth/google/start" style="text-decoration:none" hidden>用 Google 账号登录</a>
     <p class="quiet" id="loginMsg"></p>
     <details id="pwBox" class="quiet"><summary>用口令登录（管理员）</summary>
@@ -259,7 +284,7 @@
 
   <!-- 用 Google 登录了，但还没有被邀请 -->
   <section class="card" id="pending" hidden>
-    <div class="brand"><img src="/logo.svg" alt="BA"><h1>羽毛球分析</h1></div>
+    <div class="brand"><img src="/logo.svg" alt="BA"><h1>Badminton Analysis</h1></div>
     <p>已登录：<b id="pendingWho"></b></p>
     <p id="pendingMsg"></p>
     <button class="plain" id="pendingLogout">换一个账号</button>
@@ -272,9 +297,29 @@
   </section>
 
   <div id="app" hidden>
+    <!-- 顶部导航：两个大入口（分析、标注）和账号菜单 -->
+    <nav id="nav">
+      <a class="home" id="navHome" href="#/"><img src="/logo.svg" alt=""><span>Badminton Analysis</span></a>
+      <div class="areas">
+        <a href="#/" id="navAnalysis" class="ownerOnly">分析</a>
+        <a href="#/tasks" id="navLabeling">标注</a>
+      </div>
+      <details id="navMenu">
+        <summary aria-label="账号"><span id="navAvatar"></span></summary>
+        <div class="menu">
+          <div class="who"><b id="navName"></b><span class="quiet" id="navEmail"></span><span class="quiet" id="navRole"></span></div>
+          <a href="#/team" class="adminOnly">成员</a>
+          <a href="#/settings" class="ownerOnly">设置</a>
+          <a href="#/mac" class="ownerOnly">Mac 状态</a>
+          <a href="/terms">Terms</a>
+          <a href="/privacy">Privacy</a>
+          <a id="navLogout">退出登录</a>
+        </div>
+      </details>
+    </nav>
     <!-- 首页：我的录像 -->
     <div class="view" id="vHome">
-      <div class="top"><h1>我的录像</h1><a href="#/tasks">标注任务</a><a href="#/team">成员</a><a href="#/settings">设置</a></div>
+      <div class="top"><h1>我的录像</h1></div>
       <a class="pick" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
       <div class="chips" id="filters"></div>
       <div id="list"><div class="empty">读取中</div></div>
@@ -338,29 +383,11 @@
         <p class="quiet" id="dMeta"></p>
         <p id="dStatus"></p>
         <div class="tabs" id="tabs">
-          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="annot">标注</button><button data-tab="process">处理</button>
+          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process">处理</button>
         </div>
         <div id="tOverview"><div id="dStats"></div><div id="dReview"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
         <div id="tVideos" hidden></div>
         <div id="tCards" hidden></div>
-        <div id="tAnnot" hidden>
-          <p class="quiet">在手机上一帧一帧确认羽毛球的位置：模型猜对了点「对」，猜错了点画面上真正的球。标好的帧用来检验球追踪准不准，也能用来微调模型（Mac 上 <code>badminton annotate-export</code>）。</p>
-          <p id="aState"></p>
-          <p id="aError" class="bad" hidden></p>
-          <div id="aCounts" class="quiet"></div>
-          <a class="pick" id="aOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注</a>
-          <div class="row"><button id="aPrepare" hidden>准备标注</button></div>
-          <div class="row"><button class="plain" id="aFresh" hidden>用新模型重新预测</button><button class="plain" id="aClear" hidden>删除图片</button></div>
-          <div class="row"><a class="plain pick" id="aCsv" style="text-decoration:none;background:none;color:var(--accent);border:1px solid var(--line);font-weight:400" hidden>下载 CSV（带标注人）</a></div>
-          <h3 style="margin-top:22px">击球类型</h3>
-          <p class="quiet">每一拍剪成一小段慢放，选它是什么球（杀球、吊球……），再加上劈杀、对角这类标记。已经按模型的判断选好，模型没把握的排在前面。</p>
-          <p id="kState"></p>
-          <p id="kError" class="bad" hidden></p>
-          <div id="kCounts" class="quiet"></div>
-          <a class="pick" id="kOpen" style="text-decoration:none;margin-top:10px" hidden>开始标注击球类型</a>
-          <div class="row"><button id="kPrepare" hidden>准备击球类型标注</button></div>
-          <div class="row"><a class="plain pick" id="kCsv" style="text-decoration:none;background:none;color:var(--accent);border:1px solid var(--line);font-weight:400" hidden>下载 CSV</a><button class="plain" id="kClear" hidden>删除小视频</button></div>
-        </div>
         <div id="tProcess" hidden>
           <p id="dError" class="bad" hidden></p>
           <div id="dProgress"></div>
@@ -373,17 +400,37 @@
       </section>
     </div>
 
-    <!-- 任务大厅：领标注任务 -->
+    <!-- 标注 › 任务：领任务、接着标、提交 -->
     <div class="view" id="vTasks" hidden>
-      <div class="top"><a href="#/" class="adminOnly">‹ 返回</a><h1>标注任务</h1><span class="quiet" id="tWho"></span><a id="tLogout" class="annotatorOnly">退出</a></div>
-      <p class="quiet">领一个任务就只有你能标这一段，别人不会重复标。领了之后 2 小时没有保存会自动放回大厅；每次保存都会重新计时。标完点「提交」。</p>
+      <div class="top"><h1>标注</h1></div>
+      <div class="chips subnav adminOnly"><a href="#/tasks" class="on">任务</a><a href="#/materials">素材</a><a href="#/review">审核<span class="n" data-review></span></a></div>
+      <p class="quiet">领一个任务就只有你能标这一段，别人不会重复标。领了之后 2 小时没有保存会自动放回；每次保存都会重新计时。标完点「提交」。</p>
       <p class="bad" id="tError" hidden></p>
       <div id="tList"><div class="empty">读取中</div></div>
     </div>
 
+    <!-- 标注 › 素材（管理员）：每段录像的标注材料和进度 -->
+    <div class="view" id="vMaterials" hidden>
+      <div class="top"><h1>标注</h1></div>
+      <div class="chips subnav"><a href="#/tasks">任务</a><a href="#/materials" class="on">素材</a><a href="#/review">审核<span class="n" data-review></span></a></div>
+      <p class="quiet">每段分析完的录像都可以准备两种标注材料：球的位置（Mac 挑出模型最没把握的 3 个回合切成图片）和击球类型（每一拍剪成一小段）。准备好之后任务自动出现在「任务」里。<span class="notOwner">准备材料要用到家里的 Mac，只有超级管理员可以点。</span></p>
+      <p class="quiet" id="mtNode"></p>
+      <p class="bad" id="mtError" hidden></p>
+      <div id="mtList"><div class="empty">读取中</div></div>
+    </div>
+
+    <!-- 标注 › 审核（管理员）：已提交的、别人正在标的、已完成的 -->
+    <div class="view" id="vReview" hidden>
+      <div class="top"><h1>标注</h1></div>
+      <div class="chips subnav"><a href="#/tasks">任务</a><a href="#/materials">素材</a><a href="#/review" class="on">审核<span class="n" data-review></span></a></div>
+      <p class="quiet">提交上来的任务点「查看」打开标注页检查，没问题点「通过」，有问题点「退回重标」。你可以直接改错的地方。</p>
+      <p class="bad" id="rvError" hidden></p>
+      <div id="rvList"><div class="empty">读取中</div></div>
+    </div>
+
     <!-- 成员和每个人的进度（管理员） -->
     <div class="view" id="vTeam" hidden>
-      <div class="top"><a href="#/">‹ 返回</a><h1>成员</h1></div>
+      <div class="top"><h1>成员</h1></div>
       <section class="card">
         <h2>邀请</h2>
         <p class="quiet">填对方的 Google 邮箱。对方打开网站用 Google 登录就能领任务。没被邀请的人登录后会出现在下面的「申请加入」里，点「允许」也可以。</p>
