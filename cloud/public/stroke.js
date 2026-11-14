@@ -10,10 +10,11 @@ const Strokes = (() => {
   const SPEEDS = [1, 0.5, 0.25];
   const NOT_A_HIT = "不是击球";   // 模型以为这里有一拍，其实没有
 
-  async function open(id) {
-    if (S && S.id === id) { show(); return; }
+  // task：从任务大厅进来时只标这个任务范围里的拍（{id, start, end}，帧号）
+  async function open(id, task = null) {
+    if (S && S.id === id && S.taskId === (task ? task.id : null)) { show(); return; }
     close();
-    S = { id, state: null, labels: new Map(), order: [], k: 0, sel: null, queue: new Map(), saving: false, saveError: "",
+    S = { id, taskId: task ? task.id : null, task, state: null, labels: new Map(), order: [], k: 0, sel: null, queue: new Map(), saving: false, saveError: "",
           speed: 0.5, reviewFirst: true, raf: 0 };
     $s("sMsg").textContent = "读取中";
     $s("sStage").hidden = true;
@@ -31,6 +32,7 @@ const Strokes = (() => {
       $s("sStage").hidden = false;
       buildChoices();
       reorder();
+      if (!S.order.length) throw new Error("这个任务的击球不在现在的小视频里，回任务大厅刷新一下");
       const first = S.order.findIndex((i) => !S.labels.has(state.strokes[i].frame));
       go(first >= 0 ? first : 0);
       loop();
@@ -48,7 +50,8 @@ const Strokes = (() => {
 
   // 没把握的先，其余按时间；或者全部按时间
   function reorder() {
-    const n = S.state.strokes.length, all = [...Array(n).keys()];
+    const n = S.state.strokes.length;
+    const all = [...Array(n).keys()].filter((i) => !S.task || (S.state.strokes[i].frame >= S.task.start && S.state.strokes[i].frame <= S.task.end));
     S.order = S.reviewFirst ? [...all.filter((i) => S.state.strokes[i].needs_review), ...all.filter((i) => !S.state.strokes[i].needs_review)] : all;
   }
 
@@ -129,8 +132,9 @@ const Strokes = (() => {
   function show() {
     if (!S || !S.state) return;
     const st = stroke(), lab = S.labels.get(st.frame), n = S.order.length;
-    const done = S.state.strokes.filter((x) => S.labels.has(x.frame)).length;
-    const review = S.state.strokes.filter((x) => x.needs_review).length;
+    const mine = S.order.map((i) => S.state.strokes[i]);
+    const done = mine.filter((x) => S.labels.has(x.frame)).length;
+    const review = mine.filter((x) => x.needs_review).length;
     $s("sWhere").textContent = `第 ${S.k + 1}/${n} 拍 · ${fmtClock(st.time_s ?? st.frame / S.state.video.fps)} · 已标 ${done}/${n}` +
       (S.reviewFirst ? `（模型没把握的 ${review} 拍排在前面）` : "");
     const alts = (st.alternatives || []).map((a) => `${a.type} ${Math.round(a.prob * 100)}%`).join("、");

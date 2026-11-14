@@ -21,10 +21,11 @@ const Label = (() => {
 
   // ---------- 读数据 ----------
 
-  async function open(id) {
-    if (L && L.id === id) { draw(); return; }
+  // task：从任务大厅进来时只标这个任务的那一个回合（{id, start}）
+  async function open(id, task = null) {
+    if (L && L.id === id && L.taskId === (task ? task.id : null)) { draw(); return; }
     close();
-    L = { id, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
+    L = { id, taskId: task ? task.id : null, only: null, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
           hd: null, hdKey: "", focus: null, last: null,
           queue: new Map(), saving: false, saveError: "", armed: false, msg: "" };
     $l("lMsg").textContent = "读取中";
@@ -33,11 +34,15 @@ const Label = (() => {
       const [state, labels] = await Promise.all([api(`/videos/${id}/annot/files/state.json`), api(`/videos/${id}/labels`)]);
       if (!L || L.id !== id) return;
       L.state = state;
+      if (task) {
+        L.only = state.rallies.findIndex((R) => R.start === task.start);
+        if (L.only < 0) throw new Error("这个任务的回合不在现在的标注材料里，回任务大厅刷新一下");
+      }
       for (const [f, lab] of Object.entries(labels.labels || {})) L.labels.set(Number(f), lab);
       $l("lStage").hidden = false;
       $l("lMsg").textContent = "";
       // 从第一个还没标完的回合、第一张没标的帧开始
-      const start = firstTodo(0) || { r: 0, i: 0 };
+      const start = firstTodo(0) || { r: L.only ?? 0, i: 0 };
       go(start.r, start.i);
       renderRallies();
     } catch (e) {
@@ -59,6 +64,7 @@ const Label = (() => {
     const n = L.state.rallies.length;
     for (let k = 0; k < n; k++) {
       const r = (fromRally + k) % n, R = L.state.rallies[r];
+      if (L.only !== null && r !== L.only) continue;
       for (let i = 0; i < R.offsets.length; i++) if (!done(L.labels.get(R.start + i))) return { r, i };
     }
     return null;
@@ -80,7 +86,7 @@ const Label = (() => {
       for (let attempt = 0; ; attempt++) {
         try {
           const res = await fetch(`${API}/videos/${id}/annot/files/${pack}`, {
-            headers: { authorization: "Bearer " + token, range: `bytes=${from}-${to}` },
+            headers: { ...authHeaders(), range: `bytes=${from}-${to}` },
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const buf = await res.arrayBuffer();
@@ -230,7 +236,7 @@ const Label = (() => {
     if (L.i + 1 < R.offsets.length) return go(L.r, L.i + 1);
     const next = firstTodo(L.r);
     if (next) { go(next.r, next.i); L.msg = `回合 ${L.r + 1}：接着标没标完的`; draw(); }
-    else { L.msg = "全部标完了！"; draw(); }
+    else { L.msg = L.only !== null ? "这个任务标完了，可以点「提交任务」" : "全部标完了！"; draw(); }
   }
 
   function confirm() {
@@ -533,6 +539,7 @@ const Label = (() => {
     const box = $l("lRallies");
     box.textContent = "";
     L.state.rallies.forEach((R, r) => {
+      if (L.only !== null && r !== L.only) return;
       const b = document.createElement("button");
       const n = R.offsets.length, d = countDone(r);
       b.textContent = `回合 ${r + 1} · ${(n / (L.state.video.fps || 30)).toFixed(0)} 秒 · ${d === n ? "✓" : Math.floor(d * 100 / n) + "%"}`;

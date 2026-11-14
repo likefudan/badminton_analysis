@@ -7,6 +7,8 @@ name: 部署 ba.llmat.dev
 #   CLOUDFLARE_ACCOUNT_ID
 #   BA_ACCESS_TOKEN        网站登录口令（自己定）
 #   BA_NODE_TOKEN          可选：Mac 处理节点的钥匙（和 ~/.config/badminton/node.json 里的一致）
+#   GOOGLE_CLIENT_ID、GOOGLE_CLIENT_SECRET  可选：用 Google 登录（多人标注）。在 Google Cloud 建一个「Web 应用」OAuth 客户端，
+#                          重定向 URI 填 https://ba.llmat.dev/api/v1/auth/google/callback；没有就只能用口令登录
 #   AI_API_KEY 或 AZURE_API_KEY  可选：AI 报告用的模型的 API key（地址和模型名在 cloud/wrangler.toml 的 [vars]）；没有就不出报告
 on:
   push:
@@ -121,6 +123,18 @@ jobs:
             echo "没有 BA_NODE_TOKEN，跳过"
           fi
 
+      - name: 设置 Google 登录（有才设）
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          if [ -n "$GOOGLE_CLIENT_ID" ] && [ -n "$GOOGLE_CLIENT_SECRET" ]; then
+            printf '%s' "$GOOGLE_CLIENT_ID" | npx wrangler secret put GOOGLE_CLIENT_ID
+            printf '%s' "$GOOGLE_CLIENT_SECRET" | npx wrangler secret put GOOGLE_CLIENT_SECRET
+          else
+            echo "没有 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET，跳过（网站只能用口令登录）"
+          fi
+
       - name: 设置 AI 报告的 API key（有才设）
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY || secrets.AZURE_API_KEY }}
@@ -149,6 +163,9 @@ jobs:
           check "首页" 200 "$SITE/"
           check "未登录 /api/v1/me" 401 "$SITE/api/v1/me"
           check "登录后 /api/v1/me" 200 -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me"
+          echo "Google 登录是否可用：$(curl -s "$SITE/api/v1/auth/config" || true)"
+          check "条款页" 200 -L "$SITE/terms"
+          check "隐私页" 200 -L "$SITE/privacy"
           echo "AI 报告是否可用：$(curl -s -H "Authorization: Bearer $BA_ACCESS_TOKEN" "$SITE/api/v1/me" | grep -o '"review":[a-z]*' || true)"
           if [ -n "$BA_NODE_TOKEN" ]; then
             check "处理节点的钥匙 /api/v1/me" 200 -H "Authorization: Bearer $BA_NODE_TOKEN" "$SITE/api/v1/me"

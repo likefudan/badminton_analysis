@@ -1,3 +1,5 @@
+import { identify, publicApi, teamApi, requireTaskOn, guardLabelWrite, isAdmin, meJson, type Who } from "./team";
+
 // ba.llmat.dev 后端。阶段 0：录像分片上传到 R2，可断点续传。
 // 接口在 /api/v1 下，用 Bearer 口令登录；网页、将来的 App 和 Mac 处理节点共用。
 
@@ -14,6 +16,11 @@ export interface Env {
   AI_ENDPOINT_OPENAI?: string; // 其它模型走的地址（后面补 /chat/completions）
   AI_MODELS?: string; // 可选：JSON 数组 [{id, label, format}]，替换内置的模型列表
   LABEL_SYNC_DELAY_S?: string;
+  // Google 登录（OAuth 客户端的 ID 和密钥）。没有设置时网站只能用口令登录。
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  GOOGLE_AUTH_URL?: string;  // 只在测试里改：假的 Google
+  GOOGLE_TOKEN_URL?: string;
 }
 
 // 片越小，网络中断时白传的越少。R2 要求除最后一片外每片一样大、每片至少 5 MiB、最多 10000 片，
@@ -74,23 +81,23 @@ type VideoRow = {
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
 
-class HttpError extends Error {
+export class HttpError extends Error {
   constructor(public status: number, message: string) {
     super(message);
   }
 }
 
-const json = (data: unknown, status = 200) =>
+export const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 
-async function sha256(text: string): Promise<Uint8Array> {
+export async function sha256(text: string): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
 }
 
-const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+export const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 // 网页里的 <img> 和 <video> 带不了 Authorization 头，所以登录后发一个只有浏览器自己带的 cookie。
 // 它的值由口令算出，不是口令本身；改口令后旧 cookie 自动失效。
@@ -99,25 +106,11 @@ async function sessionValue(env: Env): Promise<string> {
 }
 
 // 先各自做 SHA-256 再逐字节比较，比较时间不随口令内容变化
-async function sameSecret(got: string, want: string): Promise<boolean> {
+export async function sameSecret(got: string, want: string): Promise<boolean> {
   const [a, b] = await Promise.all([sha256(got), sha256(want)]);
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
   return diff === 0;
-}
-
-async function authorized(req: Request, env: Env): Promise<boolean> {
-  if (!env.ACCESS_TOKEN) return false;
-  const header = req.headers.get("authorization") ?? "";
-  if (header.startsWith("Bearer ")) {
-    const got = header.slice(7);
-    if (await sameSecret(got, env.ACCESS_TOKEN)) return true;
-    return env.NODE_TOKEN ? sameSecret(got, env.NODE_TOKEN) : false;
-  }
-  // cookie 只用于读取（GET）：别的网站没法借它来改数据
-  if (req.method !== "GET") return false;
-  const cookie = (req.headers.get("cookie") ?? "").split(/;\s*/).find((c) => c.startsWith(SESSION_COOKIE + "="));
-  return cookie ? sameSecret(cookie.slice(SESSION_COOKIE.length + 1), await sessionValue(env)) : false;
 }
 
 async function startSession(req: Request, env: Env): Promise<Response> {
@@ -309,6 +302,7 @@ async function deleteVideo(env: Env, id: string): Promise<Response> {
   await deleteAnnotFiles(env, id);
   await deletePrefix(env, strokesKey(id, ""));
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM tasks WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM stroke_labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM video_parts WHERE video_id = ?").bind(id),
@@ -874,7 +868,7 @@ async function enforceRetention(env: Env): Promise<void> {
 // 网页点「标注球位置」→ Mac 节点挑模型最没把握的几个回合、切成图片（每个回合一个文件，state.json 记每帧的起止位置
 // 和模型的预测）传到 annot/ 下 → 网页按 Range 一次取几帧 → 每标一帧存进 labels 表 → 节点同步回 .labels.csv。
 
-const annotKey = (id: string, name: string) => `annot/${USER_ID}/${id}/${name}`;
+export const annotKey = (id: string, name: string) => `annot/${USER_ID}/${id}/${name}`;
 const LABEL_STATUSES = new Set(["human", "bulk", "skip"]); // 网页只写人看过的；machine 只在 Mac 上
 const MAX_LABEL_ITEMS = 5000;
 
@@ -952,8 +946,24 @@ async function getAnnotFile(req: Request, env: Env, id: string, name: string): P
   return serveObject(req, env, annotKey(v.id, name));
 }
 
-async function getLabels(env: Env, id: string): Promise<Response> {
+const csvName = (v: VideoRow) => (v.filename.replace(/\.[^.]*$/, "") || "video").replace(/[^A-Za-z0-9._-]/g, "_");
+const csvFile = (lines: string[], name: string) =>
+  new Response("\ufeff" + lines.join("\r\n") + "\r\n", {
+    headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="${name}"`, "cache-control": "no-store" },
+  });
+
+// ?format=csv：网页上下载，比 Mac 上的 .labels.csv 多两列：谁标的、什么时候标的
+async function getLabels(env: Env, id: string, url: URL): Promise<Response> {
   const v = await getVideo(env, id);
+  if (url.searchParams.get("format") === "csv") {
+    const all = await env.DB.prepare("SELECT frame, visibility, x, y, status, annotator, updated_at FROM labels WHERE video_id = ? ORDER BY frame")
+      .bind(id)
+      .all<Record<string, unknown>>();
+    return csvFile(
+      ["frame,visibility,x,y,status,annotator,updated_at", ...all.results.map((r) => [r.frame, r.visibility, r.x, r.y, r.status, r.annotator, r.updated_at].map(csvCell).join(","))],
+      csvName(v) + ".labels.csv",
+    );
+  }
   const rows = await env.DB.prepare("SELECT frame, visibility, x, y, status FROM labels WHERE video_id = ? ORDER BY frame")
     .bind(id)
     .all<{ frame: number; visibility: number; x: number; y: number; status: string }>();
@@ -964,12 +974,13 @@ async function getLabels(env: Env, id: string): Promise<Response> {
 }
 
 // items: [{frame, visibility, x, y, status}] 或 [{frame, delete: true}]。先全部检查，有一条不对就一条都不写。
-async function putLabels(req: Request, env: Env, id: string): Promise<Response> {
+async function putLabels(req: Request, env: Env, id: string, who: Who): Promise<Response> {
   await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
   const items = Array.isArray(body?.items) ? (body.items as Record<string, unknown>[]) : null;
   if (!items || !items.length || items.length > MAX_LABEL_ITEMS) throw new HttpError(400, "标注列表不对");
   const now = new Date().toISOString();
+  const annotator = await guardLabelWrite(env, who, id, "shuttle", items.map((it) => Number(it?.frame)).filter(Number.isInteger));
   const stmts: D1PreparedStatement[] = [];
   for (const it of items) {
     const frame = Number(it?.frame);
@@ -986,10 +997,10 @@ async function putLabels(req: Request, env: Env, id: string): Promise<Response> 
     if (!isFinite(x) || !isFinite(y) || x < 0 || y < 0 || x > 20000 || y > 20000) throw new HttpError(400, "位置不对");
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO labels (video_id, frame, visibility, x, y, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO labels (video_id, frame, visibility, x, y, status, updated_at, annotator) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (video_id, frame) DO UPDATE SET visibility = excluded.visibility, x = excluded.x, y = excluded.y,
-           status = excluded.status, updated_at = excluded.updated_at`,
-      ).bind(id, frame, visible ? 1 : 0, Math.round(x * 100) / 100, Math.round(y * 100) / 100, status, now),
+           status = excluded.status, updated_at = excluded.updated_at, annotator = excluded.annotator`,
+      ).bind(id, frame, visible ? 1 : 0, Math.round(x * 100) / 100, Math.round(y * 100) / 100, status, now, annotator),
     );
   }
   stmts.push(env.DB.prepare("UPDATE videos SET labels_changed_at = ? WHERE id = ?").bind(now, id));
@@ -1010,7 +1021,7 @@ async function labelsSynced(req: Request, env: Env, id: string): Promise<Respons
 // 网页点「准备击球类型标注」→ Mac 节点跑 badminton strokes，把每一拍前后 1.4 秒剪成一段（一个文件，一段段首尾相接）
 // 传到 strokes/ 下 → 网页逐拍看、选主类型和附加标记 → 存进 stroke_labels → 节点写回 .strokes.labels.csv。
 
-const strokesKey = (id: string, name: string) => `strokes/${USER_ID}/${id}/${name}`;
+export const strokesKey = (id: string, name: string) => `strokes/${USER_ID}/${id}/${name}`;
 const STROKE_TYPES = new Set(["放网", "挡网", "杀球", "点杀", "挑球", "防守挑球", "高远球", "平高球", "平抽", "后场抽平", "吊球",
   "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知", "不是击球"]);
 const STROKE_TAGS = ["劈杀", "劈吊", "收吊", "搓球", "直线", "对角"];
@@ -1072,29 +1083,29 @@ const csvCell = (v: unknown) => {
   return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
 };
 
-// ?format=csv：网页上直接下载（列和 Mac 上的 .strokes.labels.csv 一样）
+// ?format=csv：网页上直接下载（前几列和 Mac 上的 .strokes.labels.csv 一样，后面多两列：谁标的、什么时候标的）
 async function getStrokeLabels(env: Env, id: string, url: URL): Promise<Response> {
   const v = await getVideo(env, id);
-  const rows = await env.DB.prepare("SELECT frame, player_id, type, tags, note FROM stroke_labels WHERE video_id = ? ORDER BY frame")
+  const rows = await env.DB.prepare("SELECT frame, player_id, type, tags, note, annotator, updated_at FROM stroke_labels WHERE video_id = ? ORDER BY frame")
     .bind(id)
-    .all<StrokeLabelRow>();
+    .all<StrokeLabelRow & { annotator: string; updated_at: string }>();
   if (url.searchParams.get("format") === "csv") {
-    const lines = ["frame,player_id,type,tags,note", ...rows.results.map((r) => [r.frame, r.player_id, r.type, r.tags, r.note].map(csvCell).join(","))];
-    const name = (v.filename.replace(/\.[^.]*$/, "") || "video").replace(/[^A-Za-z0-9._-]/g, "_");
-    return new Response("\ufeff" + lines.join("\r\n") + "\r\n", {
-      headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="${name}.strokes.labels.csv"`, "cache-control": "no-store" },
-    });
+    return csvFile(
+      ["frame,player_id,type,tags,note,annotator,updated_at", ...rows.results.map((r) => [r.frame, r.player_id, r.type, r.tags, r.note, r.annotator, r.updated_at].map(csvCell).join(","))],
+      csvName(v) + ".strokes.labels.csv",
+    );
   }
   return json({ labels: Object.fromEntries(rows.results.map((r) => [r.frame, strokeLabelJson(r)])), changedAt: v.stroke_labels_changed_at });
 }
 
 // items: [{frame, player_id, type, tags: [...], note}] 或 [{frame, delete: true}]。先全部检查。
-async function putStrokeLabels(req: Request, env: Env, id: string): Promise<Response> {
+async function putStrokeLabels(req: Request, env: Env, id: string, who: Who): Promise<Response> {
   await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
   const items = Array.isArray(body?.items) ? (body.items as Record<string, unknown>[]) : null;
   if (!items || !items.length || items.length > MAX_LABEL_ITEMS) throw new HttpError(400, "标注列表不对");
   const now = new Date().toISOString();
+  const annotator = await guardLabelWrite(env, who, id, "stroke", items.map((it) => Number(it?.frame)).filter(Number.isInteger));
   const stmts: D1PreparedStatement[] = [];
   for (const it of items) {
     const frame = Number(it?.frame);
@@ -1112,10 +1123,10 @@ async function putStrokeLabels(req: Request, env: Env, id: string): Promise<Resp
     const note = typeof it.note === "string" ? it.note.trim().slice(0, 300) : "";
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO stroke_labels (video_id, frame, player_id, type, tags, note, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO stroke_labels (video_id, frame, player_id, type, tags, note, updated_at, annotator) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (video_id, frame) DO UPDATE SET player_id = excluded.player_id, type = excluded.type, tags = excluded.tags,
-           note = excluded.note, updated_at = excluded.updated_at`,
-      ).bind(id, frame, pid, type, ordered, note, now),
+           note = excluded.note, updated_at = excluded.updated_at, annotator = excluded.annotator`,
+      ).bind(id, frame, pid, type, ordered, note, now, annotator),
     );
   }
   stmts.push(env.DB.prepare("UPDATE videos SET stroke_labels_changed_at = ? WHERE id = ?").bind(now, id));
@@ -1219,10 +1230,25 @@ async function macStatus(env: Env): Promise<Response> {
   });
 }
 
+// 标注员（不是管理员）能用的接口：自己领过任务的录像的标注材料和标注
+const ANNOTATOR_PATHS = /^\/videos\/([0-9a-f-]{36})\/(annot\/files\/[^/]+|strokes\/files\/[^/]+|labels|stroke-labels)$/;
+
 async function api(req: Request, env: Env, path: string, url: URL): Promise<Response> {
-  if (!(await authorized(req, env))) throw new HttpError(401, "口令不对");
+  const open = await publicApi(req, env, path, url);
+  if (open) return open;
+  const who = await identify(req, env);
+  if (!who || (who.mediaOnly && path === "/me")) throw new HttpError(401, "没有登录");
   const m = req.method;
-  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiKey(env)) });
+  if (path === "/me" && m === "GET") return json({ user: USER_ID, partSize: PART_SIZE, review: Boolean(aiKey(env)), ...meJson(who) });
+  const team = await teamApi(req, env, path, who);
+  if (team) return team;
+  if (!isAdmin(who)) {
+    if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+    const allowed = path.match(ANNOTATOR_PATHS);
+    const write = allowed && m === "PUT" && !allowed[2].includes("/");
+    if (!allowed || !(m === "GET" || write)) throw new HttpError(403, "只有管理员可以");
+    await requireTaskOn(env, who, allowed[1]);
+  }
   if (path === "/videos" && m === "POST") return createVideo(req, env);
   if (path === "/videos" && m === "GET") return listVideos(env);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
@@ -1267,8 +1293,8 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/annot\/files\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})\/multipart$/);
   if (match && (m === "POST" || m === "PUT")) return annotMultipart(req, env, match[1], match[2], url);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/labels$/);
-  if (match && m === "GET") return getLabels(env, match[1]);
-  if (match && m === "PUT") return putLabels(req, env, match[1]);
+  if (match && m === "GET") return getLabels(env, match[1], url);
+  if (match && m === "PUT") return putLabels(req, env, match[1], who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/labels\/synced$/);
   if (match && m === "POST") return labelsSynced(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/strokes$/);
@@ -1287,7 +1313,7 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   }
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/stroke-labels$/);
   if (match && m === "GET") return getStrokeLabels(env, match[1], url);
-  if (match && m === "PUT") return putStrokeLabels(req, env, match[1]);
+  if (match && m === "PUT") return putStrokeLabels(req, env, match[1], who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/stroke-labels\/synced$/);
   if (match && m === "POST") return strokeLabelsSynced(req, env, match[1]);
   throw new HttpError(404, "没有这个接口");
