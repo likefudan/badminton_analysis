@@ -1012,7 +1012,7 @@ async function labelsSynced(req: Request, env: Env, id: string): Promise<Respons
 
 const strokesKey = (id: string, name: string) => `strokes/${USER_ID}/${id}/${name}`;
 const STROKE_TYPES = new Set(["放网", "挡网", "杀球", "点杀", "挑球", "防守挑球", "高远球", "平高球", "平抽", "后场抽平", "吊球",
-  "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知"]);
+  "过渡吊球", "推球", "扑球", "防守抽球", "勾对角", "发短球", "发长球", "未知", "不是击球"]);
 const STROKE_TAGS = ["劈杀", "劈吊", "收吊", "搓球", "直线", "对角"];
 
 async function requestStrokes(env: Env, id: string): Promise<Response> {

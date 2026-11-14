@@ -463,18 +463,20 @@ test("击球类型：请求、节点准备、读小视频、存标注、下载 C
     { frame: 60, player_id: 3, type: "吊球", tags: ["对角", "劈吊"], note: "很快, \"假动作\"" },
     { frame: 10, player_id: null, type: "发短球", tags: [] },
     { frame: 99, type: "未知" },
+    { frame: 98, type: "不是击球" },
   ])).status, 200);
   const { changedAt } = await (await put([{ frame: 99, delete: true }])).json();
   const labels = await (await call(`/videos/${v.id}/stroke-labels`)).json();
   assert.deepEqual(labels.labels, {
     10: { player_id: null, type: "发短球", tags: [], note: "" },
     60: { player_id: 3, type: "吊球", tags: ["劈吊", "对角"], note: "很快, \"假动作\"" },
+    98: { player_id: null, type: "不是击球", tags: [], note: "" },
   });
   const csv = await call(`/videos/${v.id}/stroke-labels?format=csv`);
   assert.match(csv.headers.get("content-disposition"), /game_1\.strokes\.labels\.csv/);
-  assert.equal((await csv.text()).replace(/^﻿/, ""), 'frame,player_id,type,tags,note\r\n10,,发短球,,\r\n60,3,吊球,劈吊;对角,"很快, ""假动作"""\r\n');
+  assert.equal((await csv.text()).replace(/^﻿/, ""), 'frame,player_id,type,tags,note\r\n10,,发短球,,\r\n60,3,吊球,劈吊;对角,"很快, ""假动作"""\r\n98,,不是击球,,\r\n');
   st = await (await call(`/videos/${v.id}`)).json();
-  assert.equal(st.strokes.labels, 2);
+  assert.equal(st.strokes.labels, 3);
 
   await new Promise((r) => setTimeout(r, 20));
   const sync = await (await post("/node/claim", { node: "mac", tasks })).json();

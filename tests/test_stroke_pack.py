@@ -83,7 +83,7 @@ def test_pack_cuts_one_clip_per_hit_with_a_key_frame_at_each_start(clip, analysi
     assert [s["frame"] for s in state["strokes"]] == [10, 60, 115]
     assert state["strokes"][1]["needs_review"] and state["strokes"][1]["direction"] == "对角"
     assert {p["id"] for p in state["players"]} == {1, 3}
-    assert state["types"][-1] == "未知" and "劈杀" in state["tags"]
+    assert state["types"][-2:] == ["未知", "不是击球"] and "劈杀" in state["tags"]
     cap = cv2.VideoCapture(str(out / "strokes.mp4"))
     assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 3 * 43
     frames = []
