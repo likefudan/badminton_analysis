@@ -122,6 +122,23 @@ def test_without_players_only_strong_kinks_count():
     assert all("player_id" not in h for h in hits)
 
 
+def test_lone_hits_between_rallies_are_dropped():
+    gap = int(H.RALLY_GAP_S * FPS)
+    rally_a = [{"frame": f} for f in (100, 130, 160)]
+    pickup = {"frame": 160 + gap + 30}  # the shuttle picked up and tossed back: nobody hits it back
+    rally_b = [{"frame": f} for f in (pickup["frame"] + gap + 30, pickup["frame"] + gap + 60)]
+    kept = H.drop_lone_hits(rally_a + [pickup] + rally_b, FPS)
+    assert frames(kept) == frames(rally_a + rally_b)
+
+
+def test_two_hits_within_the_rally_gap_are_kept():
+    gap = int(H.RALLY_GAP_S * FPS)
+    hits = [{"frame": 10}, {"frame": 10 + gap}]  # exactly the gap apart: still one rally
+    assert frames(H.drop_lone_hits(hits, FPS)) == [10, 10 + gap]
+    assert H.drop_lone_hits([{"frame": 10}], FPS) == []
+    assert H.drop_lone_hits([], FPS) == []
+
+
 def test_score_hits_and_ignore_labels():
     hits = [{"frame": f, "player_id": 1 + k % 2} for k, f in enumerate([10, 41, 70, 100, 131])]
     labels = [{"frame": 10, "player_id": 1, "note": ""}, {"frame": 40, "player_id": 2, "note": ""},
