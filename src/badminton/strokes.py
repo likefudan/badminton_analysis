@@ -297,7 +297,7 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
             inside = [SHUTTLESET_TYPES.index(s) for s in SM.NAMES[SM.CLASSES[rank[0]]][2]]
             k = max(inside, key=lambda j: mine[i, j])
             prob = float(coarse[i, rank[0]])
-            alts = [{"type": SM.NAMES[SM.CLASSES[c]][0], "prob": round(float(coarse[i, c]), 3)} for c in rank[1:3]]
+            alts = [{"type": SM.NAMES[SM.CLASSES[r]][0], "prob": round(float(coarse[i, r]), 3)} for r in rank[1:3]]
         else:
             order = np.argsort(-mine[i])
             k = int(order[0])

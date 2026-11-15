@@ -278,6 +278,8 @@ class StrokeClassifier:
     @classmethod
     def load(cls, path: str | Path | None = None) -> "StrokeClassifier | None":
         """The model in `path` (default: the badminton cache folder), None if there is none."""
+        import pickle
+
         import torch
 
         if path is None:
@@ -290,7 +292,7 @@ class StrokeClassifier:
                 return None
             model = build_model()
             model.load_state_dict(doc["state"])
-        except (OSError, KeyError, RuntimeError):
+        except (OSError, KeyError, RuntimeError, AttributeError, ValueError, pickle.UnpicklingError):
             return None
         return cls(model, doc.get("meta"))
 

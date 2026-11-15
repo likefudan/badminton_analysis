@@ -128,3 +128,9 @@ def test_doubles_model_picks_the_class_and_bst_the_type_inside_it():
         assert len(r["alternatives"]) == 2
     plain = ST.classify_hits(skel, tracking, hits, shuttle, _calib(), [model], 30.0)
     assert {r["model"] for r in plain} == {"bst"}
+
+
+def test_a_file_that_is_not_weights_loads_as_none(tmp_path):
+    pytest.importorskip("torch")
+    (tmp_path / "junk.pt").write_bytes(b"not a model")
+    assert SM.StrokeClassifier.load(tmp_path / "junk.pt") is None
