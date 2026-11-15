@@ -15,7 +15,9 @@ const Label = (() => {
   const TRAIL = 6;            // 画出前面几帧的轨迹
   const SIDE_PX = 175;        // 手机横屏时右边按钮栏的宽度
   const NEAR_MIN_PX = 60;     // 在上一帧附近找球的最小半径（4K 视频的像素，其它尺寸按宽度换算）
-  const NEAR_MIN_SCORE = 120; // 前后帧比较时，变亮的小块至少要这么明显才当成球
+  const NEAR_MIN_SCORE = 120; // 前后帧比较时，变亮的小块至少要这么明显才当成球（原图局部）
+  const NEAR_MIN_SCORE_FULL = 30; // 同上，用缩小一半的整帧图时（3x3 的和约是原图的 1/4）
+  const NEAR_MARGIN_PX = 12;  // 要看的范围在推算的圈外面再留这么宽（4K 的像素）
   const PHONE_LANDSCAPE = window.matchMedia("(orientation: landscape) and (max-height: 540px)");
 
   let L = null;               // 当前在标的录像
@@ -169,7 +171,7 @@ const Label = (() => {
 
   // ---------- 在上一帧附近找球 ----------
   // 这帧还没标、上一帧标了有球：按上两帧的速度推算球该在哪。模型的点离推算的位置太远（或者模型说没球）时，
-  // 先在推算点附近找模型热图上的弱信号（Mac 准备标注时存下的 weak），找不到再比较前后两帧的原图局部，
+  // 先在推算点附近找模型热图上的弱信号（Mac 准备标注时存下的 weak），找不到再比较前后两帧的图，
   // 找附近新变亮的小块。找到的点作为蓝色十字预填，对就点「对」，不对照常点真正的球。
   function expected(i = L.i) {
     const p1 = i >= 1 ? labelPoint(i - 1) : null;
@@ -205,37 +207,44 @@ const Label = (() => {
   }
   const isSuggested = () => L.suggested && L.pending && L.pending.x === L.suggested.x && L.pending.y === L.suggested.y;
 
-  // 前后两帧的原图局部里，推算点附近新变亮的小块（球是白的，背景不动）
+  // 比较前后两帧，找推算点附近新变亮的小块（球是白的，背景不动）。原图局部是围着模型的预测切的：模型丢了球，
+  // 球可能已经飞到局部外面，所以两帧的局部都盖住要看的范围才用原图局部，否则用整帧图（缩小的，位置粗一点）。
+  // 试过拿上一帧球的样子做模板比对：球太小，模板里大半是背景，球飞走后原地的背景照样很像，不如找变亮的准
+  // （IMG_0971/0995 的 1250 对标注：快速的帧模板比对 72% 对，找变亮 91–95% 对）。
   async function motionSearch(r, i, A) {
     const R = L.state.rallies[r];
-    if (!R.hd || i < 1) return;
+    if (i < 1) return;
     try {
-      await Promise.all([chunk(r, Math.floor(i / CHUNK), "hd"), chunk(r, Math.floor((i - 1) / CHUNK), "hd")]);
+      const [vw, vh] = L.state.video.size, pad = NEAR_MARGIN_PX * vw / 3840;
+      const nx0 = Math.max(0, A.x - A.radius - pad), ny0 = Math.max(0, A.y - A.radius - pad);
+      const nx1 = Math.min(vw, A.x + A.radius + pad), ny1 = Math.min(vh, A.y + A.radius + pad);
+      const crop = L.state.crop;
+      const covers = (o) => o && crop && o[2] <= nx0 && o[3] <= ny0 && o[2] + crop[0] >= nx1 && o[3] + crop[1] >= ny1;
+      const kind = R.hd && covers(R.hd[i]) && covers(R.hd[i - 1]) ? "hd" : "";
+      const s = kind ? 1 : L.state.image[0] / vw; // 图上的像素 / 视频像素
+      await Promise.all([chunk(r, Math.floor(i / CHUNK), kind), chunk(r, Math.floor((i - 1) / CHUNK), kind)]);
       if (!nearTodo(r, i)) return;
-      const b1 = L.blobs.get("hd" + r + ":" + i), b0 = L.blobs.get("hd" + r + ":" + (i - 1));
+      const b1 = L.blobs.get(kind + r + ":" + i), b0 = L.blobs.get(kind + r + ":" + (i - 1));
       if (!b1 || !b0) return;
       const [m1, m0] = await Promise.all([createImageBitmap(b1), createImageBitmap(b0)]);
-      const [, , ax, ay] = R.hd[i], [, , bx, by] = R.hd[i - 1];
-      const x0 = Math.round(Math.max(A.x - A.radius, ax, bx)), y0 = Math.round(Math.max(A.y - A.radius, ay, by));
-      const x1 = Math.round(Math.min(A.x + A.radius, ax + m1.width, bx + m0.width));
-      const y1 = Math.round(Math.min(A.y + A.radius, ay + m1.height, by + m0.height));
-      const w = x1 - x0, h = y1 - y0;
+      const [ax, ay] = kind ? R.hd[i].slice(2) : [0, 0], [bx, by] = kind ? R.hd[i - 1].slice(2) : [0, 0];
+      const x0 = Math.floor(nx0 * s), y0 = Math.floor(ny0 * s), w = Math.ceil(nx1 * s) - x0, h = Math.ceil(ny1 * s) - y0;
       if (w < 8 || h < 8) { m1.close?.(); m0.close?.(); return; }
       const pixels = (bmp, ox, oy) => {
         const c = document.createElement("canvas");
         c.width = w; c.height = h;
         const g = c.getContext("2d", { willReadFrequently: true });
-        g.drawImage(bmp, ox - x0, oy - y0);
+        g.drawImage(bmp, ox * s - x0, oy * s - y0);
         return g.getImageData(0, 0, w, h).data;
       };
       const d1 = pixels(m1, ax, ay), d0 = pixels(m0, bx, by);
       m1.close?.(); m0.close?.();
       if (!nearTodo(r, i)) return;
-      const best = brightening(d1, d0, w, h, A.x - x0, A.y - y0, A.radius);
-      if (!best || best.score < NEAR_MIN_SCORE) return;
-      offer({ x: x0 + best.x, y: y0 + best.y }, "motion");
+      const best = brightening(d1, d0, w, h, A.x * s - x0, A.y * s - y0, A.radius * s);
+      if (!best || best.score < (kind ? NEAR_MIN_SCORE : NEAR_MIN_SCORE_FULL)) return;
+      offer({ x: round((x0 + best.x) / s), y: round((y0 + best.y) / s) }, "motion");
       draw();
-    } catch (e) { /* 没有原图局部就不找 */ }
+    } catch (e) { /* 图读不到就不找 */ }
   }
 
   // 每个像素：这一帧比上一帧亮了多少 × 这一帧有多亮；3x3 加起来，离推算点越远打折越多
