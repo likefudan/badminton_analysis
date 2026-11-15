@@ -508,13 +508,14 @@ badminton hits match.mp4 --court match.court.json
 badminton strokes match.mp4 --court match.court.json --hits match.hits.json
 ```
 
-给每拍写出击球人和技术类型（杀球、点杀、吊球、过渡吊球、放网、勾对角、推球、扑球、挑球、高远球、平高球、平抽、挡网、发球等），附带直线/对角，输出 `match.strokes.json`、`.csv` 和带标签的 `match.strokes.mp4`。单打和双打都能用。主类型来自 BST 模型（需要另外下载权重），直线/对角和平高/高远是按下一拍击球人的位置推算的。还没有人工标注，所以没有准确率数字；劈杀、劈吊、收吊、搓球要等有了标注再做。说明见 [docs/stroke_types.md](docs/stroke_types.md)。
+给每拍写出击球人和技术类型（杀球、点杀、吊球、过渡吊球、放网、勾对角、推球、扑球、挑球、高远球、平高球、平抽、挡网、发球等），附带直线/对角，输出 `match.strokes.json`、`.csv` 和带标签的 `match.strokes.mp4`。单打和双打都能用。主类型来自 BST 模型（需要另外下载权重），直线/对角和平高/高远是按下一拍击球人的位置推算的。还没有人工标注，所以没有准确率数字；劈杀、劈吊、收吊、搓球要等有了标注再做。双打另有一个用 DShuttleNet 训练的 9 类模型（`--doubles-model auto`，默认不开）：转播双打上判对 79%，BST 是 67%；手机录像上还没看出更好。说明见 [docs/stroke_types.md](docs/stroke_types.md)。
 
 ## 代码结构
 
 | 文件 | 内容 |
 | --- | --- |
 | `src/badminton/strokes.py` | 每拍击球类型：击球人和对手送进 BST、只取击球人一侧的类别、直线/对角和平高规则、带标签的视频 |
+| `src/badminton/stroke_model.py` | 双打击球类型模型（DShuttleNet 训练）：站位和节奏特征、姿态和球的序列特征、模型和权重读写；训练和按场次打分在 `scripts/train_stroke_classifier.py` |
 | `src/badminton/court.py` | 球场尺寸、标记点、画面与球场坐标的单应变换、检测区域 |
 | `src/badminton/calibrate.py` | 点标记点的窗口（带放大镜） |
 | `src/badminton/autocal.py` | 自动标定：找白线、和标准球场对应、精调、机位漂移、从球场线估计镜头畸变 |

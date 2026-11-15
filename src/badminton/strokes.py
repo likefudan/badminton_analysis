@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from . import bst
+from . import stroke_model as SM
 from .court import CourtCalibration
 from .provenance import DERIVED
 
@@ -234,8 +235,12 @@ def attributes(hits: list[dict], i: int, fps: float, by_id: dict, type_name: str
 
 
 def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray, calib: CourtCalibration,
-                  models: list, fps: float) -> list[dict]:
-    """hits: dicts with frame, player_id, side ("near"/"far"). Returns one result dict per hit."""
+                  models: list, fps: float, doubles_model=None) -> list[dict]:
+    """hits: dicts with frame, player_id, side ("near"/"far"). Returns one result dict per hit.
+
+    With `doubles_model` (stroke_model.StrokeClassifier, trained on DShuttleNet's doubles) the
+    type comes from it where it has an answer: it picks one of nine coarse types, and BST only
+    chooses among the ShuttleSet types inside that one (杀球 or 点杀, 挑球 or 防守挑球, …)."""
     frames_np = np.asarray(data["frame"], int)
     n_frames = int(frames_np[-1]) + 1
     row_of = np.full(n_frames, -1)
@@ -280,27 +285,37 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
     else:
         probs = np.zeros((0, N_CLASSES_FULL))
     mine = hitter_probs(probs, [h.get("side") for h in hits])
+    coarse = np.full((len(hits), len(SM.CLASSES)), np.nan)
+    if doubles_model is not None and hits:
+        coarse = doubles_model.proba(SM.hit_features(SM.Scene(data, tracking, shuttle_px, calib), hits))
 
     out = []
     for i, (h, c, opp) in enumerate(zip(hits, clips, meta)):
-        order = np.argsort(-mine[i])
-        k = int(order[0])
+        by_doubles = bool(np.isfinite(coarse[i]).all())
+        if by_doubles:
+            rank = np.argsort(-coarse[i])
+            inside = [SHUTTLESET_TYPES.index(s) for s in SM.NAMES[SM.CLASSES[rank[0]]][2]]
+            k = max(inside, key=lambda j: mine[i, j])
+            prob = float(coarse[i, rank[0]])
+            alts = [{"type": SM.NAMES[SM.CLASSES[c]][0], "prob": round(float(coarse[i, c]), 3)} for c in rank[1:3]]
+        else:
+            order = np.argsort(-mine[i])
+            k = int(order[0])
+            prob = float(mine[i, k])
+            alts = [{"type": type_names(UNKNOWN if kk == N_TYPES else int(kk))[0], "prob": round(float(mine[i, kk]), 3)}
+                    for kk in order[1:3]]
         cls = UNKNOWN if k == N_TYPES else k + (0 if h.get("side") == "far" else N_TYPES)
         name, group, en = type_names(cls)
         attrs = attributes(hits, i, fps, by_id, name)
         if attrs.get("length", {}).get("value") == "平高":
             name, group, en = FLAT_CLEAR
-        alts = []
-        for kk in order[1:3]:
-            alts.append({"type": type_names(UNKNOWN if kk == N_TYPES else int(kk))[0], "prob": round(float(mine[i, kk]), 3)})
-        prob = float(mine[i, k])
         out.append({
             "frame": h["frame"], "time_s": round(h["frame"] / fps, 3),
             "player_id": h.get("player_id"), "side": h.get("side"), "opponent_id": opp,
             "type": name, "group": group, "type_en": en, "shuttleset_type": None if k == N_TYPES else SHUTTLESET_TYPES[k],
             "prob": round(prob, 3), "alternatives": alts, "attributes": attrs,
-            "ok_share": round(c.ok_share, 2),
-            "needs_review": bool(prob < REVIEW_PROB or c.ok_share < REVIEW_OK or k == N_TYPES),
+            "ok_share": round(c.ok_share, 2), "model": "dshuttlenet" if by_doubles else "bst",
+            "needs_review": bool(prob < REVIEW_PROB or k == N_TYPES or (not by_doubles and c.ok_share < REVIEW_OK)),
         })
     return out
 
@@ -357,8 +372,9 @@ def load_models(weights: list[str | Path]) -> list:
 
 
 def run(shuttle_csv, skeleton_npz, court: CourtCalibration, weights: list, hits_file=None,
-        players_per_side: int = 1) -> tuple[list[dict], dict]:
-    """Files in, one result per hit out. Without hits_file the hits are found here (`badminton hits`)."""
+        players_per_side: int = 1, doubles_model=None) -> tuple[list[dict], dict]:
+    """Files in, one result per hit out. Without hits_file the hits are found here (`badminton hits`).
+    `doubles_model`: see classify_hits; only used with two players a side."""
     from . import hits as H
     from .tracking import load_npz, track_players
 
@@ -373,7 +389,8 @@ def run(shuttle_csv, skeleton_npz, court: CourtCalibration, weights: list, hits_
         tracking = ctx["tracking"]
         hits = [{"frame": h["frame"], "player_id": h.get("player_id"), "side": h.get("side")} for h in found]
     shuttle_px = bst.read_shuttle_csv(shuttle_csv, n)
-    results = classify_hits(data, tracking, hits, shuttle_px, court, load_models(weights), fps)
+    results = classify_hits(data, tracking, hits, shuttle_px, court, load_models(weights), fps,
+                            doubles_model if players_per_side == 2 else None)
     return results, {"fps": fps, "tracking": tracking, "data": data}
 
 
