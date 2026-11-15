@@ -231,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
     s.add_argument("--weights", nargs="+", help="BST 不合并类别的权重 bst_CG_AP_JnB_bone*.pt，"
                    "默认 ~/codebase/third_party/BST_weights/weight/bst_CG_AP_JnB_bone.pt")
+    s.add_argument("--doubles-model", default="off", help="双打类型模型（DShuttleNet 训练，scripts/train_stroke_classifier.py）："
+                   "off（默认，只用 BST）、auto（缓存目录里有就用）或权重路径；单打不用它。"
+                   "转播双打上比 BST 准，手机录像上还没看出更好，见 docs/stroke_types.md")
     s.add_argument("--no-video", action="store_true", help="不输出带类型标签的视频")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
@@ -979,7 +982,16 @@ def cmd_strokes(a) -> int:
     names_path = Path(a.players) if a.players else video.with_suffix(".players.json")
     names = json.loads(names_path.read_text()) if names_path.exists() else {}
     per_side = 1 if a.singles else _players_per_side(data_path)
-    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side)
+    doubles = None
+    if per_side == 2 and a.doubles_model != "off":
+        from .stroke_model import STROKE_MODEL_FILE, StrokeClassifier
+
+        doubles = StrokeClassifier.load(None if a.doubles_model == "auto" else a.doubles_model)
+        if doubles is None and a.doubles_model != "auto":
+            raise SystemExit(f"读不了双打类型模型 {a.doubles_model}")
+        print("双打：类型用 DShuttleNet 训练的模型，BST 只在大类里细分" if doubles else
+              f"没有双打类型模型（{STROKE_MODEL_FILE}），只用 BST；训练方法见 scripts/train_stroke_classifier.py")
+    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side, doubles)
     doc = ST.strokes_json(results, ctx["fps"], str(video),
                           {"skeleton": str(data_path), "shuttle": str(shuttle_path), "hits": a.hits},
                           names, [str(w) for w in weights])
