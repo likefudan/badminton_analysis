@@ -105,6 +105,29 @@ def blob_candidates(heatmap: np.ndarray, thr: float = 0.3) -> np.ndarray:
     return np.array(out, dtype=np.float32).reshape(-1, 5)
 
 
+WEAK_MIN = 0.05  # weakest heatmap peak kept as a hint for the labelling page (the model's own threshold: 0.5)
+WEAK_PEAKS = 6   # at most this many per frame, highest first
+
+
+def weak_peaks(heatmap: np.ndarray, thr: float = WEAK_MIN, k: int = WEAK_PEAKS, radius: int = 3) -> np.ndarray:
+    """Local maxima of one heatmap at or above `thr`: rows (x, y, peak) in heatmap pixels,
+    highest first, at most `k`, no two closer than `radius`. Where the model reports no
+    shuttle it often still lights up faintly on it: the labelling page offers the faint
+    peak nearest to where the shuttle was a frame before (cloud/public/label.js)."""
+    hm = np.asarray(heatmap, np.float32)
+    top = cv2.dilate(hm, np.ones((2 * radius + 1, 2 * radius + 1), np.uint8))
+    ys, xs = np.nonzero((hm >= top) & (hm >= thr))
+    order = np.argsort(-hm[ys, xs], kind="stable")
+    out: list = []
+    for j in order:
+        x, y = float(xs[j]), float(ys[j])
+        if all((x - a) ** 2 + (y - b) ** 2 > radius**2 for a, b, _ in out):
+            out.append((x, y, float(hm[ys[j], xs[j]])))
+            if len(out) == k:
+                break
+    return np.array(out, dtype=np.float32).reshape(-1, 3)
+
+
 def inpaint_mask(y: np.ndarray, vis: np.ndarray, th_h: float) -> np.ndarray:
     """Frames InpaintNet should fill: gaps with the shuttle seen (below `th_h`
     from the top) on both sides; a gap after the shuttle left the top of the
@@ -561,7 +584,9 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     start_frame: begin there (row frame numbers stay video frame numbers).
     debug: if a dict is given, it receives per processed frame the blob candidates
     of the merged heatmap ("candidates") and, for processed frames listed in
-    debug["keep_heatmaps"] (a set), the merged heatmaps ("heatmaps", fp16).
+    debug["keep_heatmaps"] (a set), the merged heatmaps ("heatmaps", fp16). If it has
+    a "weak" list, that receives per processed frame the faint peaks of the full
+    frame's heatmap (weak_peaks, heatmap pixels).
 
     frame_step=2 feeds every second frame to the models: TrackNetV3 was trained
     on 30 fps footage, so a 60 fps video looks like it does in training (the
@@ -617,6 +642,7 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
         debug.setdefault("heatmaps", {})
         debug["views"] = views
         keep_hm = debug.get("keep_heatmaps", set())
+        want_weak = isinstance(debug.get("weak"), list)
 
     def locate(heats):
         """One frame: `heats` = the merged heatmap of every view."""
@@ -627,6 +653,8 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
             debug["candidates"].append(cands[0] if V == 1 else merge_view_candidates(cands, views, (w, h)))
             if k in keep_hm:
                 debug["heatmaps"][k] = heat.astype(np.float16)
+            if want_weak:
+                debug["weak"].append(weak_peaks(heat))
         t0 = time.perf_counter()
         c = largest_blob_center(heat)
         if c is None:
@@ -710,6 +738,8 @@ def track_shuttle(video: str | Path, tracknet_dir=None, compute_units: str = "AL
     tm.frames = n
     if debug is not None:
         del debug["candidates"][n:]
+        if isinstance(debug.get("weak"), list):
+            del debug["weak"][n:]
 
     xs, ys, vis = np.array(xs[:n], float), np.array(ys[:n], float), np.array(vis[:n], int)
     seen = vis.astype(bool)  # before InpaintNet fills gaps: what TrackNet itself saw
