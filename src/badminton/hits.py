@@ -79,7 +79,7 @@ WEAK = 0.4  # kinks from this fraction of the threshold up become candidates
 KINK_CAP = 3.0
 EDGE_BH = 0.7  # body heights: a track starting / ending this close to a wrist is a candidate
 EDGE_KINK = {"start": 1.5, "end": 1.0}  # what such an edge counts for, on the kink scale
-EDGE_AFTER = 3  # frames: a kink this soon after a track starts is the start itself
+EDGE_AFTER_S = 0.1  # a kink this soon after a track starts is the start itself (3 frames at 30 fps)
 WRIST_THR = 2.5  # body heights / s: wrist speed peak that is a swing
 REACH_BH = 1.3  # body heights: shuttle further than this from every wrist was not hit
 WRIST_SYNC_S = 0.1  # wrist peak and kink belong together within this
@@ -359,6 +359,7 @@ def candidates(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, 
         seen = shuttle.seen
         scale = local_scale(players, xy, frame_h)
         lost = int(round(GAP_MAX_S * fps))
+        after = max(1, int(round(EDGE_AFTER_S * fps)))
         idx = np.flatnonzero(seen)
         for run in np.split(idx, np.flatnonzero(np.diff(idx) > lost) + 1) if len(idx) else []:
             a, b = int(run[0]), int(run[-1])
@@ -370,8 +371,11 @@ def candidates(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, 
                 # a serve has a kink a few frames later (the top of a short serve, the
                 # track finding its pace): only candidates before the start or right at it
                 # stand in the way of a start, the flight's own kinks do not.
-                lo, hi = (i - gap, i + EDGE_AFTER) if kind == "start" else (i - gap, i + gap)
-                if speed >= MIN_SPEED and near <= EDGE_BH and not any(lo < f < hi + (kind == "start") for f in frames):
+                if kind == "start":
+                    blocked = any(i - gap < f <= i + after for f in frames)
+                else:
+                    blocked = any(abs(i - f) < gap for f in frames)
+                if speed >= MIN_SPEED and near <= EDGE_BH and not blocked:
                     frames[i] = kind
                     edge[i] = EDGE_KINK[kind]
     if opts.use_wrist:

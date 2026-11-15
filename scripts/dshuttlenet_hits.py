@@ -185,7 +185,6 @@ def hitter_scores(dets: list[dict], labels: list[dict], tol: int) -> dict:
         r = H.score_hits([{"frame": d["frame"], "player_id": d.get(key)} for d in dets],
                          [{"frame": l["frame"], "player_id": l.get(key), "note": ""} for l in labels], tol)
         out[key] = {"checked": r["hitter_checked"], "right": r["hitter_right"]}
-    # person given the side is right (is it the partner?)
     return out
 
 
