@@ -14,6 +14,10 @@ const Label = (() => {
   const LOUPE_SPAN = 1 / 20;  // 放大镜里看到的宽度占视频宽度的比例（4K 里是 192 个像素）
   const TRAIL = 6;            // 画出前面几帧的轨迹
   const SIDE_PX = 175;        // 手机横屏时右边按钮栏的宽度
+  const NEAR_MIN_PX = 60;     // 在上一帧附近找球的最小半径（4K 视频的像素，其它尺寸按宽度换算）
+  const NEAR_MIN_SCORE = 120; // 前后帧比较时，变亮的小块至少要这么明显才当成球（原图局部）
+  const NEAR_MIN_SCORE_FULL = 30; // 同上，用缩小一半的整帧图时（3x3 的和约是原图的 1/4）
+  const NEAR_MARGIN_PX = 12;  // 要看的范围在推算的圈外面再留这么宽（4K 的像素）
   const PHONE_LANDSCAPE = window.matchMedia("(orientation: landscape) and (max-height: 540px)");
 
   let L = null;               // 当前在标的录像
@@ -21,11 +25,12 @@ const Label = (() => {
 
   // ---------- 读数据 ----------
 
-  async function open(id) {
-    if (L && L.id === id) { draw(); return; }
+  // task：从任务大厅进来时只标这个任务的那一个回合（{id, start}）
+  async function open(id, task = null) {
+    if (L && L.id === id && L.taskId === (task ? task.id : null)) { draw(); return; }
     close();
-    L = { id, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
-          hd: null, hdKey: "", focus: null, last: null,
+    L = { id, taskId: task ? task.id : null, only: null, state: null, labels: new Map(), r: 0, i: 0, pending: null, step: 1, blobs: new Map(), loading: new Map(), bitmap: null, bitmapKey: "",
+          hd: null, hdKey: "", focus: null, last: null, suggested: null,
           queue: new Map(), saving: false, saveError: "", armed: false, msg: "" };
     $l("lMsg").textContent = "读取中";
     $l("lStage").hidden = true;
@@ -33,15 +38,19 @@ const Label = (() => {
       const [state, labels] = await Promise.all([api(`/videos/${id}/annot/files/state.json`), api(`/videos/${id}/labels`)]);
       if (!L || L.id !== id) return;
       L.state = state;
+      if (task) {
+        L.only = state.rallies.findIndex((R) => R.start === task.start);
+        if (L.only < 0) throw new Error("这个任务的回合不在现在的标注材料里，回任务大厅刷新一下");
+      }
       for (const [f, lab] of Object.entries(labels.labels || {})) L.labels.set(Number(f), lab);
       $l("lStage").hidden = false;
       $l("lMsg").textContent = "";
       // 从第一个还没标完的回合、第一张没标的帧开始
-      const start = firstTodo(0) || { r: 0, i: 0 };
+      const start = firstTodo(0) || { r: L.only ?? 0, i: 0 };
       go(start.r, start.i);
       renderRallies();
     } catch (e) {
-      $l("lMsg").textContent = e.status === 404 ? "标注用的图片还没准备好：回到录像的「处理」里点「准备标注」。" : "读取失败：" + e.message;
+      $l("lMsg").textContent = e.status === 404 ? "标注用的图片还没准备好：到「标注 › 素材」里点「准备标注」。" : "读取失败：" + e.message;
     }
   }
 
@@ -59,6 +68,7 @@ const Label = (() => {
     const n = L.state.rallies.length;
     for (let k = 0; k < n; k++) {
       const r = (fromRally + k) % n, R = L.state.rallies[r];
+      if (L.only !== null && r !== L.only) continue;
       for (let i = 0; i < R.offsets.length; i++) if (!done(L.labels.get(R.start + i))) return { r, i };
     }
     return null;
@@ -80,7 +90,7 @@ const Label = (() => {
       for (let attempt = 0; ; attempt++) {
         try {
           const res = await fetch(`${API}/videos/${id}/annot/files/${pack}`, {
-            headers: { authorization: "Bearer " + token, range: `bytes=${from}-${to}` },
+            headers: { ...authHeaders(), range: `bytes=${from}-${to}` },
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const buf = await res.arrayBuffer();
@@ -150,11 +160,127 @@ const Label = (() => {
     L.r = r;
     L.i = Math.max(0, Math.min(R.offsets.length - 1, i));
     L.pending = null;
+    L.suggested = null;
     L.focus = focusFor();
     L.armed = false;
     L.msg = "";
+    suggest();
     showFrame();
     renderRallies();
+  }
+
+  // ---------- 在上一帧附近找球 ----------
+  // 这帧还没标、上一帧标了有球：按上两帧的速度推算球该在哪。模型的点离推算的位置太远（或者模型说没球）时，
+  // 先在推算点附近找模型热图上的弱信号（Mac 准备标注时存下的 weak），找不到再比较前后两帧的图，
+  // 找附近新变亮的小块。找到的点作为蓝色十字预填，对就点「对」，不对照常点真正的球。
+  function expected(i = L.i) {
+    const p1 = i >= 1 ? labelPoint(i - 1) : null;
+    if (!p1) return null;
+    const p2 = i >= 2 ? labelPoint(i - 2) : null;
+    const vx = p2 ? p1.x - p2.x : 0, vy = p2 ? p1.y - p2.y : 0;
+    const k = L.state.video.size[0] / 3840;
+    return { x: p1.x + vx, y: p1.y + vy, radius: Math.max(NEAR_MIN_PX * k, 1.5 * Math.hypot(vx, vy) + 30 * k) };
+  }
+  function nearTodo(r, i) {
+    return L && L.r === r && L.i === i && !L.pending && !done(L.labels.get(frameOf(r, i)));
+  }
+  function suggest() {
+    if (!nearTodo(L.r, L.i)) return;
+    const A = expected();
+    if (!A) return;
+    const R = rally(), p = R.pred[L.i];
+    if (p[0] && Math.hypot(p[1] - A.x, p[2] - A.y) <= A.radius) return; // 模型的点就在附近：用橙圈
+    let best = null, bestScore = Infinity;
+    for (const [x, y, peak] of [...((R.cand && R.cand[L.i]) || []), ...((R.weak && R.weak[L.i]) || [])]) {
+      const d = Math.hypot(x - A.x, y - A.y);
+      if (d > A.radius) continue;
+      const score = d / A.radius - 0.5 * Math.min(1, peak * 2);
+      if (score < bestScore) { bestScore = score; best = { x, y }; }
+    }
+    if (best) offer(best, "heat");
+    else motionSearch(L.r, L.i, A);
+  }
+  function offer(pt, how) {
+    L.pending = { x: pt.x, y: pt.y };
+    L.suggested = { x: pt.x, y: pt.y, how };
+    follow(L.pending);
+  }
+  const isSuggested = () => L.suggested && L.pending && L.pending.x === L.suggested.x && L.pending.y === L.suggested.y;
+
+  // 比较前后两帧，找推算点附近新变亮的小块（球是白的，背景不动）。原图局部是围着模型的预测切的：模型丢了球，
+  // 球可能已经飞到局部外面，所以两帧的局部都盖住要看的范围才用原图局部，否则用整帧图（缩小的，位置粗一点）。
+  // 试过拿上一帧球的样子做模板比对：球太小，模板里大半是背景，球飞走后原地的背景照样很像，不如找变亮的准
+  // （IMG_0971/0995 的 1250 对标注：快速的帧模板比对 72% 对，找变亮 91–95% 对）。
+  async function motionSearch(r, i, A) {
+    const R = L.state.rallies[r];
+    if (i < 1) return;
+    try {
+      const [vw, vh] = L.state.video.size, pad = NEAR_MARGIN_PX * vw / 3840;
+      const nx0 = Math.max(0, A.x - A.radius - pad), ny0 = Math.max(0, A.y - A.radius - pad);
+      const nx1 = Math.min(vw, A.x + A.radius + pad), ny1 = Math.min(vh, A.y + A.radius + pad);
+      const crop = L.state.crop;
+      const covers = (o) => o && crop && o[2] <= nx0 && o[3] <= ny0 && o[2] + crop[0] >= nx1 && o[3] + crop[1] >= ny1;
+      const kind = R.hd && covers(R.hd[i]) && covers(R.hd[i - 1]) ? "hd" : "";
+      const s = kind ? 1 : L.state.image[0] / vw; // 图上的像素 / 视频像素
+      await Promise.all([chunk(r, Math.floor(i / CHUNK), kind), chunk(r, Math.floor((i - 1) / CHUNK), kind)]);
+      if (!nearTodo(r, i)) return;
+      const b1 = L.blobs.get(kind + r + ":" + i), b0 = L.blobs.get(kind + r + ":" + (i - 1));
+      if (!b1 || !b0) return;
+      const [m1, m0] = await Promise.all([createImageBitmap(b1), createImageBitmap(b0)]);
+      const [ax, ay] = kind ? R.hd[i].slice(2) : [0, 0], [bx, by] = kind ? R.hd[i - 1].slice(2) : [0, 0];
+      const x0 = Math.floor(nx0 * s), y0 = Math.floor(ny0 * s), w = Math.ceil(nx1 * s) - x0, h = Math.ceil(ny1 * s) - y0;
+      if (w < 8 || h < 8) { m1.close?.(); m0.close?.(); return; }
+      const pixels = (bmp, ox, oy) => {
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const g = c.getContext("2d", { willReadFrequently: true });
+        g.drawImage(bmp, ox * s - x0, oy * s - y0);
+        return g.getImageData(0, 0, w, h).data;
+      };
+      const d1 = pixels(m1, ax, ay), d0 = pixels(m0, bx, by);
+      m1.close?.(); m0.close?.();
+      if (!nearTodo(r, i)) return;
+      const best = brightening(d1, d0, w, h, A.x * s - x0, A.y * s - y0, A.radius * s);
+      if (!best || best.score < (kind ? NEAR_MIN_SCORE : NEAR_MIN_SCORE_FULL)) return;
+      offer({ x: round((x0 + best.x) / s), y: round((y0 + best.y) / s) }, "motion");
+      draw();
+    } catch (e) { /* 图读不到就不找 */ }
+  }
+
+  // 每个像素：这一帧比上一帧亮了多少 × 这一帧有多亮；3x3 加起来，离推算点越远打折越多
+  function brightening(d1, d0, w, h, cx, cy, radius) {
+    const s = new Float32Array(w * h);
+    for (let k = 0, j = 0; k < s.length; k++, j += 4) {
+      const l1 = 0.299 * d1[j] + 0.587 * d1[j + 1] + 0.114 * d1[j + 2];
+      const l0 = 0.299 * d0[j] + 0.587 * d0[j + 1] + 0.114 * d0[j + 2];
+      s[k] = Math.max(0, l1 - l0) * l1 / 255;
+    }
+    let best = null;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const d = Math.hypot(x - cx, y - cy);
+        if (d > radius) continue;
+        let sum = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) sum += s[(y + dy) * w + x + dx];
+        const score = sum * (1 - 0.5 * d / radius);
+        if (!best || score > best.score) best = { x, y, score };
+      }
+    }
+    if (!best) return null;
+    // 只亮了球新到的那一侧：再按这一帧里亮的部分取中心，对准球本身
+    const lum = (j) => 0.299 * d1[j] + 0.587 * d1[j + 1] + 0.114 * d1[j + 2], R = 6;
+    let lo = 255, hi = 0;
+    for (let y = Math.max(0, best.y - R); y <= Math.min(h - 1, best.y + R); y++) {
+      for (let x = Math.max(0, best.x - R); x <= Math.min(w - 1, best.x + R); x++) { const l = lum((y * w + x) * 4); lo = Math.min(lo, l); hi = Math.max(hi, l); }
+    }
+    let sw = 0, sx = 0, sy = 0;
+    for (let y = Math.max(0, best.y - R); y <= Math.min(h - 1, best.y + R); y++) {
+      for (let x = Math.max(0, best.x - R); x <= Math.min(w - 1, best.x + R); x++) {
+        const v = Math.max(0, lum((y * w + x) * 4) - (lo + hi) / 2);
+        sw += v; sx += v * x; sy += v * y;
+      }
+    }
+    return sw ? { x: Math.round(sx / sw), y: Math.round(sy / sw), score: best.score } : best;
   }
 
   // 离开一帧时记下球在哪（标的点 / 正在改的点 / 预测），下一帧的放大镜先对准这里：球一帧里走不远
@@ -230,7 +356,7 @@ const Label = (() => {
     if (L.i + 1 < R.offsets.length) return go(L.r, L.i + 1);
     const next = firstTodo(L.r);
     if (next) { go(next.r, next.i); L.msg = `回合 ${L.r + 1}：接着标没标完的`; draw(); }
-    else { L.msg = "全部标完了！"; draw(); }
+    else { L.msg = L.only !== null ? "这个任务标完了，可以点「提交任务」" : "全部标完了！"; draw(); }
   }
 
   function confirm() {
@@ -356,6 +482,7 @@ const Label = (() => {
     const lab = L.labels.get(f);
     if (L.pending) cross(g, L.pending.x * s, L.pending.y * s, "#2f81f7");
     else if (done(lab) && lab[0]) cross(g, lab[1] * s, lab[2] * s, lab[3] === "bulk" ? "#7ee787" : "#3fb950");
+    if (isSuggested()) { g.setLineDash([3, 3]); ring(g, L.pending.x * s, L.pending.y * s, 18, "#2f81f7", 1.5); g.setLineDash([]); }
     // 放大镜对准的范围
     if (L.focus && L.bitmap) {
       const half = spanPx() / 2 * s;
@@ -467,7 +594,10 @@ const Label = (() => {
     const doneN = countDone(L.r);
     $l("lWhere").textContent = `回合 ${L.r + 1}/${L.state.rallies.length} · 第 ${L.i + 1}/${n} 帧 · ${((f) / fps).toFixed(2)} 秒 · 这回合已标 ${doneN}/${n}`;
     const unsure = R.unc[L.i] >= L.state.doubtful ? "，模型很没把握" : R.unc[L.i] >= L.state.confident ? "，模型不太有把握" : "";
-    const what = L.pending ? "蓝色十字：点「对」保存，用方向键或拖动微调"
+    const what = isSuggested() ? (L.suggested.how === "heat"
+        ? "蓝色十字：在上一帧附近找到的（模型的弱信号）。对就点「对」，不对就点真正的球"
+        : "蓝色十字：上一帧附近新出现的亮点。对就点「对」，不对就点真正的球")
+      : L.pending ? "蓝色十字：点「对」保存，用方向键或拖动微调"
       : done(lab) ? (lab[3] === "skip" ? "已标：看不清" : lab[0] ? `已标：有球（${lab[3] === "bulk" ? "一键接受的" : "绿色十字"}）` : "已标：没有球")
       : p[0] ? `模型猜的位置是橙色圈${unsure}` : `模型没找到球${unsure}`;
     $l("lWhat").textContent = L.msg || what;
@@ -533,6 +663,7 @@ const Label = (() => {
     const box = $l("lRallies");
     box.textContent = "";
     L.state.rallies.forEach((R, r) => {
+      if (L.only !== null && r !== L.only) return;
       const b = document.createElement("button");
       const n = R.offsets.length, d = countDone(r);
       b.textContent = `回合 ${r + 1} · ${(n / (L.state.video.fps || 30)).toFixed(0)} 秒 · ${d === n ? "✓" : Math.floor(d * 100 / n) + "%"}`;
@@ -727,7 +858,7 @@ const Label = (() => {
       else if (k === "ArrowLeft") go(L.r, L.i - 1);
       else if (k === "ArrowRight") { if (L.i + 1 < rally().offsets.length) go(L.r, L.i + 1); }
       else if (k === "Backspace") clearFrame();
-      else if (k === "Escape") { L.pending = null; L.focus = focusFor(); draw(); }
+      else if (k === "Escape") { L.pending = null; L.suggested = null; L.focus = focusFor(); draw(); }
       else return;
       e.preventDefault();
     });

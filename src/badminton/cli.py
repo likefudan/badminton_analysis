@@ -214,6 +214,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
     s.add_argument("--no-wrist", action="store_true", help="只用球轨迹，不用手腕速度（对比用）")
+    s.add_argument("--classifier", default="bounce", choices=["bounce", "full", "off"],
+                   help="击球/落地分类器（权重在 ~/.cache/badminton/hit_classifier.json，没有就不用）：bounce 只压低像落地的候选"
+                        "（默认，各种画面都不变差），full 按击球概率加减分（转播画面上更准，手机录像上会漏拍），off 不用")
+    s.add_argument("--no-refine", action="store_true", help="不按球轨迹折点微调击球帧")
     s.add_argument("--labels", help="人工标注的击球 CSV（Frame, Player, Note），给了就报告准确率、召回率和 F1")
     s.add_argument("--manual", help="人工核对过的击球 CSV：不做识别，直接写成来源为「人工」的击球文件")
 
@@ -227,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--singles", action="store_true", help="单打：每边 1 人（默认从数据里判断）")
     s.add_argument("--weights", nargs="+", help="BST 不合并类别的权重 bst_CG_AP_JnB_bone*.pt，"
                    "默认 ~/codebase/third_party/BST_weights/weight/bst_CG_AP_JnB_bone.pt")
+    s.add_argument("--doubles-model", default="off", help="双打类型模型（DShuttleNet 训练，scripts/train_stroke_classifier.py）："
+                   "off（默认，只用 BST）、auto（缓存目录里有就用）或权重路径；单打不用它。"
+                   "转播双打上比 BST 准，手机录像上还没看出更好，见 docs/stroke_types.md")
     s.add_argument("--no-video", action="store_true", help="不输出带类型标签的视频")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
@@ -918,8 +925,10 @@ def cmd_hits(a) -> int:
     names = json.loads(names_path.read_text()) if names_path.exists() else {}
     per_side = 1 if a.singles else _players_per_side(data_path)
     hits, ctx = H.run(shuttle_path, data_path, CourtCalibration.load(a.court), per_side,
-                      H.Options(use_wrist=not a.no_wrist), names)
+                      H.Options(use_wrist=not a.no_wrist, classifier=a.classifier, refine=not a.no_refine), names)
     fps = ctx["fps"]
+    if a.classifier != "off" and ctx["model"] is None:
+        print(f"没有击球分类器权重（{H.HIT_MODEL_FILE}），按不用分类器识别；训练方法见 scripts/train_hit_classifier.py")
     if ctx["stride"] > 1:
         print(f"注意：骨架数据是每 {ctx['stride']} 帧一次，手腕速度不准；建议用 badminton skeleton --stride 1 重跑")
     if a.labels:
@@ -935,7 +944,9 @@ def cmd_hits(a) -> int:
         side_of = {p.id: ("near", "far")[p.side] for p in ctx["players"]}
         hits = H.manual_hits(H.load_labels(a.manual), side_of)
     doc = H.hits_json(hits, fps, str(video), {"shuttle": str(shuttle_path), "skeleton": str(data_path),
-                                              "manual": a.manual or None}, names)
+                                              "manual": a.manual or None,
+                                              "classifier": a.classifier if ctx["model"] is not None else "off",
+                                              "refine": not a.no_refine}, names)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{video.stem}.hits.json"
     H.save(out, doc)
@@ -971,7 +982,16 @@ def cmd_strokes(a) -> int:
     names_path = Path(a.players) if a.players else video.with_suffix(".players.json")
     names = json.loads(names_path.read_text()) if names_path.exists() else {}
     per_side = 1 if a.singles else _players_per_side(data_path)
-    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side)
+    doubles = None
+    if per_side == 2 and a.doubles_model != "off":
+        from .stroke_model import STROKE_MODEL_FILE, StrokeClassifier
+
+        doubles = StrokeClassifier.load(None if a.doubles_model == "auto" else a.doubles_model)
+        if doubles is None and a.doubles_model != "auto":
+            raise SystemExit(f"读不了双打类型模型 {a.doubles_model}")
+        print("双打：类型用 DShuttleNet 训练的模型，BST 只在大类里细分" if doubles else
+              f"没有双打类型模型（{STROKE_MODEL_FILE}），只用 BST；训练方法见 scripts/train_stroke_classifier.py")
+    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side, doubles)
     doc = ST.strokes_json(results, ctx["fps"], str(video),
                           {"skeleton": str(data_path), "shuttle": str(shuttle_path), "hits": a.hits},
                           names, [str(w) for w in weights])

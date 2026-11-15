@@ -45,7 +45,8 @@ CROP_QUALITY = 90
 RALLIES = 3           # how many rallies to offer
 MAX_RALLY_S = 20.0    # longer rallies only when there are not enough short ones (a phone labels ~1 frame/s)
 MAX_FRAMES = 3600     # all chosen rallies together
-PREDICT_VERSION = "2"  # raise when the path selection changes, so cached predictions are redone
+PREDICT_VERSION = "3"  # raise when the path selection (or what is cached) changes, so cached predictions are redone
+WEAK_PER_FRAME = 6     # faint heatmap peaks per frame in state.json (label.js looks there near the last label)
 
 
 def model_stamp(tracknet_dir=None) -> str:
@@ -69,8 +70,9 @@ def model_stamp(tracknet_dir=None) -> str:
 
 def load_or_predict(video: Path, court: Path | None, fresh: bool = False, tracknet_dir=None, progress=None,
                     predict=an.predict):
-    """(path, raw, candidates, stamp, predicted_at): the cached prediction of `badminton annotate`
-    (<video>.annotate.npz) unless asked for a fresh one or the model changed since."""
+    """(path, raw, candidates, stamp, predicted_at, weak): the cached prediction of `badminton annotate`
+    (<video>.annotate.npz) unless asked for a fresh one or the model changed since. `weak` = the
+    faint heatmap peaks per frame (None if the predictor gives none)."""
     cache = video.with_suffix(".annotate.npz")
     stamp_file = video.with_suffix(".annotate.model.json")
     stamp = model_stamp(tracknet_dir)
@@ -78,13 +80,15 @@ def load_or_predict(video: Path, court: Path | None, fresh: bool = False, trackn
     if cache.exists() and not fresh and saved.get("model") == stamp:
         path, raw, cands = an.load_predictions(cache)
         print(f"沿用缓存的预测 {cache.name}")
-        return path, raw, cands, saved.get("model", stamp), saved.get("predicted_at", "")
+        return path, raw, cands, saved.get("model", stamp), saved.get("predicted_at", ""), an.load_weak(cache)
     print("用 TrackNetV3 逐帧找球（结果缓存下来，下次直接用）")
-    path, raw, cands = predict(video, court, tracknet_dir, progress)
-    an.save_predictions(cache, path, raw, cands)
+    weak: list = []
+    path, raw, cands = predict(video, court, tracknet_dir, progress, weak=weak)
+    weak = weak if len(weak) == len(path) else None
+    an.save_predictions(cache, path, raw, cands, weak)
     when = an._now()
     stamp_file.write_text(json.dumps({"model": stamp, "predicted_at": when}))
-    return path, raw, cands, stamp, when
+    return path, raw, cands, stamp, when, weak
 
 
 def choose_rallies(rallies: list, uncertainty: np.ndarray, fps: float, count: int = RALLIES,
@@ -168,7 +172,7 @@ def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None
     info = probe(video)
     fps = info.fps or 30.0
     size = (info.width, info.height)
-    path, raw, cands, stamp, predicted_at = load_or_predict(video, Path(court) if court else None, fresh,
+    path, raw, cands, stamp, predicted_at, weak = load_or_predict(video, Path(court) if court else None, fresh,
                                                             tracknet_dir, progress, predict)
     n = len(path)
     if movement and Path(movement).exists():
@@ -177,12 +181,19 @@ def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None
         rallies = an.rallies_from_predictions(path, fps) or [(0, n - 1)]
         print(f"没有回合列表，按球出现的时段切成 {len(rallies)} 段")
     raw_weight = None
-    moving = None
+    moving = grid = None
     if cands is not None:
         moving, grid = an.moving_candidates(cands, size)
         if raw is not None:
             raw_weight = np.where(an.on_static(grid, raw[:, 1:3], size) & (raw[:, 0] > 0), an.RAW_ON_STATIC, 1.0)
     unc = an.frame_uncertainty(path, raw, moving, size[1], raw_weight)
+
+    def faint(f: int) -> list:
+        """The faint heatmap peaks of frame f off the static spots, for label.js's local search."""
+        c = np.asarray(weak[f])[:WEAK_PER_FRAME * 2] if weak is not None and f < len(weak) else np.zeros((0, 3))
+        if len(c) and grid is not None:
+            c = c[~an.on_static(grid, c[:, :2], size)]
+        return [[round(float(x)), round(float(y)), round(float(p), 2)] for x, y, p in c[:WEAK_PER_FRAME]]
 
     # the same frames as last time, so earlier labels and before/after comparisons still line up
     previous = out_dir / "state.json"
@@ -217,6 +228,7 @@ def pack(video: str | Path, out_dir: str | Path, court: str | Path | None = None
             "raw": [[int(raw[f, 0] > 0), r1(raw[f, 1]), r1(raw[f, 2])] for f in frames] if raw is not None else None,
             "cand": [[[r1(x), r1(y), round(float(p), 2)] for x, y, p in np.asarray(moving[f])[:, :3]] for f in frames]
             if moving is not None else None,
+            "weak": [faint(f) for f in frames] if weak is not None else None,
             "unc": [round(float(unc[f]), 3) for f in frames],
         })
         print(f"回合 {k + 1}：第 {a}–{b} 帧，{len(offsets)} 张图，{(out_dir / name).stat().st_size / 1e6:.1f} MB")

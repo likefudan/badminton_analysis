@@ -84,6 +84,12 @@ test("首页和脚本能打开", async () => {
   assert.equal(page.status, 200);
   assert.match(await page.text(), /选择录像/);
   assert.equal((await fetch(`http://127.0.0.1:${PORT}/app.js`)).status, 200);
+  // 条款、隐私和 logo 不用登录就能看
+  for (const [path, text] of [["/terms", /Terms of Service/], ["/privacy", /Privacy Policy/], ["/terms.html", /Terms of Service/], ["/logo.svg", /<svg/]]) {
+    const res = await fetch(`http://127.0.0.1:${PORT}${path}`);
+    assert.equal(res.status, 200, path);
+    assert.match(await res.text(), text);
+  }
 });
 
 test("分片上传、断点续传、合并、下载、删除", async () => {
@@ -474,7 +480,10 @@ test("击球类型：请求、节点准备、读小视频、存标注、下载 C
   });
   const csv = await call(`/videos/${v.id}/stroke-labels?format=csv`);
   assert.match(csv.headers.get("content-disposition"), /game_1\.strokes\.labels\.csv/);
-  assert.equal((await csv.text()).replace(/^﻿/, ""), 'frame,player_id,type,tags,note\r\n10,,发短球,,\r\n60,3,吊球,劈吊;对角,"很快, ""假动作"""\r\n98,,不是击球,,\r\n');
+  // 后两列是标注人（这里还没有管理员账号，是空的）和时间
+  const stamp = "\\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z";
+  assert.match((await csv.text()).replace(/^﻿/, ""), new RegExp(
+    `^frame,player_id,type,tags,note,annotator,updated_at\\r\\n10,,发短球,,,,${stamp}\\r\\n60,3,吊球,劈吊;对角,"很快, ""假动作""",,${stamp}\\r\\n98,,不是击球,,,,${stamp}\\r\\n$`));
   st = await (await call(`/videos/${v.id}`)).json();
   assert.equal(st.strokes.labels, 3);
 
@@ -487,4 +496,57 @@ test("击球类型：请求、节点准备、读小视频、存标注、下载 C
   assert.equal((await call(`/videos/${v.id}/strokes`, { method: "DELETE" })).status, 200);
   assert.equal((await call(`/videos/${v.id}/strokes/files/strokes.mp4`)).status, 404);
   assert.equal((await call(`/videos/${v.id}`, { method: "DELETE" })).status, 200);
+});
+
+test("Mac 状态：节点上报，网页读到状态、排队和失败的作业", async () => {
+  const json = { "content-type": "application/json" };
+  const post = (path, body, headers = auth) => fetch(BASE + path, { method: "POST", headers: { ...headers, ...json }, body: JSON.stringify(body ?? {}) });
+  const status = { name: "mac", job: { task: "process", name: "a.mp4" }, tasks: [{ id: "1-2", command: "scripts/train.py", running: true, log: ["Epoch [2 / 10]"] }], log: ["12:00:00 开始处理"] };
+
+  // 节点用自己的钥匙上报；没有钥匙不行，内容不对不行
+  assert.equal((await fetch(BASE + "/node/status", { method: "POST", headers: json, body: "{}" })).status, 401);
+  assert.equal((await post("/node/status", { node: "status-mac" })).status, 400);
+  assert.equal((await post("/node/status", { node: "status-mac", status: { log: ["x".repeat(250_000)] } })).status, 413);
+  assert.equal((await post("/node/status", { node: "status-mac", status }, { authorization: "Bearer node-key" })).status, 200);
+
+  let s = await (await call("/status")).json();
+  const node = s.nodes[0]; // 最近联系的排在最前
+  assert.equal(node.name, "status-mac");
+  assert.deepEqual(node.status, status);
+  assert.ok(Math.abs(new Date(s.now) - new Date(node.statusAt)) < 5000);
+  assert.equal(node.seenAt, node.statusAt); // 上报也算一次联系：首页的“在线”跟着走
+
+  // 再报一次是覆盖，不是多一行；只问过任务、没上报过状态的旧节点 status 是 null
+  assert.equal((await post("/node/status", { node: "status-mac", status: { ...status, job: null } })).status, 200);
+  await post("/node/claim", { node: "old-mac", tasks: [] });
+  s = await (await call("/status")).json();
+  assert.equal(s.nodes.filter((n) => n.name === "status-mac").length, 1);
+  assert.equal(s.nodes.find((n) => n.name === "status-mac").status.job, null);
+  assert.equal(s.nodes.find((n) => n.name === "old-mac").status, null);
+
+  // 云端知道的作业：新传的在排队，领了是正在做，失败的带原因
+  const data = randomBytes(1000);
+  const v = await (await post("/videos", { filename: "status.mp4", size: data.length, contentType: "video/mp4" })).json();
+  await call(`/videos/${v.id}/parts/1`, { method: "PUT", body: data });
+  await post(`/videos/${v.id}/complete`);
+  s = await (await call("/status")).json();
+  assert.deepEqual(s.queued.filter((j) => j.videoId === v.id).map((j) => [j.kind, j.name]), [["process", "status.mp4"]]);
+  let claimed;
+  do claimed = (await (await post("/node/claim", { node: "status-mac" })).json()).video; // 前面的测试可能留下排队的
+  while (claimed && claimed.id !== v.id);
+  assert.ok(claimed);
+  s = await (await call("/status")).json();
+  const active = s.active.find((j) => j.videoId === v.id);
+  assert.equal(active.kind, "process");
+  assert.equal(active.node, "status-mac");
+  assert.equal(active.stale, false);
+  await post(`/videos/${v.id}/job`, { status: "failed", stage: "骨架识别", error: "模型文件找不到" });
+  s = await (await call("/status")).json();
+  assert.equal(s.active.find((j) => j.videoId === v.id), undefined);
+  const failed = s.failed.find((j) => j.videoId === v.id);
+  assert.equal(failed.error, "模型文件找不到");
+  assert.equal(failed.stage, "骨架识别");
+
+  // 状态页的脚本能打开
+  assert.equal((await fetch(`http://127.0.0.1:${PORT}/status.js`)).status, 200);
 });

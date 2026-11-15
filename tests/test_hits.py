@@ -109,6 +109,20 @@ def test_serve_is_found_where_the_track_starts_in_the_hand():
     assert hits[0]["by"].startswith("track-start")
 
 
+def test_short_serve_start_is_not_hidden_by_the_kink_at_its_top():
+    # a short serve: the track starts in the server's hand, rises slowly and bends at the top
+    # of the serve 6 frames later. That bend used to block the start candidate, and the serve
+    # was then found 6 frames late (DShuttleNet, docs/hits.md).
+    xy = rally()
+    a = HIT_FRAMES[0]
+    xy[:a] = np.nan
+    xy[a:a + 7] = NEAR[None] + np.linspace(0, 1, 7)[:, None] * np.array([0.0, -0.4 * BH[0]])
+    xy[a + 7:a + 10] = xy[a + 6] + np.arange(1, 4)[:, None] * np.array([30.0, -20.0])
+    hits = H.detect_hits(track(xy), players(), FPS, FRAME_H)
+    assert abs(hits[0]["frame"] - a) <= 1 and hits[0]["player_id"] == 1
+    assert hits[0]["by"].startswith("track-start")
+
+
 def test_drop_static_removes_a_phantom_point():
     xy = rally()
     xy[200:260] = (915.0, 270.0)  # TrackNetV3's "nothing found" position, frame after frame
@@ -194,3 +208,74 @@ def test_provenance_helpers():
         P.tagged(3, "guess")
     s = P.share([P.MEASURED, P.MEASURED, P.INTERPOLATED, ""])
     assert s[P.MEASURED] == pytest.approx(2 / 3, abs=1e-3) and s[P.MANUAL] == 0
+
+
+# --- time refinement and the hit / bounce classifier -----------------------------------------
+
+
+def test_refine_moves_a_hit_to_the_bend_of_the_track():
+    xy = rally()
+    hits = [{"frame": f + (2 if k == 2 else 0)} for k, f in enumerate(HIT_FRAMES)]  # third hit 2 frames late
+    out = H.refine_frames(hits, track(xy), FPS)
+    assert abs(out[2]["frame"] - HIT_FRAMES[2]) <= 1
+    assert out[2]["moved"] < 0
+    assert hits[2]["frame"] == HIT_FRAMES[2] + 2  # input left alone
+
+
+def test_refine_leaves_a_hit_without_a_clear_bend():
+    xy = np.full((N, 2), np.nan)
+    xy[:, 0] = np.arange(N) * 5.0  # one straight flight
+    xy[:, 1] = 500.0
+    out = H.refine_frames([{"frame": 100}], track(xy), FPS)
+    assert out[0]["frame"] == 100 and "moved" not in out[0]
+
+
+def _stump(feature, thr, left, right, classes=("hit", "bounce", "none")):
+    """A model of one round: per class a tree that splits once on `feature`."""
+    k = H.FEATURES.index(feature)
+    trees = [{"feature": [k, 0, 0], "threshold": [thr, 0, 0], "left": [1, 0, 0], "right": [2, 0, 0],
+              "value": [0.0, left[j], right[j]], "missing_left": [1, 0, 0], "leaf": [0, 1, 1]}
+             for j in range(len(classes))]
+    return {"features": list(H.FEATURES), "classes": list(classes), "baseline": [0.0] * len(classes),
+            "trees": [trees]}
+
+
+def test_classifier_trees_are_evaluated_with_numpy():
+    m = H.HitClassifier(_stump("kink", 1.0, left=(0.0, 2.0, 0.0), right=(3.0, 0.0, 0.0)))
+    X = np.full((3, len(H.FEATURES)), np.nan)
+    X[:, 0] = [0.5, 2.0, np.nan]  # kink; NaN goes left
+    p = m.proba(X)
+    assert np.allclose(p.sum(1), 1)
+    assert p[0].argmax() == 1 and p[1].argmax() == 0 and p[2].argmax() == 1
+
+
+def test_classifier_missing_or_foreign_file_is_none(tmp_path):
+    assert H.HitClassifier.load(tmp_path / "none.json") is None
+    bad = _stump("kink", 1.0, (0, 0, 0), (0, 0, 0))
+    bad["features"] = ["something_else"]
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    assert H.HitClassifier.load(tmp_path / "bad.json") is None
+
+
+def test_candidate_features_have_one_row_per_candidate():
+    sh, pl = track(rally()), players()
+    cands = H.candidates(sh, pl, FPS, FRAME_H, H.Options())
+    X = H.candidate_features(cands, sh, pl, FPS, FRAME_H, 1920.0)
+    assert X.shape == (len(cands), len(H.FEATURES))
+    k = H.FEATURES.index("dist1")
+    assert np.isfinite(X[:, k]).all()
+
+
+def test_bounce_mode_only_takes_evidence_away():
+    sh, pl = track(rally()), players()
+    # a model that calls everything a bounce: in bounce mode it lowers every candidate,
+    # in full mode it also says "not a hit"; with the default weight both drop the weak ones
+    always_bounce = H.HitClassifier(_stump("kink", 1e9, left=(0.0, 5.0, 0.0), right=(0.0, 5.0, 0.0)))
+    base = frames(H.detect_hits(sh, pl, FPS, FRAME_H))
+    off = frames(H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(model=always_bounce, classifier="off")))
+    assert off == base
+    low = frames(H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(model=always_bounce, w_model=0.1)))
+    assert low == base  # a little evidence taken away does not lose the clear hits
+    always_hit = H.HitClassifier(_stump("kink", 1e9, left=(5.0, 0.0, 0.0), right=(5.0, 0.0, 0.0)))
+    same = frames(H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(model=always_hit)))
+    assert same == base  # bounce mode ignores P(hit)

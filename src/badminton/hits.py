@@ -23,6 +23,17 @@ fast wrist near the shuttle as well, but the same side cannot hit twice in a
 row. A kink with nobody within reach is the shuttle landing or a tracking
 error. The hitter is the player the chosen evidence belongs to.
 
+Two optional steps follow (docs/hits.md, BFMD 上的改进):
+
+  * a hit / bounce / neither classifier on each candidate (gradient-boosted
+    trees trained on BFMD by scripts/train_hit_classifier.py, weights in the
+    cache folder, evaluated with numpy). By default it only takes evidence away
+    from candidates that look like the shuttle landing ("bounce" mode); "full"
+    mode also uses its P(hit), which is much better on broadcast doubles but
+    loses hits on phone recordings. Without the weights nothing changes.
+  * refine_frames: each chosen hit moves (up to 2 frames at 30 fps) to where a
+    once-bent line fits the shuttle track best.
+
 Speeds and distances are in body heights of the player nearest to the shuttle
 (not pixels, not frames): the same stroke moves the shuttle fewer pixels on
 the far side of the court, and one set of thresholds then serves both sides,
@@ -42,7 +53,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -68,10 +79,12 @@ WEAK = 0.4  # kinks from this fraction of the threshold up become candidates
 KINK_CAP = 3.0
 EDGE_BH = 0.7  # body heights: a track starting / ending this close to a wrist is a candidate
 EDGE_KINK = {"start": 1.5, "end": 1.0}  # what such an edge counts for, on the kink scale
+EDGE_AFTER_S = 0.1  # a kink this soon after a track starts is the start itself (3 frames at 30 fps)
 WRIST_THR = 2.5  # body heights / s: wrist speed peak that is a swing
 REACH_BH = 1.3  # body heights: shuttle further than this from every wrist was not hit
 WRIST_SYNC_S = 0.1  # wrist peak and kink belong together within this
 W_KINK, W_WRIST, W_DIST, BIAS = 1.0, 0.5, 1.0, 0.8  # evidence weights, see evidence()
+W_MODEL = 2.0  # weight of the hit classifier's opinion, see evidence()
 KPT_THR = 0.3
 _WRISTS = (9, 10)
 
@@ -117,6 +130,7 @@ class PlayerSignals:
     body_h: np.ndarray  # (N,) body height in pixels (smoothed), NaN when unknown
     measured: np.ndarray  # (N,) pose model ran on this frame and saw a wrist
     name: str = ""
+    feet: np.ndarray | None = None  # (N, 2) bottom centre of the box, video pixels, NaN when not seen
 
 
 def player_signals(data: dict, tracking, n_frames: int) -> list[PlayerSignals]:
@@ -130,6 +144,7 @@ def player_signals(data: dict, tracking, n_frames: int) -> list[PlayerSignals]:
     for tr in tracking.tracks:
         w = np.full((n_frames, 2, 2), np.nan)
         bh = np.full(n_frames, np.nan)
+        feet = np.full((n_frames, 2), np.nan)
         for i in np.flatnonzero(tr.det_index >= 0):
             f, p = frames[i], tr.det_index[i]
             if f >= n_frames:
@@ -139,11 +154,13 @@ def player_signals(data: dict, tracking, n_frames: int) -> list[PlayerSignals]:
                     w[f, j] = data["keypoints"][i, p, k]
             b = data["bbox"][i, p]
             bh[f] = b[3] - b[1]
+            feet[f] = ((b[0] + b[2]) / 2, b[3])
         measured = np.isfinite(w[:, :, 0]).any(1)
         stride = int(np.median(np.diff(frames))) if len(frames) > 1 else 1
         for j in range(2):
             w[:, j] = _interp_gaps(w[:, j], max_gap=max(2, 2 * stride))
-        out.append(PlayerSignals(tr.id, tr.side, w, _upright_height(bh), measured, getattr(tr, "name", "")))
+        out.append(PlayerSignals(tr.id, tr.side, w, _upright_height(bh), measured, getattr(tr, "name", ""),
+                                 _interp_gaps(feet, max_gap=max(2, 2 * stride))))
     return out
 
 
@@ -307,6 +324,10 @@ class Options:
     w_dist: float = W_DIST
     bias: float = BIAS
     same_side_cost: float = SAME_SIDE_COST
+    classifier: str = "bounce"  # how the hit / bounce / neither classifier is used: bounce, full, off
+    model: "HitClassifier | None" = None  # its weights (run() loads them from the cache when None)
+    w_model: float = W_MODEL  # see evidence()
+    refine: bool = True  # move each chosen hit to where the track bends (refine_frames)
 
 
 def candidates(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, frame_h: float,
@@ -338,6 +359,7 @@ def candidates(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, 
         seen = shuttle.seen
         scale = local_scale(players, xy, frame_h)
         lost = int(round(GAP_MAX_S * fps))
+        after = max(1, int(round(EDGE_AFTER_S * fps)))
         idx = np.flatnonzero(seen)
         for run in np.split(idx, np.flatnonzero(np.diff(idx) > lost) + 1) if len(idx) else []:
             a, b = int(run[0]), int(run[-1])
@@ -346,7 +368,14 @@ def candidates(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, 
             for i, j, kind in ((a, min(a + 3, b), "start"), (b, max(b - 3, a), "end")):
                 speed = float(np.hypot(*(xy[j] - xy[i]))) * fps / abs(j - i) / scale[i]
                 near = min(float(d[min(i, j):max(i, j) + 1].min()) for d in dists)
-                if speed >= MIN_SPEED and near <= EDGE_BH and not any(abs(i - f) < gap for f in frames):
+                # a serve has a kink a few frames later (the top of a short serve, the
+                # track finding its pace): only candidates before the start or right at it
+                # stand in the way of a start, the flight's own kinks do not.
+                if kind == "start":
+                    blocked = any(i - gap < f <= i + after for f in frames)
+                else:
+                    blocked = any(abs(i - f) < gap for f in frames)
+                if speed >= MIN_SPEED and near <= EDGE_BH and not blocked:
                     frames[i] = kind
                     edge[i] = EDGE_KINK[kind]
     if opts.use_wrist:
@@ -375,6 +404,10 @@ def evidence(c: dict, k: int | None, opts: Options) -> float:
     than a clear one), how fast that player's wrist moved and how far the shuttle
     was from that wrist; minus a bias."""
     s = opts.w_kink * min(c["kink"], KINK_CAP) - opts.bias
+    if opts.classifier == "full" and c.get("p_hit") is not None:
+        s += opts.w_model * (2 * c["p_hit"] - 1)
+    elif opts.classifier == "bounce" and c.get("p_bounce") is not None:
+        s -= opts.w_model * c["p_bounce"]
     if k is None:
         return s
     d = c["dist_bh"][k]
@@ -385,8 +418,139 @@ def evidence(c: dict, k: int | None, opts: Options) -> float:
     return s - opts.w_dist * d
 
 
+# --- hit / bounce / neither classifier (optional, weights outside the repo) ------------------
+
+FEATURES = (
+    ["kink", "in_gap", "origin_track", "origin_start", "origin_end", "origin_wrist"]
+    + [f"{k}_{d}" for d in (2, 4, 8) for k in ("speed_in", "speed_out", "cos", "vy_in", "vy_out")]
+    + ["seen_before", "seen_after", "seen_around", "run_before_s", "run_after_s"]
+    + ["dist1", "dist2", "wrist_nearest", "wrist_reach_max", "n_reach", "n_close", "nearest_far",
+       "height_bh", "body_h_frac", "x_frac", "y_frac", "prev_cand_s", "next_cand_s"]
+)
+
+
+def candidate_features(cands: list[dict], shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
+                       frame_h: float, frame_w: float) -> np.ndarray:
+    """(len(cands), len(FEATURES)) numbers the hit classifier sees; NaN where unknown.
+
+    Everything is our own output (shuttle track, wrists, boxes), in body heights and
+    seconds like the rest of this module: the shuttle's velocity before and after over
+    2, 4 and 8 frames at 30 fps, how much of the track is seen around, how close and
+    how fast the wrists are, how many players are within reach, and how high the
+    shuttle is above the feet of the nearest player (a bounce is at the feet)."""
+    n = len(shuttle.xy)
+    xy = _interp_gaps(shuttle.xy, int(round(INTERP_S * fps)))
+    seen = shuttle.seen
+    scale = local_scale(players, _interp_gaps(shuttle.xy, int(round(GAP_MAX_S * fps))), frame_h)
+    k30 = fps / 30.0
+    frames = [c["frame"] for c in cands]
+    X = np.full((len(cands), len(FEATURES)), np.nan)
+    # length of the seen run of the raw track ending / starting at each frame
+    run_b = np.zeros(n)
+    run_a = np.zeros(n)
+    for i in range(n):
+        run_b[i] = run_b[i - 1] + 1 if seen[i] and i else float(seen[i])
+    for i in range(n - 1, -1, -1):
+        run_a[i] = run_a[i + 1] + 1 if seen[i] and i + 1 < n else float(seen[i])
+    for r, c in enumerate(cands):
+        i = c["frame"]
+        f = [min(c["kink"], 5.0), float(c["in_gap"])] + [float(c["origin"] == o) for o in ("track", "start", "end", "wrist")]
+        for d30 in (2, 4, 8):
+            d = max(1, int(round(d30 * k30)))
+            vals = [np.nan] * 5
+            if d <= i < n - d and np.isfinite(xy[[i - d, i, i + d], 0]).all():
+                k = fps / d / scale[i]
+                vi, vo = (xy[i] - xy[i - d]) * k, (xy[i + d] - xy[i]) * k
+                si, so = float(np.hypot(*vi)), float(np.hypot(*vo))
+                vals = [si, so, float(vi @ vo) / (si * so) if si * so > 0 else np.nan, float(vi[1]), float(vo[1])]
+            f += vals
+        w8, w20 = int(round(8 * k30)), int(round(20 * k30))
+        f += [seen[max(0, i - w8):i].mean() if i else 0.0, seen[i + 1:i + 1 + w8].mean() if i + 1 < n else 0.0,
+              seen[max(0, i - w20):i + w20 + 1].mean(),
+              min(run_b[max(0, i - 1)], 2 * fps) / fps, min(run_a[min(n - 1, i + 1)], 2 * fps) / fps]
+        dist = np.array(c["dist_bh"], float) if players else np.array([])
+        wr = np.array(c["wrist"], float) if players else np.array([])
+        if len(dist) and np.isfinite(dist).any():
+            o = np.argsort(dist)
+            k = int(o[0])
+            p = players[k]
+            reach = dist <= REACH_BH
+            height = np.nan
+            pos = xy[i] if np.isfinite(xy[i, 0]) else None
+            if pos is not None and p.feet is not None and np.isfinite(p.feet[i, 1]) and p.body_h[i] > 0:
+                height = (p.feet[i, 1] - pos[1]) / p.body_h[i]
+            f += [min(dist[o[0]], 5.0), min(dist[o[1]], 5.0) if len(o) > 1 else 5.0, wr[k],
+                  wr[reach].max() if reach.any() else 0.0, float(reach.sum()), float((dist <= 0.6).sum()),
+                  float(p.side), height, p.body_h[i] / frame_h]
+        else:
+            f += [np.nan] * 9
+        f += [xy[i, 0] / frame_w, xy[i, 1] / frame_h] if np.isfinite(xy[i, 0]) else [np.nan, np.nan]
+        f += [min((i - frames[r - 1]) / fps, 3.0) if r else 3.0, min((frames[r + 1] - i) / fps, 3.0) if r + 1 < len(frames) else 3.0]
+        X[r] = f
+    return X
+
+
+HIT_MODEL_FILE = "hit_classifier.json"
+CLASSES = ("hit", "bounce", "none")
+
+
+class HitClassifier:
+    """Gradient-boosted trees trained by scripts/train_hit_classifier.py on BFMD,
+    evaluated here with numpy only (no scikit-learn needed at run time).
+
+    The file holds, per boosting round, one tree per class as flat arrays
+    (feature, threshold, left, right, value, missing_left, leaf) plus a baseline."""
+
+    def __init__(self, doc: dict):
+        if not set(doc.get("features", [None])) <= set(FEATURES):
+            raise ValueError("hit classifier was trained on other features")
+        self.doc = doc
+        self.columns = np.array([FEATURES.index(f) for f in doc["features"]], int)
+        self.baseline = np.asarray(doc["baseline"], float)
+        self.trees = [[{k: np.asarray(v) for k, v in t.items()} for t in rnd] for rnd in doc["trees"]]
+        self.classes = tuple(doc["classes"])
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> "HitClassifier | None":
+        """The model in `path` (default: the badminton cache folder), None if there is none."""
+        if path is None:
+            from .coreml_native import CACHE_DIR
+
+            path = CACHE_DIR / HIT_MODEL_FILE
+        try:
+            return cls(json.loads(Path(path).read_text()))
+        except (OSError, ValueError, KeyError):
+            return None
+
+    @staticmethod
+    def _tree(t: dict, X: np.ndarray) -> np.ndarray:
+        node = np.zeros(len(X), int)
+        for _ in range(64):
+            leaf = t["leaf"][node].astype(bool)
+            if leaf.all():
+                break
+            x = X[np.arange(len(X)), t["feature"][node]]
+            go_left = np.where(np.isnan(x), t["missing_left"][node].astype(bool), x <= t["threshold"][node])
+            node = np.where(leaf, node, np.where(go_left, t["left"][node], t["right"][node]))
+        return t["value"][node]
+
+    def proba(self, X: np.ndarray) -> np.ndarray:
+        """(n, classes) probabilities; X has all FEATURES (candidate_features)."""
+        X = X[:, self.columns]
+        raw = np.tile(self.baseline, (len(X), 1))
+        for rnd in self.trees:
+            for j, t in enumerate(rnd):
+                raw[:, j] += self._tree(t, X)
+        if raw.shape[1] == 1:  # binary: one logit for the positive class
+            p = 1 / (1 + np.exp(-raw[:, 0]))
+            return np.stack([p, 1 - p], 1)
+        e = np.exp(raw - raw.max(1, keepdims=True))
+        return e / e.sum(1, keepdims=True)
+
+
+
 def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, frame_h: float,
-                opts: Options | None = None) -> list[dict]:
+                opts: Options | None = None, frame_w: float | None = None, cands: list[dict] | None = None) -> list[dict]:
     """Hits as dicts (frame, evidence, hitter); see hits_json for the saved form.
 
     Picks the set of candidates with the largest total evidence such that two hits
@@ -398,7 +562,14 @@ def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
     follow-through of a stroke, the preparation for the next) and settles who hit
     when both players are close to the shuttle at the net."""
     opts = opts or Options()
-    cands = candidates(shuttle, players, fps, frame_h, opts)
+    if cands is None:
+        cands = candidates(shuttle, players, fps, frame_h, opts)
+        if opts.model is not None and opts.classifier != "off" and cands:
+            X = candidate_features(cands, shuttle, players, fps, frame_h, frame_w or frame_h * 16 / 9)
+            p = opts.model.proba(X)
+            for c, row in zip(cands, p):
+                for k, name in enumerate(opts.model.classes):
+                    c["p_" + name] = float(row[k])
     gap = max(1, int(round(MIN_GAP_S * fps)))
     rally_gap = RALLY_GAP_S * fps
     same_side = SAME_SIDE_MIN_S * fps
@@ -442,7 +613,7 @@ def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
         j, s = node
         e, k = ev[j][s]
         c = cands[j]
-        h = {"frame": c["frame"], "kink": c["kink"], "in_gap": c["in_gap"],
+        h = {"frame": c["frame"], "kink": c["kink"], "in_gap": c["in_gap"], "p_hit": c.get("p_hit"), "p_bounce": c.get("p_bounce"),
              "evidence": float(e), "shuttle_xy": c["shuttle_xy"], "shuttle_source": c["shuttle_source"],
              "wrist": 0.0, "dist_bh": float("nan"), "player": k}
         if k is not None:
@@ -484,6 +655,55 @@ def drop_lone_hits(hits: list[dict], fps: float, min_hits: int = MIN_RALLY_HITS)
     return out
 
 
+REFINE_S = 0.067  # a hit's frame may move this far (2 frames at 30 fps) to where the track breaks
+REFINE_FIT_S = 0.27  # flight fitted on each side of the break (8 frames at 30 fps)
+REFINE_GAIN = 4.0  # the bent line must fit this many times better than a straight one
+
+
+def refine_frames(hits: list[dict], shuttle: ShuttleTrack, fps: float, max_s: float = REFINE_S,
+                  fit_s: float = REFINE_FIT_S, gain: float = REFINE_GAIN) -> list[dict]:
+    """Move each hit to the frame where the shuttle's path bends most clearly.
+
+    Around a hit, the seen shuttle positions (no filled-in ones) are fitted with a
+    line that bends once ("hinge": two straight pieces that meet) at each frame up
+    to `max_s` away; the bend that fits best, if it fits `gain` times better than a
+    single straight line, is the new frame. The fit never reaches past half way to
+    the neighbouring hits. Selection works on kinks taken over a 0.13 s window and
+    on wrist peaks, both of which can sit a few frames off the contact; the bend
+    is the contact itself. On BFMD this moved hits 1-2 frames and turned part of
+    the "4-8 frames off" misses into matches (docs/hits.md)."""
+    xy = shuttle.xy
+    seen = shuttle.seen
+    n = len(xy)
+    r = max(1, int(round(max_s * fps)))
+    half = max(3, int(round(fit_s * fps)))
+    order = sorted(range(len(hits)), key=lambda j: hits[j]["frame"])
+    frames = [hits[j]["frame"] for j in order]
+    out = [dict(h) for h in hits]
+    for pos, j in enumerate(order):
+        f = frames[pos]
+        lo = (frames[pos - 1] + f) // 2 + 1 if pos else 0
+        hi = (frames[pos + 1] + f) // 2 if pos + 1 < len(frames) else n - 1
+        best = (gain, None)
+        for b in range(max(lo, f - r), min(hi, f + r) + 1):
+            idx = np.arange(max(lo, b - half), min(hi, b + half) + 1)
+            idx = idx[seen[idx]]
+            if (idx < b).sum() < 3 or (idx > b).sum() < 3:
+                continue
+            t = (idx - b).astype(float)
+            pts = xy[idx]
+            one = np.stack([np.ones_like(t), t], 1)
+            two = np.stack([np.ones_like(t), np.minimum(t, 0), np.maximum(t, 0)], 1)
+            sse = [float(((pts - a @ np.linalg.lstsq(a, pts, rcond=None)[0]) ** 2).sum()) for a in (one, two)]
+            q = sse[0] / max(sse[1], 1.0)
+            if q > best[0]:
+                best = (q, b)
+        if best[1] is not None and best[1] != f:
+            out[j]["frame"] = int(best[1])
+            out[j]["moved"] = int(best[1]) - f
+    return out
+
+
 def hits_json(hits: list[dict], fps: float, video: str = "", inputs: dict | None = None,
               names: dict | None = None) -> dict:
     """The saved form: every value with its source (measured / interpolated / derived / manual)."""
@@ -499,6 +719,11 @@ def hits_json(hits: list[dict], fps: float, video: str = "", inputs: dict | None
         if "evidence" in h:
             e["signals"] = {"evidence": round(h["evidence"], 2), "kink": round(h["kink"], 2),
                             "kink_across_gap": h["in_gap"], "wrist_speed_bh_per_s": round(h["wrist"], 2)}
+            for k in ("p_hit", "p_bounce"):
+                if h.get(k) is not None:
+                    e["signals"][k] = round(h[k], 3)
+            if h.get("moved"):
+                e["signals"]["moved_to_track_bend_frames"] = h["moved"]
             e["shuttle_xy"] = {"value": h["shuttle_xy"], "source": h["shuttle_source"] or None}
         if h.get("player_id") is not None:
             e["player"] = {"value": h["player_id"], "name": names.get(str(h["player_id"]), ""),
@@ -599,8 +824,13 @@ def run(shuttle_csv, skeleton_npz, court=None, players_per_side: int = 1, opts: 
     players = player_signals(data, tracking, len(shuttle.xy))
     for p in players:
         p.name = (names or {}).get(str(p.id), p.name)
-    hits = drop_lone_hits(detect_hits(shuttle, players, fps, frame_h, opts), fps)
-    return hits, {"fps": fps, "frame_h": frame_h, "shuttle": shuttle, "players": players, "tracking": tracking,
+    opts = opts or Options()
+    if opts.classifier != "off" and opts.model is None:
+        opts = replace(opts, model=HitClassifier.load())
+    hits = drop_lone_hits(detect_hits(shuttle, players, fps, frame_h, opts, float(data["frame_size"][0])), fps)
+    if opts.refine:
+        hits = refine_frames(hits, shuttle, fps)
+    return hits, {"fps": fps, "model": opts.model if opts.classifier != "off" else None, "frame_h": frame_h, "shuttle": shuttle, "players": players, "tracking": tracking,
                   "stride": int(np.median(np.diff(data["frame"]))) if len(data["frame"]) > 1 else 1}
 
 

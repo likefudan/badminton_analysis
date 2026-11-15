@@ -36,7 +36,7 @@ def clip(tmp_path):
 
 
 def fake_predict(calls):
-    def predict(video, court, tracknet_dir, progress):
+    def predict(video, court, tracknet_dir, progress, weak=None):
         calls.append(video)
         path = np.zeros((N, 3))
         for f in range(N):
@@ -45,6 +45,8 @@ def fake_predict(calls):
         raw = path.copy()
         raw[50:60] = 0
         cands = [np.array([[*xy(f), 0.9], [600.0, 20.0, 0.5]]) for f in range(N)]
+        if weak is not None:  # faint peaks: the shuttle itself, a moving speck, the static blob
+            weak[:] = [np.array([[*xy(f), 0.12], [300.0 + f, 200.0, 0.07], [600.0, 20.0, 0.06]]) for f in range(N)]
         return path, raw, cands
     return predict
 
@@ -80,10 +82,14 @@ def test_pack_picks_the_unsure_rallies_and_cuts_their_frames(clip, tmp_path):
     assert hd[y - y0, x - x0].mean() > 150  # the dot, at full resolution
     # the static blob at (600, 20) is in every frame: not offered as a candidate
     assert all(len(c) == 1 for c in r["cand"])
+    # faint heatmap peaks for the page's local search, also without the static blob
+    assert len(r["weak"]) == len(r["offsets"])
+    assert r["weak"][10] == [[x, y, 0.12], [300 + f, 200, 0.07]]
 
-    # packed again: same rallies, cached predictions
+    # packed again: same rallies, cached predictions (faint peaks included)
     state2 = ap.pack(clip, out, movement=clip.with_suffix(".movement.json"), count=2, predict=fake_predict(calls), width=320)
     assert [x["start"] for x in state2["rallies"]] == starts and len(calls) == 1
+    assert state2["rallies"][0]["weak"] == r["weak"]
     ap.pack(clip, out, movement=clip.with_suffix(".movement.json"), fresh=True, predict=fake_predict(calls), width=320)
     assert len(calls) == 2
 
@@ -233,6 +239,8 @@ def test_predict_passes_what_tracknet_measured_to_the_path_selection(clip, monke
 
     def track(video, tracknet_dir=None, progress=None, debug=None, **kw):
         debug["candidates"] = [np.array([[10.0, 10.0, 0.9]]) for _ in range(N)]
+        if isinstance(debug.get("weak"), list):
+            debug["weak"] += [np.array([[100.0, 40.0, 0.1]]) for _ in range(N)]
         return [(f, 1, 10.0, 10.0) for f in range(N)], SimpleNamespace(measured=measured)
 
     got = {}
@@ -243,7 +251,23 @@ def test_predict_passes_what_tracknet_measured_to_the_path_selection(clip, monke
 
     monkeypatch.setattr(shuttle, "track_shuttle", track)
     monkeypatch.setattr(shuttle_path, "rows_from_candidates", rows_from_candidates)
-    path, raw, cands = an.predict(clip)
+    weak: list = []
+    path, raw, cands = an.predict(clip, weak=weak)
     assert len(path) == N and len(cands) == N
+    assert len(weak) == N and np.allclose(weak[0], [[100 * W / 512, 40 * H / 288, 0.1]])  # video pixels
     assert got["measured"] == (None if measured is None else list(measured))
     assert got["fps"] == FPS
+
+
+def test_weak_peaks_finds_faint_local_maxima_highest_first():
+    from badminton.shuttle import weak_peaks
+
+    hm = np.zeros((288, 512), np.float32)
+    hm[100, 200] = 0.2
+    hm[100, 201] = 0.15     # the same blob's shoulder: not a peak of its own
+    hm[50, 400] = 0.08
+    hm[10, 10] = 0.03       # below the floor
+    got = weak_peaks(hm)
+    assert got.tolist() == [[200.0, 100.0, pytest.approx(0.2)], [400.0, 50.0, pytest.approx(0.08)]]
+    assert len(weak_peaks(hm, k=1)) == 1
+    assert len(weak_peaks(np.zeros((288, 512), np.float32))) == 0

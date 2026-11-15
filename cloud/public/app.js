@@ -8,8 +8,15 @@ const STALL_MS = 30 * 1000;   // 一片这么久没有任何进展就算卡住�
 const HIDDEN_KICK_MS = 3000;  // 离开页面超过这么久，回来后把在途的请求断开重传
 const $ = (id) => document.getElementById(id);
 
-let token = "";
+let token = "";   // 用口令登录时的口令；用 Google 登录时是空的，靠 cookie
 try { token = localStorage.getItem("ba.token") || ""; } catch {}
+let me = null;    // 登录后 /me 的回答：email、name、role（admin | annotator）、status
+let authed = false;
+const isAdmin = () => Boolean(me && me.role === "admin" && me.status === "active");
+// 超级管理员：只有它有「分析」这一边（上传、看结果、设置、Mac 状态），也只有它能让 Mac 准备标注材料
+const isOwner = () => Boolean(isAdmin() && me.owner);
+// 每个请求都带 x-ba（服务器靠它确认请求是本站的网页发的）；有口令再带口令
+const authHeaders = () => (token ? { "x-ba": "1", authorization: "Bearer " + token } : { "x-ba": "1" });
 
 let file = null;
 let meta = {};
@@ -44,7 +51,7 @@ function log(msg) {
 async function api(path, options = {}) {
   const res = await fetch(API + path, {
     ...options,
-    headers: { authorization: "Bearer " + token, ...(options.headers || {}) },
+    headers: { ...authHeaders(), ...(options.headers || {}) },
   });
   let data = null;
   try { data = await res.json(); } catch {}
@@ -59,23 +66,59 @@ async function api(path, options = {}) {
 
 // ---------- 登录 ----------
 
+const LOGIN_ERRORS = {
+  not_configured: "网站还没有配置 Google 登录",
+  cancelled: "没有完成 Google 登录",
+  state: "登录超时了，再试一次",
+  google: "Google 登录失败，再试一次",
+  full: "申请加入的人太多了，请联系管理员",
+};
+
 async function tryLogin() {
-  if (!token) return showLogin("");
+  authed = false;
+  let cfg = { google: false };
+  try { cfg = await (await fetch(API + "/auth/config")).json(); } catch {}
+  $("googleBtn").hidden = !cfg.google;
+  $("pwBox").hidden = cfg.google;  // 有 Google 登录就不再显示口令登录
+  $("pwBox").open = !cfg.google;
+  $("claimBox").hidden = !cfg.claim;
+  const code = new URLSearchParams(location.search).get("login_error");
+  if (code) history.replaceState(null, "", location.pathname + location.hash);
   try {
-    await api("/me");
-    await api("/session", { method: "POST" }); // 图片和视频靠 cookie 读取
-    $("login").hidden = true;
-    $("app").hidden = false;
-    route();
-    refreshList();
-    loadAi();
+    try { me = await api("/me"); }
+    catch (e) {
+      // 存着的口令失效了，但可能已经用 Google 登录过
+      if (e.status !== 401 || !token) throw e;
+      const old = token;
+      token = "";
+      try { me = await api("/me"); } catch { token = old; throw e; }
+      try { localStorage.removeItem("ba.token"); } catch {}
+    }
+    if (token) await api("/session", { method: "POST" }); // 用口令登录时，图片和视频靠 cookie 读取
   } catch (e) {
-    showLogin(e.status === 401 ? "口令不对" : "连不上服务器：" + e.message);
+    return showLogin(e.status === 401 ? (token ? "口令不对" : LOGIN_ERRORS[code] || "") : "连不上服务器：" + e.message);
   }
+  $("login").hidden = true;
+  if (me.status !== "active") {
+    $("pending").hidden = false;
+    $("app").hidden = true;
+    $("pendingWho").textContent = me.email;
+    $("pendingMsg").textContent = me.status === "disabled" ? "这个账号已经被管理员停用。" : "这个账号还没有被邀请。管理员已经能在「成员」页看到你的申请，放行后刷新这个页面就能进。";
+    return;
+  }
+  authed = true;
+  $("pending").hidden = true;
+  $("app").hidden = false;
+  document.body.classList.toggle("annotator", !isAdmin());
+  document.body.classList.toggle("owner", isOwner());
+  Team.setUser();
+  route();
+  if (isOwner()) { refreshList(); loadAi(); }
 }
 function showLogin(msg) {
+  authed = false;
   $("login").hidden = false;
-  $("app").hidden = true;
+  $("app").hidden = $("pending").hidden = true;
   $("loginMsg").textContent = msg;
 }
 $("loginBtn").onclick = () => {
@@ -83,10 +126,21 @@ $("loginBtn").onclick = () => {
   try { localStorage.setItem("ba.token", token); } catch {}
   tryLogin();
 };
-$("logout").onclick = () => {
+async function logout() {
   token = "";
+  me = null;
   try { localStorage.removeItem("ba.token"); } catch {}
+  try { await fetch(API + "/auth/logout", { method: "POST", headers: { "x-ba": "1" } }); } catch {}
   showLogin("");
+}
+for (const id of ["logout", "pendingLogout", "navLogout"]) $(id).onclick = logout;
+// 第一个管理员：用 Google 登录后输一次口令
+$("claimBtn").onclick = async () => {
+  try {
+    await api("/auth/claim-admin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: $("claimPw").value.trim() }) });
+    $("claimPw").value = "";
+    tryLogin();
+  } catch (e) { $("claimMsg").textContent = e.message; }
 };
 
 // ---------- 读视频参数 ----------
@@ -234,7 +288,7 @@ function putPart(video, n, signal, onProgress) {
     const blob = file.slice(start, Math.min(start + video.partSize, file.size));
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", `${API}/videos/${video.id}/parts/${n}`);
-    xhr.setRequestHeader("authorization", "Bearer " + token);
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
     xhr.setRequestHeader("content-type", "application/octet-stream");
     // 卡住检测：没有新的进度就断开。字节发完后等服务器回应，多给一倍时间
     let lastMove = Date.now(), lastLoaded = -1, allSent = false;
@@ -585,7 +639,7 @@ async function refreshList() {
   renderList();
   if (openId) renderDetail();
   clearTimeout(pollTimer);
-  if (videos.some(busy) || videos.some(annotBusy) || (run && !run.finished)) pollTimer = setTimeout(refreshList, 3000);
+  if (videos.some(busy) || (run && !run.finished)) pollTimer = setTimeout(refreshList, 3000);
 }
 
 function renderNodeLine() {
@@ -597,7 +651,9 @@ function renderNodeLine() {
   for (const id of ["nodeLine", "nodeLine2"]) {
     const line = $(id);
     line.textContent = "";
-    line.append(el("span", "dot " + (node ? (nodeOnline() ? "on" : "off") : "")), text);
+    const more = el("a", "", "看它在做什么 ›");
+    more.href = "#/mac";
+    line.append(el("span", "dot " + (node ? (nodeOnline() ? "on" : "off") : "")), text + " ", more);
   }
 }
 
@@ -670,27 +726,46 @@ setInterval(() => {
 }, 1000);
 
 
-// ---------- 页面切换：#/ 首页，#/upload 上传，#/v/<id> 一段录像，#/settings 设置 ----------
+// ---------- 页面切换：#/ 首页，#/upload 上传，#/v/<id> 一段录像，#/settings 设置，#/mac Mac 状态 ----------
 
+// 分析：#/ 我的录像，#/upload 上传，#/v/<id> 一段录像。标注：#/tasks 任务，#/materials 素材，#/review 审核，
+// #/label/<id>、#/strokes/<id> 标注页。账号菜单：#/team 成员，#/settings 设置，#/mac Mac 状态。
 function route() {
-  const h = location.hash || "#/";
+  let h = location.hash || "#/";
+  // 超级管理员什么都能进；别的管理员只有标注这一边和成员；标注员只有任务和标注页
+  const labeling = /^#\/(tasks$|label\/|strokes\/)/.test(h);
+  const allowed = isOwner() || labeling || (isAdmin() && /^#\/(materials|review|team)$/.test(h));
+  if (!allowed) h = "#/tasks";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
-  const lm = h.match(/^#\/label\/([0-9a-f-]{36})$/);
-  const sm = h.match(/^#\/strokes\/([0-9a-f-]{36})$/);
-  const name = m ? "vDetail" : lm ? "vLabel" : sm ? "vStrokes" : h === "#/upload" ? "vUpload" : h === "#/settings" ? "vSettings" : "vHome";
+  const lm = h.match(/^#\/label\/([0-9a-f-]{36})(?:\/t(\d+))?$/);
+  const sm = h.match(/^#\/strokes\/([0-9a-f-]{36})(?:\/t(\d+))?$/);
+  const PAGES = { "#/upload": "vUpload", "#/settings": "vSettings", "#/mac": "vMac", "#/tasks": "vTasks", "#/materials": "vMaterials", "#/review": "vReview", "#/team": "vTeam" };
+  const name = m ? "vDetail" : lm ? "vLabel" : sm ? "vStrokes" : PAGES[h] || "vHome";
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
+  $("navAnalysis").classList.toggle("on", ["vHome", "vUpload", "vDetail"].includes(name));
+  $("navLabeling").classList.toggle("on", ["vTasks", "vMaterials", "vReview"].includes(name));
+  $("navHome").href = isOwner() ? "#/" : "#/tasks";
+  $("navMenu").open = false;
   document.body.classList.toggle("labeling", Boolean(lm || sm));
   document.querySelector("main").classList.toggle("wide", Boolean(lm || sm));
   if (m) openDetail(m[1]);
   else closeDetail();
+  // 带任务号（#/label/<录像>/t<任务>）：只标这个任务的范围，标完可以提交；不带任务号是从「素材」里整段打开
+  const taskId = lm && lm[2] ? Number(lm[2]) : sm && sm[2] ? Number(sm[2]) : null;
+  const back = taskId ? (Team.cameFrom() === "review" ? "#/review" : "#/tasks") : "#/materials";
+  Team.showBar(null);
   if (sm) {
-    $("sBack").href = "#/v/" + sm[1];
-    Strokes.open(sm[1]);
+    $("sBack").href = back;
+    if (taskId) Team.task(taskId).then((t) => { if (location.hash === h) { Strokes.open(sm[1], t); Team.showBar(t); } }).catch((e) => { $("sMsg").textContent = e.message; });
+    else Strokes.open(sm[1]);
   } else Strokes.close();
   if (lm) {
-    $("lBack").href = "#/v/" + lm[1];
-    Label.open(lm[1]);
+    $("lBack").href = back;
+    if (taskId) Team.task(taskId).then((t) => { if (location.hash === h) { Label.open(lm[1], t); Team.showBar(t); } }).catch((e) => { $("lMsg").textContent = e.message; });
+    else Label.open(lm[1]);
   }
+  Team.show(name === "vTasks" ? "tasks" : name === "vReview" ? "review" : name === "vMaterials" ? "materials" : null);
+  if (name === "vTeam") Team.openTeam();
   if (name === "vUpload" && !$("upDone").hidden) {
     // 上一段已经传完：回到空白的上传页，方便接着传下一段
     file = null;
@@ -698,10 +773,12 @@ function route() {
     $("info").hidden = $("progress").hidden = $("upDone").hidden = true;
   }
   if (name === "vSettings") loadAi();
+  if (name === "vMac") Mac.open();
+  else Mac.close();
   if (name === "vHome") refreshList();
   window.scrollTo(0, 0);
 }
-window.addEventListener("hashchange", () => { if (token && !$("app").hidden) route(); });
+window.addEventListener("hashchange", () => { if (authed && !$("app").hidden) route(); });
 
 function openDetail(id) {
   if (openId === id) return;
@@ -724,7 +801,7 @@ function closeDetail() {
   for (const pane of ["tVideos", "tCards"]) $(pane).textContent = ""; // 停掉正在放的视频
 }
 
-const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", annot: "tAnnot", process: "tProcess" };
+const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", process: "tProcess" };
 function setTab(name) {
   tab = name;
   for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
@@ -769,7 +846,6 @@ async function renderDetail() {
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   renderReview(v);
-  renderAnnot(v);
   const key = v.id + "|" + v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
   shownKey = key;
@@ -845,7 +921,7 @@ function saveRow(v, r) {
       if (busy) return;
       busy = true;
       try {
-        const res = await fetch(resultUrl(v, r.name), { credentials: "include", headers: { authorization: "Bearer " + token } });
+        const res = await fetch(resultUrl(v, r.name), { credentials: "include", headers: authHeaders() });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const total = Number(res.headers.get("content-length")) || r.size || 0;
         const reader = res.body.getReader(), parts = [];
@@ -1171,95 +1247,6 @@ $("aiSave").onclick = () => {
   saveAi({ prices }, "单价已保存");
 };
 
-// ---------- 标注球的位置（标注页本身在 label.js） ----------
-
-function renderAnnot(v) {
-  const a = v.annot || { status: "none", labels: {} };
-  const c = a.labels || {};
-  const n = (c.human || 0) + (c.bulk || 0) + (c.skip || 0);
-  const ready = v.status === "uploaded" && v.job && ["done", "failed", "archived"].includes(v.job.status);
-  const st = $("aState");
-  st.className = a.status === "failed" ? "bad" : "quiet";
-  st.textContent = {
-    none: ready ? "点「准备标注」：家里的 Mac 会挑出模型最没把握的 3 个回合，切成图片传上来，一般几分钟。" : "这段录像分析完之后才能标注。",
-    queued: nodeOnline() ? "排队中，Mac 马上开始准备" : "排队中。家里的 Mac 现在离线，上线后开始准备",
-    preparing: "Mac 正在准备：" + (a.stage || "开始"),
-    ready: "图片准备好了" + (a.stage ? "：" + a.stage : "") + "。",
-    failed: "准备失败",
-  }[a.status] || "";
-  $("aError").hidden = !(a.status === "failed" && a.error);
-  $("aError").textContent = a.status === "failed" ? a.error || "" : "";
-  const synced = a.labelsChangedAt && a.labelsSyncedAt && a.labelsSyncedAt >= a.labelsChangedAt;
-  $("aCounts").textContent = n
-    ? `已标 ${n} 帧：亲手确认 ${c.human || 0}，一键接受 ${c.bulk || 0}，看不清 ${c.skip || 0}。` +
-      (synced ? "已同步到 Mac 上的 .labels.csv。" : "停手一分钟后会同步到 Mac 上的 .labels.csv。")
-    : "";
-  $("aOpen").hidden = a.status !== "ready";
-  $("aOpen").href = "#/label/" + v.id;
-  $("aOpen").textContent = n ? "接着标注" : "开始标注";
-  $("aPrepare").hidden = !(ready && (a.status === "none" || a.status === "failed"));
-  $("aPrepare").textContent = a.status === "failed" ? "重新准备" : "准备标注";
-  $("aFresh").hidden = !(ready && a.status === "ready");
-  $("aClear").hidden = !(a.status === "ready" || a.status === "failed");
-  $("aClear").textContent = "删除图片";
-  delete $("aClear").dataset.armed;
-
-  const k = v.strokes || { status: "none", labels: 0 };
-  const ks = $("kState");
-  ks.className = k.status === "failed" ? "bad" : "quiet";
-  ks.textContent = {
-    none: ready ? "点「准备击球类型标注」：家里的 Mac 会识别每一拍的类型，再把每拍剪成一小段传上来。" : "这段录像分析完之后才能标注。",
-    queued: nodeOnline() ? "排队中，Mac 马上开始准备" : "排队中。家里的 Mac 现在离线，上线后开始准备",
-    preparing: "Mac 正在准备：" + (k.stage || "开始"),
-    ready: "小视频准备好了" + (k.stage ? "：" + k.stage : "") + "。",
-    failed: "准备失败",
-  }[k.status] || "";
-  $("kError").hidden = !(k.status === "failed" && k.error);
-  $("kError").textContent = k.status === "failed" ? k.error || "" : "";
-  const ksynced = k.labelsChangedAt && k.labelsSyncedAt && k.labelsSyncedAt >= k.labelsChangedAt;
-  $("kCounts").textContent = k.labels ? `已标 ${k.labels} 拍。` + (ksynced ? "已同步到 Mac 上的 .strokes.labels.csv。" : "停手一分钟后会同步到 Mac 上的 .strokes.labels.csv。") : "";
-  $("kOpen").hidden = k.status !== "ready";
-  $("kOpen").href = "#/strokes/" + v.id;
-  $("kOpen").textContent = k.labels ? "接着标注击球类型" : "开始标注击球类型";
-  // 准备好了也能重新准备（比如 Mac 上的程序更新了）：已标的拍按帧号对应，不会丢
-  $("kPrepare").hidden = !(ready && (k.status === "none" || k.status === "failed" || k.status === "ready"));
-  $("kPrepare").textContent = k.status === "none" ? "准备击球类型标注" : k.status === "ready" ? "重新准备小视频（已标的拍保留）" : "重新准备";
-  $("kPrepare").classList.toggle("plain", k.status === "ready");
-  $("kCsv").hidden = !k.labels;
-  $("kCsv").href = `${API}/videos/${v.id}/stroke-labels?format=csv`;
-  $("kClear").hidden = !(k.status === "ready" || k.status === "failed");
-  $("kClear").textContent = "删除小视频";
-  delete $("kClear").dataset.armed;
-}
-
-async function annotAction(path, method, body, done) {
-  try {
-    await api(`/videos/${openId}${path}`, { method, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-    log(done);
-  } catch (e) {
-    log("标注：" + e.message);
-    const box = $(path.startsWith("/strokes") ? "kError" : "aError");
-    box.hidden = false;
-    box.textContent = e.message;
-    return;
-  }
-  refreshList();
-}
-$("aPrepare").onclick = () => annotAction("/annot", "POST", {}, "已请 Mac 准备标注材料");
-// 微调换了权重后：同样这些回合，用新模型重新预测（标注保留），在标注页对比准确率
-$("aFresh").onclick = () => annotAction("/annot", "POST", { fresh: true }, "已请 Mac 用新模型重新预测");
-$("kPrepare").onclick = () => annotAction("/strokes", "POST", {}, "已请 Mac 准备击球类型标注");
-$("kClear").onclick = () => {
-  const btn = $("kClear");
-  if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次：删除小视频（标注保留）"; return; }
-  annotAction("/strokes", "DELETE", null, "击球小视频已删除，标注保留");
-};
-$("aClear").onclick = () => {
-  const btn = $("aClear");
-  if (btn.dataset.armed !== "1") { btn.dataset.armed = "1"; btn.textContent = "再点一次：删除图片（标注保留）"; return; }
-  annotAction("/annot", "DELETE", null, "标注用的图片已删除，标注保留");
-};
-
 // ---------- 处理：重新处理、改单打双打、删除 ----------
 
 $("dRetry").onclick = async () => {
@@ -1290,7 +1277,7 @@ $("dDelete").onclick = async () => {
   if (v) log("已从云端删除 " + v.filename);
   location.hash = "#/";
 };
-document.addEventListener("visibilitychange", () => { if (!document.hidden && token && !$("app").hidden) refreshList(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && authed && isOwner() && !$("app").hidden) refreshList(); });
 
 $("copyLog").onclick = async () => {
   try { await navigator.clipboard.writeText($("log").textContent); log("记录已复制"); }

@@ -26,6 +26,8 @@
 | `PATCH /videos/{id}` | 改标题，请求体 `{"title": "…"}`（新建时也可以带 `title`） |
 | `POST /session` | 发一个只读 cookie，网页里的图片和视频靠它读取 |
 | `POST /node/claim` | 处理节点领取一个排队中的录像（节点失联 10 分钟后可被重新领取） |
+| `POST /node/status` | 节点每半分钟上报一次这台 Mac 的状态（当前作业、后台任务和日志、机器负载），原样存成 JSON |
+| `GET /status` | 「Mac 状态」页要的全部内容：各节点最后上报的状态，加上正在做、排队、失败的作业 |
 | `POST /videos/{id}/job` | 节点汇报进度（`stage` 文字加 `progress` 步骤列表：每步状态、用时、百分比、预计剩余），或以 `done` / `failed` 结束 |
 | `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打 |
 | `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
@@ -54,9 +56,21 @@ badminton node --once     # 处理完排队中的就退出
 
 自动标定失败时这一局标为失败，网页上能看到原因；在 Mac 上手动标定（把 `court.json` 放在原片旁边）之后，在网页上点“重新处理”即可。
 
+### Mac 状态页
+
+网页首页下面那行「家里的 Mac 在线」后面的「看它在做什么」（`#/mac`，`public/status.js`）每 10 秒刷新一次，显示：
+
+- 处理程序在不在线、正在做哪个录像的哪种作业、启动时间和代码版本、CPU 负载、内存、磁盘剩余，以及它最近打印的几十行日志（含正在跑的那一步的输出）。
+- 后台任务：不经过网站、直接在 Mac 上跑的程序（微调训练、手动跑的 `badminton` 命令）。不用登记，节点每半分钟用 `ps` 和 `lsof` 找出工作目录在本仓库下的 Python 进程（存活 20 秒以上，子进程算在父进程里），读它标准输出指向的日志文件的最后 25 行，并从里面认进度（`Epoch [3 / 10]`、tqdm 进度条、`600/1200 帧`）。任务结束后保留一天，日志结尾有 Traceback 之类的会标成「日志里有报错」。输出没有重定向到文件的任务只能看到命令和运行时间。
+- 网站交给 Mac 的作业：正在做的、排队的、失败的（带原因）。
+
+要看别的目录下的任务，在 `~/.config/badminton/node.json` 里加 `"watch": ["~/codebase/badminton_analysis", "~/codebase/third_party"]`（写了就以它为准）。日志里像口令、token、API key 的值上传前会换成 `***`。实现在 `src/badminton/node_status.py`。
+
 ## 手机上标注球的位置
 
 录像页的「标注」里点「准备标注」：节点领到 `annotate` 任务（只有没有录像要分析时才领），运行 `badminton annotate-pack`，挑模型最没把握的 3 个回合（优先 20 秒以内的，最多 3600 帧），每个回合的帧切成 1920 宽的 JPEG 拼成一个文件（4K 视频另外每帧在预测的球附近切一块 768×768 的原图，`rally-<k>.hd.bin`，给放大镜用），`state.json` 记每帧在文件里的位置和模型的预测，传到 R2 的 `annot/` 下（不算在 10 GB 结果里）。网页（`public/label.js`，`#/label/<编号>`）一次用 Range 取 8 帧。
+
+在上一帧附近找球：这帧还没标、上一帧标了有球，而模型说没球或者模型的点离推算的位置太远时，网页按上两帧的速度推算球该在哪，先在附近找模型热图上的弱信号（`state.json` 每帧的 `weak`：热图上 0.05 以上的局部峰值，最多 6 个，去掉不动的亮点），找不到再比较前后两帧的图，找附近新变亮的小块：两帧的原图局部都盖住要找的范围就用原图局部，否则用整帧图（模型丢了球时，原图局部停在模型上次看到球的地方，球可能在局部外面）。试过拿上一帧球的样子做模板比对，不如找变亮的准（球太小，模板里大半是背景），没有采用。找到的点作为蓝色十字和虚线圈预填，点「对」才保存。旧的标注材料没有 `weak`，要点「重新准备」（已标的帧保留；会重新跑一遍模型）。
 每标一帧存进 D1 的 `labels` 表；停手一分钟后节点领到 `labels` 任务，写回录像旁边的 `<视频名>.labels.csv`（网页回合里的帧以网站为准，其它帧保留 Mac 上原来的标注），之后 `badminton annotate-export` 照常用。
 再次准备时沿用同样的回合，所以微调后点「用新模型重新预测」，标注页上的准确率就是同一批帧上微调前后的对比。
 
@@ -130,3 +144,32 @@ Mac 上不放 API key。处理节点只上传 `review.request.json`（`badminton
 **用量和价格。** 每次调用模型，接口返回的输入、输出 token 数记在 D1 的 `ai_usage` 表里，同时按当时的单价算出估算价格。结果页显示每份报告、每次追问的用量，设置页显示累计。单价默认是公开的标价，可以在设置页改成账单上的数字（存在 `settings` 表）；没有单价的模型只记 token 数。价格只是估算，以 Azure 账单为准。
 
 报告在网页上只按标题、列表、引用、粗体、行内代码渲染，里面的 HTML 不会被执行。
+
+## 多人标注：Google 登录和领任务
+
+代码在 `src/team.ts`（后端）和 `public/team.js`。
+
+网站分成两边，顶部导航切换：
+- **分析**（`#/` 我的录像、`#/upload`、`#/v/<id>`）：上传录像、看结果。只有超级管理员能用（要用家里的 Mac 处理），
+  设置和 Mac 状态也只有它能看；让 Mac 准备标注材料也只有它能点。
+- **标注**（`#/tasks` 任务、`#/materials` 素材、`#/review` 审核）：任务所有成员都能用；素材（每段录像的标注材料、进度、CSV，
+  接口 `GET /labeling/videos`）和审核只有管理员能看。
+- 账号菜单（右上角头像）：成员 `#/team`（管理员）、设置、Mac 状态、退出。
+
+- **登录**：网站用 Google 登录（OAuth 授权码流程，只要 `openid email profile`）。登录后发一个随机的会话 cookie `ba_sid`
+  （库里只存 SHA-256，30 天过期）；带 cookie 的写请求必须有 `x-ba: 1` 头。口令（`ACCESS_TOKEN`）仍然有效：Mac 节点用它，
+  管理员也可以在登录页的「用口令登录」里用它。没有配置 Google 时网站只有口令登录。
+- **成员**：白名单。管理员在「成员」页填邮箱邀请；没被邀请的人登录后是 `pending`，出现在「申请加入」里，点「允许」放行。
+  超级管理员：仓库 secret `ADMIN_GOOGLE_EMAIL` 里的邮箱，用它登录直接是管理员，别人不能停用、降级或删除它。
+  没有设置时，第一个管理员：用 Google 登录后在「我是管理员」里输一次口令（以前没署名的标注记到这个账号名下）。
+  标注员只能用任务大厅和标注页，只能读自己领过任务的录像的标注材料。
+- **任务**（表 `tasks`）：标注材料准备好之后自动生成。球位置一个回合一个任务；击球类型约 20 拍一个任务。
+  `open` → `claimed`（领取，2 小时没有保存自动放回，每次保存续期；标注员同时最多领 3 个）→ `submitted` → `approved`，
+  管理员可以收回、退回重标。重新准备材料时，有人领过的任务保留，没人领的按新材料重新分。
+- **标注归属**：`labels.annotator`、`stroke_labels.annotator` 记邮箱。标注员只能写自己手上任务范围里的帧；管理员不能写别人正在标的帧。
+  网页下载的 CSV（`/videos/{id}/labels?format=csv`、`/videos/{id}/stroke-labels?format=csv`）多两列 `annotator,updated_at`；
+  Mac 节点读到的 JSON 和它写的 `.labels.csv`、`.strokes.labels.csv` 没有变。
+- **配置**：仓库 secret `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`ADMIN_GOOGLE_EMAIL`（部署流程写进 Worker）。在 Google Cloud 的 Google Auth Platform 里建
+  「Web 应用」客户端，已获授权的重定向 URI 填 `https://ba.llmat.dev/api/v1/auth/google/callback`，
+  隐私权政策和服务条款填 `https://ba.llmat.dev/privacy`、`https://ba.llmat.dev/terms`。
+- **测试**：`test/team.test.mjs` 用一个假的 Google 把整个流程走一遍。
