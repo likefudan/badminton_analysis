@@ -445,19 +445,27 @@ const Label = (() => {
 
   function layout() {
     const cv = $l("lCanvas"), [vw, vh] = L.state.video.size;
-    let w;
+    let w, zoom; // 画面的宽度，放大镜（正方形）的边长
+    const padEl = $l("lPad"), padW = padEl.offsetWidth || 126, padH = padEl.offsetHeight || 126;
     if (PHONE_LANDSCAPE.matches) {
-      // 手机横屏：高度占满，右边留一栏放按钮
-      w = Math.min(window.innerWidth - SIDE_PX, window.innerHeight * vw / vh);
+      // 手机横屏：从左到右是画面、放大镜（下面是方向键）、按钮栏
+      zoom = clamp(window.innerHeight - padH - 16, 140, 340);
+      w = Math.min(window.innerWidth - SIDE_PX - zoom - 20, window.innerHeight * vw / vh);
     } else {
-      // 竖屏：宽度占满；横屏的平板、电脑：画面高度不超出屏幕（减去画面上面的标题）
       w = cv.parentElement.clientWidth;
       if (window.innerWidth > window.innerHeight) {
+        // 横屏的平板、电脑：画面在上，放大镜在下，两个加起来不超出屏幕（减去画面上面的标题）
         const top = cv.parentElement.getBoundingClientRect().top + window.scrollY;
-        w = Math.min(w, (window.innerHeight - Math.min(top, 80) - 12) * vw / vh);
+        const avail = window.innerHeight - Math.min(top, 80) - 12;
+        zoom = clamp(Math.round(avail * 0.45), 220, 520);
+        w = Math.min(w, (avail - zoom - 10) * vw / vh);
+      } else {
+        // 竖屏：画面宽度占满，放大镜在下面，旁边留出方向键
+        zoom = clamp(w - padW - 12, 140, 420);
       }
     }
     w = Math.max(160, w);
+    L.zoom = Math.round(zoom);
     const h = w * vh / vw;
     const dpr = window.devicePixelRatio || 1;
     if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
@@ -541,24 +549,18 @@ const Label = (() => {
   }
 
   // 放大镜：一直开着，对准 L.focus（翻帧时沿用上一帧球的位置）。有原图局部就用原图，看到的是视频的原始像素；
-  // 在放大镜里点一下 = 把球放在那里，拖动 = 精细地挪。放在离点远的那一角。
-  function loupeGeom(s, h) {
-    const padH = $l("lPad").hidden ? 0 : $l("lPad").offsetHeight;
-    const big = Math.min(h * 0.5, 360);
-    const size = Math.round(Math.max(80, Math.min(big, h - padH - 18)));
+  // 在放大镜里点一下 = 把球放在那里，拖动 = 精细地挪。单独放在画面下面（手机横屏时在右边），不挡画面。
+  function loupeGeom() {
+    const size = L.zoom || 240;
     const span = spanPx();
     return { size, span, z: size / span, x0: L.focus.x - span / 2, y0: L.focus.y - span / 2 };
   }
   function loupe(s, h) {
     const lc = $l("lLoupe");
-    if (!L.bitmap || !L.focus) { lc.hidden = true; return; }
-    const { size, span, z, x0, y0 } = loupeGeom(s, h), dpr = window.devicePixelRatio || 1;
-    lc.hidden = false;
-    if (lc.width !== size * dpr) { lc.width = lc.height = size * dpr; lc.style.width = lc.style.height = size + "px"; }
-    const cvW = $l("lCanvas").clientWidth, mark = basePoint() || L.focus;
-    const left = mark.x * s > cvW / 2;
-    lc.style.left = left ? "6px" : "";
-    lc.style.right = left ? "" : "6px";
+    const dpr = window.devicePixelRatio || 1, side = L.zoom || 240;
+    if (lc.width !== Math.round(side * dpr)) { lc.width = lc.height = Math.round(side * dpr); lc.style.width = lc.style.height = side + "px"; }
+    if (!L.bitmap || !L.focus) { lc.getContext("2d").clearRect(0, 0, lc.width, lc.height); return; }
+    const { size, span, z, x0, y0 } = loupeGeom();
     const g = lc.getContext("2d");
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.imageSmoothingEnabled = false;
@@ -590,7 +592,7 @@ const Label = (() => {
     }
   }
 
-  // 悬浮方向键：放在离点远的那一侧（和放大镜同侧），有点可以挪时才显示
+  // 方向键：在放大镜旁边，有点可以挪时才显示
   function basePoint() {
     if (L.pending) return L.pending;
     const lab = L.labels.get(frameOf(L.r, L.i)), p = rally().pred[L.i];
@@ -599,11 +601,8 @@ const Label = (() => {
   }
   function pad(s) {
     const el = $l("lPad"), pt = basePoint();
-    el.hidden = !pt;
+    el.style.visibility = pt ? "" : "hidden"; // 位置一直留着，画面不会跳
     if (!pt) return;
-    const right = pt.x * s <= $l("lCanvas").clientWidth / 2;
-    el.style.left = right ? "" : "6px";
-    el.style.right = right ? "6px" : "";
     $l("lStep").textContent = L.step === 1 ? "1" : String(L.step);
   }
   // 挪 1 步 = 视频的 1 个像素（有原图局部时）或整帧图的 1 个像素；切到 5 就是 5 倍
@@ -793,7 +792,7 @@ const Label = (() => {
   // 放大镜里：点一下把球放在那里，拖动按放大后的比例挪（很细）
   let ltouch = null;
   function loupePoint(e) {
-    const rect = $l("lLoupe").getBoundingClientRect(), { w, h, s } = layout(), G = loupeGeom(s, h);
+    const rect = $l("lLoupe").getBoundingClientRect(), G = loupeGeom();
     return { x: G.x0 + (e.clientX - rect.left) / G.z, y: G.y0 + (e.clientY - rect.top) / G.z, z: G.z };
   }
   function onLoupeDown(e) {

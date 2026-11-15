@@ -142,7 +142,9 @@
   main.wide { max-width: 1400px; }
   #lPic { position: relative; touch-action: none; user-select: none; -webkit-user-select: none; }
   #lCanvas { display: block; width: 100%; border-radius: 8px; background: #000; touch-action: none; }
-  #lLoupe { position: absolute; top: 6px; border: 2px solid #fff; border-radius: 8px; box-shadow: 0 1px 6px rgba(0,0,0,.5); touch-action: none; cursor: crosshair; }
+  /* 放大镜单独放在画面下面（手机横屏时在画面右边），方向键在它旁边 */
+  #lZoom { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #lLoupe { flex: none; border-radius: 8px; background: #000; touch-action: none; cursor: crosshair; }
   #lWhat { min-height: 1.5em; margin: 4px 0 8px; }
   #lScrub { position: relative; height: 34px; margin: 4px 0 2px; }
   #lStrip { position: absolute; left: 10px; right: 10px; top: 13px; height: 8px; width: calc(100% - 20px); border-radius: 4px; background: var(--line); }
@@ -159,36 +161,40 @@
   #lAcc table td:nth-child(2) { font-weight: 600; white-space: nowrap; }
   #lAcc table td:nth-child(3) { text-align: left; font-size: 12px; }
   #tAnnot code { font-size: 13px; }
-  #lPad { position: absolute; bottom: 6px; display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px);
+  #lPad { flex: none; display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px);
     gap: 3px; grid-template-areas: ". u ." "l c r" ". d ."; touch-action: none; user-select: none; -webkit-user-select: none; }
-  #lPad button { width: 40px; height: 40px; padding: 0; border-radius: 8px; background: rgba(20,20,20,.55); color: #fff;
+  #lPad button { width: 40px; height: 40px; padding: 0; border-radius: 8px; background: rgba(20,20,20,.8); color: #fff;
     border: 1px solid rgba(255,255,255,.45); font-size: 15px; font-weight: 600; touch-action: none; -webkit-touch-callout: none; }
   #lPad button:active, #lPad button.held { background: rgba(47,129,247,.85); }
   #lPad .u { grid-area: u; } #lPad .l { grid-area: l; } #lPad .c { grid-area: c; font-size: 13px; } #lPad .r { grid-area: r; } #lPad .d { grid-area: d; }
   @media (orientation: portrait) {
-    #lPad { grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(3, 34px); gap: 2px; bottom: 4px; }
+    #lPad { grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(3, 34px); gap: 2px; }
     #lPad button { width: 34px; height: 34px; font-size: 13px; }
   }
   /* 平板、电脑横着：画面在左边尽量大，按钮在右边一栏 */
   @media (orientation: landscape) and (min-width: 600px) and (min-height: 541px) {
     body.labeling main { max-width: none; }
-    #lStage { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; align-items: start; }
-    #lSide { max-height: calc(100dvh - 70px); overflow-y: auto; }
+    #lStage { display: grid; grid-template-columns: minmax(0, 1fr) 320px; column-gap: 14px; align-items: start; }
+    #lPic { grid-column: 1; grid-row: 1; }
+    #lZoom { grid-column: 1; grid-row: 2; }
+    #lSide { grid-column: 2; grid-row: 1 / 3; max-height: calc(100dvh - 70px); overflow-y: auto; }
   }
   /* 手机横屏：画面占满整个高度，标题和按钮挤到右边一栏，右栏自己滚动 */
   @media (orientation: landscape) and (max-height: 540px) {
     body.labeling { padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left); }
     body.labeling main { max-width: none; }
-    #vLabel { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: auto auto 1fr; height: 100vh; height: 100dvh; column-gap: 8px; }
+    #vLabel { display: grid; grid-template-columns: auto auto minmax(0, 1fr); grid-template-rows: auto auto auto 1fr; height: 100vh; height: 100dvh; column-gap: 8px; }
     #vLabel[hidden] { display: none; }
     #lStage { display: contents; }
-    #lPic { grid-column: 1; grid-row: 1 / 4; align-self: center; }
+    #lPic { grid-column: 1; grid-row: 1 / 5; align-self: center; }
+    #lZoom { grid-column: 2; grid-row: 1 / 5; align-self: center; flex-direction: column; gap: 6px; margin: 0; }
+    #lTaskBar { grid-column: 3; grid-row: 2; }
     #lCanvas { border-radius: 0; }
-    #vLabel .top { grid-column: 2; grid-row: 1; margin: 4px 0 0; min-height: 0; gap: 4px; }
+    #vLabel .top { grid-column: 3; grid-row: 1; margin: 4px 0 0; min-height: 0; gap: 4px; }
     #vLabel .top h1 { display: none; }
     #vLabel .top a { padding: 4px 2px; font-size: 14px; }
-    #lMsg { grid-column: 2; grid-row: 2; margin: 0; }
-    #lSide { grid-column: 2; grid-row: 3; overflow-y: auto; min-height: 0; padding: 0 4px 8px 0; -webkit-overflow-scrolling: touch; }
+    #lMsg { grid-column: 3; grid-row: 3; margin: 0; }
+    #lSide { grid-column: 3; grid-row: 4; overflow-y: auto; min-height: 0; padding: 0 4px 8px 0; -webkit-overflow-scrolling: touch; }
     #lWhere { font-size: 12px; margin: 0; }
     #lWhat { font-size: 13px; margin: 2px 0 6px; min-height: 0; }
     .lbtns { grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -446,8 +452,9 @@
       <div class="taskbar" id="lTaskBar" hidden><span></span><button>提交任务</button></div>
       <p class="quiet" id="lMsg"></p>
       <div id="lStage" hidden>
-        <div id="lPic"><canvas id="lCanvas"></canvas><canvas id="lLoupe" hidden></canvas>
-          <div id="lPad" hidden>
+        <div id="lPic"><canvas id="lCanvas"></canvas></div>
+        <div id="lZoom"><canvas id="lLoupe"></canvas>
+          <div id="lPad">
             <button class="u" data-dx="0" data-dy="-1" aria-label="上移">▲</button>
             <button class="l" data-dx="-1" data-dy="0" aria-label="左移">◀</button>
             <button class="c" id="lStep" aria-label="每次移动的距离">1</button>
@@ -473,7 +480,7 @@
           <h2 style="margin-top:14px">模型准不准</h2>
           <div id="lAcc" class="quiet"></div>
           <details class="quiet" style="margin-top:10px"><summary>怎么标</summary>
-            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去）。蓝色虚线小圈是模型的弱信号：模型觉得那里可能有球但没把握，点在它附近也会吸过去，放大镜里点在圈上同样可以。角上的放大镜一直开着，翻到下一帧时对准上一帧球的位置（画面上虚线框就是它看的范围），左下角写「原图」时看到的是 4K 原始像素；在放大镜里点一下就把球放在那里，按住拖动可以很细地挪。也可以用方向键微调（按一下挪 1 个像素，按住连续挪，中间的数字切换每次挪 1 或 5 个像素），看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。球落在地上不动时点「球没动」，直接用上一帧标的位置。帧数下面的滑条可以拖着快速选帧：绿色是标了有球的帧，灰色是没有球或看不清，橙色是模型很没把握、还没标的帧。</p>
+            <p>橙色圈是模型猜的球，白色小圈是模型看到的其它亮点，黄色是前几帧的轨迹。猜对了点「对」；不对就点一下真正的球（点在白圈附近会自动吸过去）。蓝色虚线小圈是模型的弱信号：模型觉得那里可能有球但没把握，点在它附近也会吸过去，放大镜里点在圈上同样可以。画面下面（手机横过来时在右边）的大放大镜一直开着，翻到下一帧时对准上一帧球的位置（画面上虚线框就是它看的范围），左下角写「原图」时看到的是 4K 原始像素；在放大镜里点一下就把球放在那里，按住拖动可以很细地挪。也可以用放大镜旁边的方向键微调（按一下挪 1 个像素，按住连续挪，中间的数字切换每次挪 1 或 5 个像素），看准了再点「对」。球被挡住或者糊得看不出来点「看不清」，这一帧不会拿去训练。球落在地上不动时点「球没动」，直接用上一帧标的位置。帧数下面的滑条可以拖着快速选帧：绿色是标了有球的帧，灰色是没有球或看不清，橙色是模型很没把握、还没标的帧。</p>
             <p>「一键接受」把这回合里模型很有把握、你还没看过的帧直接按预测记下来（和电脑版一样记成“批量接受”），不算进上面的准确率。横过来拿手机，画面铺满屏幕，按钮在右边。</p>
           </details>
         </div>
