@@ -8,7 +8,8 @@ const Label = (() => {
   const CHUNK = 8;            // 一次请求取几帧
   const AHEAD = 3;            // 往后预取几个块
   const KEEP_BLOBS = 480;     // 压缩的图最多留多少张（整帧和原图局部一起算，约 60 MB）
-  const SNAP_PX = 16;         // 点在候选点这么近（屏幕像素）就吸到候选点上
+  const SNAP_PX = 26;         // 点在候选点、弱信号这么近（屏幕像素）就吸到它上面
+  const LOUPE_SNAP_PX = 14;   // 放大镜里吸附的距离小一些（屏幕像素），圈外面还能精确地点
   const DRAG_PX = 8;          // 手指移动超过这么多算拖动，不算点
   const FINE = 0.3;           // 拖动时点移动的比例：手指走 10 像素，点走 3 像素
   const LOUPE_SPAN = 1 / 20;  // 放大镜里看到的宽度占视频宽度的比例（4K 里是 192 个像素）
@@ -191,7 +192,7 @@ const Label = (() => {
     const R = rally(), p = R.pred[L.i];
     if (p[0] && Math.hypot(p[1] - A.x, p[2] - A.y) <= A.radius) return; // 模型的点就在附近：用橙圈
     let best = null, bestScore = Infinity;
-    for (const [x, y, peak] of [...((R.cand && R.cand[L.i]) || []), ...((R.weak && R.weak[L.i]) || [])]) {
+    for (const [x, y, peak] of hints()) {
       const d = Math.hypot(x - A.x, y - A.y);
       if (d > A.radius) continue;
       const score = d / A.radius - 0.5 * Math.min(1, peak * 2);
@@ -199,6 +200,32 @@ const Label = (() => {
     }
     if (best) offer(best, "heat");
     else motionSearch(L.r, L.i, A);
+  }
+  // 这一帧模型看到的点：候选点（强）和热图上的弱信号，[x, y, 分数]
+  function hints(i = L.i) {
+    const R = rally();
+    return [...((R.cand && R.cand[i]) || []), ...((R.weak && R.weak[i]) || [])];
+  }
+  // 离 (x, y) 最近、屏幕上不超过 SNAP_PX 的那个点；`scale` = 屏幕像素 / 视频像素
+  function snap(x, y, scale, px = SNAP_PX) {
+    let best = px / scale, out = null;
+    for (const [cx, cy] of hints()) {
+      const d = Math.hypot(cx - x, cy - y);
+      if (d < best) { best = d; out = { x: cx, y: cy }; }
+    }
+    return out;
+  }
+  // 弱信号画成虚线小圈（候选点是实线圈）；和候选点重合的不重复画
+  function drawWeak(g, at, r) {
+    const R = rally(), weak = (R.weak && R.weak[L.i]) || [], cand = (R.cand && R.cand[L.i]) || [];
+    if (!weak.length) return;
+    g.strokeStyle = "rgba(120,200,255,.9)"; g.lineWidth = 1.5; g.setLineDash([3, 3]);
+    for (const [x, y] of weak) {
+      if (cand.some(([cx, cy]) => Math.hypot(cx - x, cy - y) < 12)) continue;
+      const [a, b] = at(x, y);
+      g.beginPath(); g.arc(a, b, r, 0, 7); g.stroke();
+    }
+    g.setLineDash([]);
   }
   function offer(pt, how) {
     L.pending = { x: pt.x, y: pt.y };
@@ -475,6 +502,7 @@ const Label = (() => {
       g.strokeStyle = "rgba(255,255,255,.7)"; g.lineWidth = 1;
       for (const [x, y] of R.cand[L.i] || []) { g.beginPath(); g.arc(x * s, y * s, 7, 0, 7); g.stroke(); }
     }
+    drawWeak(g, (x, y) => [x * s, y * s], 7);
     // 模型的预测
     const p = R.pred[L.i];
     if (p[0]) ring(g, p[1] * s, p[2] * s, 12, "#ff8c00", 2.5);
@@ -551,6 +579,7 @@ const Label = (() => {
       g.strokeStyle = "rgba(255,255,255,.6)"; g.lineWidth = 1;
       for (const [x, y] of R.cand[L.i] || []) { const [a, b] = at(x, y); g.beginPath(); g.arc(a, b, 9, 0, 7); g.stroke(); }
     }
+    drawWeak(g, at, 18);
     if (p[0]) { const [a, b] = at(p[1], p[2]); ring(g, a, b, 14, "#ff8c00", 2); }
     const lab = L.labels.get(frameOf(L.r, L.i));
     if (L.pending) { const [a, b] = at(L.pending.x, L.pending.y); cross(g, a, b, "#2f81f7"); }
@@ -752,13 +781,9 @@ const Label = (() => {
     if (t.dragging) return;
     const rect = $l("lCanvas").getBoundingClientRect(), s = layout().s;
     let x = (e.clientX - rect.left) / s, y = (e.clientY - rect.top) / s;
-    // 吸到最近的候选点
-    const R = rally();
-    let best = SNAP_PX / s;
-    for (const [cx, cy] of (R.cand && R.cand[L.i]) || []) {
-      const d = Math.hypot(cx - x, cy - y);
-      if (d < best) { best = d; x = cx; y = cy; }
-    }
+    // 吸到最近的候选点或弱信号
+    const near = snap(x, y, s);
+    if (near) { x = near.x; y = near.y; }
     L.pending = { x, y };
     L.focus = { x, y };
     L.msg = "";
@@ -795,7 +820,8 @@ const Label = (() => {
     ltouch = null;
     if (t.dragging) { follow(L.pending); draw(); return; }
     const pt = loupePoint(e), [vw, vh] = L.state.video.size;
-    L.pending = { x: clamp(pt.x, 0, vw), y: clamp(pt.y, 0, vh) };
+    const near = snap(pt.x, pt.y, pt.z, LOUPE_SNAP_PX); // 点在候选点、弱信号的圈上：吸过去
+    L.pending = near || { x: clamp(pt.x, 0, vw), y: clamp(pt.y, 0, vh) };
     follow(L.pending);
     L.msg = "";
     draw();
