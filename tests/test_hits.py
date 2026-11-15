@@ -109,6 +109,20 @@ def test_serve_is_found_where_the_track_starts_in_the_hand():
     assert hits[0]["by"].startswith("track-start")
 
 
+def test_short_serve_start_is_not_hidden_by_the_kink_at_its_top():
+    # a short serve: the track starts in the server's hand, rises slowly and bends at the top
+    # of the serve 6 frames later. That bend used to block the start candidate, and the serve
+    # was then found 6 frames late (DShuttleNet, docs/hits.md).
+    xy = rally()
+    a = HIT_FRAMES[0]
+    xy[:a] = np.nan
+    xy[a:a + 7] = NEAR[None] + np.linspace(0, 1, 7)[:, None] * np.array([0.0, -0.4 * BH[0]])
+    xy[a + 7:a + 10] = xy[a + 6] + np.arange(1, 4)[:, None] * np.array([30.0, -20.0])
+    hits = H.detect_hits(track(xy), players(), FPS, FRAME_H)
+    assert abs(hits[0]["frame"] - a) <= 1 and hits[0]["player_id"] == 1
+    assert hits[0]["by"].startswith("track-start")
+
+
 def test_drop_static_removes_a_phantom_point():
     xy = rally()
     xy[200:260] = (915.0, 270.0)  # TrackNetV3's "nothing found" position, frame after frame
