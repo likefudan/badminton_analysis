@@ -16,6 +16,10 @@ const Label = (() => {
   const SIDE_PX = 175;        // 手机横屏时右边按钮栏的宽度
   const NEAR_MIN_PX = 60;     // 在上一帧附近找球的最小半径（4K 视频的像素，其它尺寸按宽度换算）
   const NEAR_MIN_SCORE = 120; // 前后帧比较时，变亮的小块至少要这么明显才当成球
+  const TEMPLATE_PX = 12;     // 拿上一帧球的样子比对时，取球周围多大（半边，4K 的像素）
+  const LOOK_MIN = 0.6;       // 样子至少要这么像（相关系数）才当成同一个球
+  const LOOK_SURE = 0.8;      // 这么像时，比模型的弱信号更可信
+  const LOOK_MIN_STD = 6;     // 上一帧球那块的亮度起伏至少这么大，不然看不出样子
   const PHONE_LANDSCAPE = window.matchMedia("(orientation: landscape) and (max-height: 540px)");
 
   let L = null;               // 当前在标的录像
@@ -169,8 +173,8 @@ const Label = (() => {
 
   // ---------- 在上一帧附近找球 ----------
   // 这帧还没标、上一帧标了有球：按上两帧的速度推算球该在哪。模型的点离推算的位置太远（或者模型说没球）时，
-  // 先在推算点附近找模型热图上的弱信号（Mac 准备标注时存下的 weak），找不到再比较前后两帧的原图局部，
-  // 找附近新变亮的小块。找到的点作为蓝色十字预填，对就点「对」，不对照常点真正的球。
+  // 先在推算点附近找模型热图上的弱信号（Mac 准备标注时存下的 weak），找不到再比较前后两帧的原图局部：
+  // 先拿上一帧球的样子去比对，再找附近新变亮的小块。找到的点作为蓝色十字预填，对就点「对」，不对照常点真正的球。
   function expected(i = L.i) {
     const p1 = i >= 1 ? labelPoint(i - 1) : null;
     if (!p1) return null;
@@ -179,8 +183,10 @@ const Label = (() => {
     const k = L.state.video.size[0] / 3840;
     return { x: p1.x + vx, y: p1.y + vy, radius: Math.max(NEAR_MIN_PX * k, 1.5 * Math.hypot(vx, vy) + 30 * k) };
   }
-  function nearTodo(r, i) {
-    return L && L.r === r && L.i === i && !L.pending && !done(L.labels.get(frameOf(r, i)));
+  // 还在这一帧、还没标；`replace`：预填的弱信号建议还没被动过，也可以换掉
+  function nearTodo(r, i, replace = false) {
+    return L && L.r === r && L.i === i && (!L.pending || (replace && isSuggested() && L.suggested.how === "heat"))
+      && !done(L.labels.get(frameOf(r, i)));
   }
   function suggest() {
     if (!nearTodo(L.r, L.i)) return;
@@ -196,7 +202,7 @@ const Label = (() => {
       if (score < bestScore) { bestScore = score; best = { x, y }; }
     }
     if (best) offer(best, "heat");
-    else motionSearch(L.r, L.i, A);
+    motionSearch(L.r, L.i, A, Boolean(best)); // 有弱信号时，样子很像的地方仍然可以换掉它
   }
   function offer(pt, how) {
     L.pending = { x: pt.x, y: pt.y };
@@ -205,37 +211,100 @@ const Label = (() => {
   }
   const isSuggested = () => L.suggested && L.pending && L.pending.x === L.suggested.x && L.pending.y === L.suggested.y;
 
-  // 前后两帧的原图局部里，推算点附近新变亮的小块（球是白的，背景不动）
-  async function motionSearch(r, i, A) {
+  // 前后两帧的原图局部：先拿上一帧标的（或确认过的）球的样子，在这一帧推算点附近比对（球没动、
+  // 球中间有黑点也能找到）；比不上再找附近新变亮的小块（球是白的，背景不动）
+  async function motionSearch(r, i, A, hasHeat = false) {
     const R = L.state.rallies[r];
-    if (!R.hd || i < 1) return;
+    const p1 = i >= 1 ? labelPoint(i - 1) : null;
+    if (!p1) return;
     try {
-      await Promise.all([chunk(r, Math.floor(i / CHUNK), "hd"), chunk(r, Math.floor((i - 1) / CHUNK), "hd")]);
-      if (!nearTodo(r, i)) return;
-      const b1 = L.blobs.get("hd" + r + ":" + i), b0 = L.blobs.get("hd" + r + ":" + (i - 1));
+      const [vw, vh] = L.state.video.size, T0 = TEMPLATE_PX * vw / 3840;
+      // 要看的范围（视频像素）：推算点附近，加上上一帧球的位置附近（球可能没动），再留出模板的边
+      const nx0 = Math.max(0, Math.min(A.x - A.radius, p1.x - T0) - T0), ny0 = Math.max(0, Math.min(A.y - A.radius, p1.y - T0) - T0);
+      const nx1 = Math.min(vw, Math.max(A.x + A.radius, p1.x + T0) + T0), ny1 = Math.min(vh, Math.max(A.y + A.radius, p1.y + T0) + T0);
+      // 原图局部是围着模型的预测切的：模型丢了球，球可能已经在局部外面。两帧的局部都盖住要看的范围才用，否则用整帧图
+      const crop = L.state.crop;
+      const covers = (o) => o && crop && o[2] <= nx0 && o[3] <= ny0 && o[2] + crop[0] >= nx1 && o[3] + crop[1] >= ny1;
+      const kind = R.hd && covers(R.hd[i]) && covers(R.hd[i - 1]) ? "hd" : "";
+      const s = kind ? 1 : L.state.image[0] / vw; // 图上的像素 / 视频像素
+      await Promise.all([chunk(r, Math.floor(i / CHUNK), kind), chunk(r, Math.floor((i - 1) / CHUNK), kind)]);
+      if (!nearTodo(r, i, hasHeat)) return;
+      const b1 = L.blobs.get(kind + r + ":" + i), b0 = L.blobs.get(kind + r + ":" + (i - 1));
       if (!b1 || !b0) return;
       const [m1, m0] = await Promise.all([createImageBitmap(b1), createImageBitmap(b0)]);
-      const [, , ax, ay] = R.hd[i], [, , bx, by] = R.hd[i - 1];
-      const x0 = Math.round(Math.max(A.x - A.radius, ax, bx)), y0 = Math.round(Math.max(A.y - A.radius, ay, by));
-      const x1 = Math.round(Math.min(A.x + A.radius, ax + m1.width, bx + m0.width));
-      const y1 = Math.round(Math.min(A.y + A.radius, ay + m1.height, by + m0.height));
-      const w = x1 - x0, h = y1 - y0;
-      if (w < 8 || h < 8) { m1.close?.(); m0.close?.(); return; }
+      const [ax, ay] = kind ? R.hd[i].slice(2) : [0, 0], [bx, by] = kind ? R.hd[i - 1].slice(2) : [0, 0];
+      const T = Math.max(4, Math.round(T0 * s));
+      const x0 = Math.floor(nx0 * s), y0 = Math.floor(ny0 * s), w = Math.ceil(nx1 * s) - x0, h = Math.ceil(ny1 * s) - y0;
+      if (w < 2 * T + 3 || h < 2 * T + 3) { m1.close?.(); m0.close?.(); return; }
       const pixels = (bmp, ox, oy) => {
         const c = document.createElement("canvas");
         c.width = w; c.height = h;
         const g = c.getContext("2d", { willReadFrequently: true });
-        g.drawImage(bmp, ox - x0, oy - y0);
+        g.drawImage(bmp, ox * s - x0, oy * s - y0);
         return g.getImageData(0, 0, w, h).data;
       };
       const d1 = pixels(m1, ax, ay), d0 = pixels(m0, bx, by);
       m1.close?.(); m0.close?.();
-      if (!nearTodo(r, i)) return;
-      const best = brightening(d1, d0, w, h, A.x - x0, A.y - y0, A.radius);
-      if (!best || best.score < NEAR_MIN_SCORE) return;
-      offer({ x: x0 + best.x, y: y0 + best.y }, "motion");
+      if (!nearTodo(r, i, hasHeat)) return;
+      const back = (pt) => ({ x: round((x0 + pt.x) / s), y: round((y0 + pt.y) / s) });
+      const look = matchLook(luma(d1), luma(d0), w, h, Math.round(p1.x * s - x0), Math.round(p1.y * s - y0), T,
+                             A.x * s - x0, A.y * s - y0, A.radius * s + T);
+      if (look && (!hasHeat || !L.pending || look.c >= LOOK_SURE)) { offer(back(look), "look"); draw(); return; }
+      if (hasHeat) return;
+      const best = brightening(d1, d0, w, h, A.x * s - x0, A.y * s - y0, A.radius * s);
+      if (!best || best.score < NEAR_MIN_SCORE * (kind ? 1 : 0.6)) return;
+      offer(back(best), "motion");
       draw();
-    } catch (e) { /* 没有原图局部就不找 */ }
+    } catch (e) { /* 图读不到就不找 */ }
+  }
+
+  function luma(d) {
+    const out = new Float32Array(d.length / 4);
+    for (let k = 0, j = 0; k < out.length; k++, j += 4) out[k] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    return out;
+  }
+
+  // 模板比对：上一帧 (tx, ty) 周围 (2T+1)² 的样子，在这一帧离 (cx, cy) 不超过 radius 的地方找最像的
+  // （去掉平均亮度后的相关系数）。要求够像（LOOK_MIN），而且找到的地方不是一片平的背景。
+  function matchLook(l1, l0, w, h, tx, ty, T, cx, cy, radius) {
+    if (tx - T < 0 || ty - T < 0 || tx + T >= w || ty + T >= h) return null;
+    const n = (2 * T + 1) ** 2, tpl = new Float32Array(n);
+    let mean = 0;
+    for (let dy = -T, k = 0; dy <= T; dy++) for (let dx = -T; dx <= T; dx++, k++) mean += tpl[k] = l0[(ty + dy) * w + tx + dx];
+    mean /= n;
+    let tvar = 0;
+    for (let k = 0; k < n; k++) { tpl[k] -= mean; tvar += tpl[k] * tpl[k]; }
+    if (tvar / n < LOOK_MIN_STD ** 2) return null; // 上一帧那里本身就看不出东西
+    const score = (x, y) => {
+      let sum = 0, sum2 = 0, cross = 0;
+      for (let dy = -T, k = 0; dy <= T; dy++) {
+        const row = (y + dy) * w + x;
+        for (let dx = -T; dx <= T; dx++, k++) { const v = l1[row + dx]; sum += v; sum2 += v * v; cross += v * tpl[k]; }
+      }
+      const pvar = sum2 - sum * sum / n;
+      if (pvar < 0.25 * tvar) return -1; // 平的地方：不是球
+      return cross / Math.sqrt(pvar * tvar);
+    };
+    const inside = (x, y) => x - T >= 0 && y - T >= 0 && x + T < w && y + T < h && Math.hypot(x - cx, y - cy) <= radius
+      || (x - T >= 0 && y - T >= 0 && x + T < w && y + T < h && Math.hypot(x - tx, y - ty) <= T);
+    let best = null;
+    for (let y = T; y < h - T; y += 2) {
+      for (let x = T; x < w - T; x += 2) {
+        if (!inside(x, y)) continue;
+        const c = score(x, y);
+        if (!best || c > best.c) best = { x, y, c };
+      }
+    }
+    if (!best) return null;
+    const coarse = best;
+    for (let y = coarse.y - 1; y <= coarse.y + 1; y++) {
+      for (let x = coarse.x - 1; x <= coarse.x + 1; x++) {
+        if (x - T < 0 || y - T < 0 || x + T >= w || y + T >= h) continue;
+        const c = score(x, y);
+        if (c > best.c) best = { x, y, c };
+      }
+    }
+    return best.c >= LOOK_MIN ? best : null;
   }
 
   // 每个像素：这一帧比上一帧亮了多少 × 这一帧有多亮；3x3 加起来，离推算点越远打折越多
@@ -587,6 +656,7 @@ const Label = (() => {
     const unsure = R.unc[L.i] >= L.state.doubtful ? "，模型很没把握" : R.unc[L.i] >= L.state.confident ? "，模型不太有把握" : "";
     const what = isSuggested() ? (L.suggested.how === "heat"
         ? "蓝色十字：在上一帧附近找到的（模型的弱信号）。对就点「对」，不对就点真正的球"
+        : L.suggested.how === "look" ? "蓝色十字：和上一帧标的球样子最像的地方。对就点「对」，不对就点真正的球"
         : "蓝色十字：上一帧附近新出现的亮点。对就点「对」，不对就点真正的球")
       : L.pending ? "蓝色十字：点「对」保存，用方向键或拖动微调"
       : done(lab) ? (lab[3] === "skip" ? "已标：看不清" : lab[0] ? `已标：有球（${lab[3] === "bulk" ? "一键接受的" : "绿色十字"}）` : "已标：没有球")
