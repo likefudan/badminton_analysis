@@ -43,6 +43,7 @@ LETTERS = "ABCD"
 # far end), the same axes as ours (badminton.court) in metres. Checked on video: the feet of our
 # tracked players lie a median 0.4 m from the labelled positions this way (1.0 m with y flipped).
 DM_LENGTH = 134.0
+LANDED = {"Opp Grounded within Boundaries", "Failed Return", "Out of Bounds", "Judgment Error"}
 
 
 def to_metres(x_dm: float, y_dm: float) -> tuple[float, float]:
@@ -98,8 +99,12 @@ def read_match(raw: str | Path, match: str) -> dict:
                       "shot": int(r["shot_num"]), "positions": pos})
     shots.sort(key=lambda s: (s["frame"], s["shot"]))
     spans = sorted((int(float(r["start_frame"])), int(float(r["end_frame"]))) for r in rallies.values())
+    # A rally's end frame is its last shot's end: where the shuttle came down. Only the reasons
+    # that mean "it hit the floor" are a landing; a net fault ends on the net.
+    landed = sorted(int(float(r["end_frame"])) for r in rallies.values()
+                    if r.get("lose_reason", "").strip() in LANDED)
     return {"match": m["video_name"], "match_id": int(m["match_id"]), "event": int(m["event"]),
-            "rallies": spans, "shots": shots}
+            "rallies": spans, "shots": shots, "landed": landed}
 
 
 def cmd_labels(a) -> int:
@@ -112,7 +117,7 @@ def cmd_labels(a) -> int:
     side = {"schema": SCHEMA, "match": name, "source": f"DShuttleNet match_id {doc['match_id']}", "fps": 30.0,
             "event": {1: "MD", 2: "WD", 3: "XD"}.get(doc["event"], str(doc["event"])),
             "rallies": [list(r) for r in doc["rallies"]], "hits": hits, "hits_in_rallies": len(inside),
-            "shots": doc["shots"], "events": {}}
+            "shots": doc["shots"], "events": {"bounce": doc["landed"]}}
     (out / f"{name}.rallies.json").write_text(json.dumps(side, ensure_ascii=False, indent=1))
     who = sum(s["player"] is not None for s in doc["shots"])
     print(f"{name}：{len(hits)} 拍（{who} 拍有击球人），{len(doc['rallies'])} 个回合，回合内 {len(inside)} 拍")

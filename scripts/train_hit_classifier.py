@@ -1,4 +1,4 @@
-"""Train the hit / bounce / neither classifier of `badminton hits` on BFMD (docs/hits.md).
+"""Train the hit / bounce / neither classifier of `badminton hits` on BFMD and DShuttleNet (docs/hits.md).
 
 Two steps, because the second needs scikit-learn and `badminton` itself does not:
 
@@ -11,7 +11,9 @@ it) and computes hits.candidate_features for each candidate. Its class comes
 from BFMD, with the labels moved 1 frame earlier (docs/hits.md, 帧号对齐): hit
 when a hit label is within 3 frames, else bounce when a bounce label is, else
 neither. Only candidates inside BFMD's Rally spans count (outside them nothing
-is labelled).
+is labelled). Clips made from DShuttleNet (scripts/dshuttlenet_hits.py) work the
+same way; their landings are the rally ends that hit the floor, and candidates
+4-8 frames from a label are left out rather than called "neither".
 
 `train` fits scikit-learn's HistGradientBoostingClassifier and writes its trees
 as plain JSON that hits.HitClassifier evaluates with numpy. With --oof it also
@@ -29,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 SHIFT, TOL = -1, 3
+UNSURE = 8  # DShuttleNet: candidates TOL+1..UNSURE frames from a label are not used
 PARAMS = dict(max_iter=200, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=40, l2_regularization=1.0)
 
 
@@ -63,6 +66,9 @@ def clip_data(clip: Path, shuttle_suffix: str = ".shuttle.csv"):
     hits = np.array([to_clip[h] + SHIFT for h in doc["hits"] if h in to_clip and in_rally(h)])
     bounces = np.array([to_clip[f] + SHIFT for f in doc["events"].get("bounce", []) if f in to_clip])
     y = np.full(len(cands), 2)
+    # DShuttleNet labels every shot and its landings only approximately (scripts/dshuttlenet_hits.py):
+    # a candidate a few frames from a label is left out instead of being called "neither".
+    complete = "shots" in doc
     keep = np.zeros(len(cands), bool)
     for r, c in enumerate(cands):
         j = c["frame"]
@@ -71,6 +77,8 @@ def clip_data(clip: Path, shuttle_suffix: str = ".shuttle.csv"):
             y[r] = 0
         elif len(bounces) and np.abs(bounces - j).min() <= TOL:
             y[r] = 1
+        elif complete and any(len(e) and np.abs(e - j).min() <= UNSURE for e in (hits, bounces)):
+            keep[r] = False  # near a label but not within TOL: a hit labelled a few frames off?
     ctx = {"shuttle": shuttle, "players": players, "fps": fps, "frame_h": frame_h, "frame_w": frame_w,
            "cands": cands, "fmap": fmap, "rallies": rallies, "hits": hits, "match": doc["match"]}
     return X, y, keep, ctx

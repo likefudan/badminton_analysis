@@ -19,8 +19,8 @@ def _raw(tmp_path):
     raw.mkdir()
     _write(raw / "match.csv", ["match_id", "video_name", "event"], [[7, "X_vs_Y_Final", 1], [8, "Other", 2]])
     _write(raw / "set.csv", ["set_id", "match_id", "set_num"], [[1, 7, 1], [2, 7, 2], [3, 8, 1]])
-    _write(raw / "rally.csv", ["rally_id", "set_id", "rally_num", "start_frame", "end_frame"],
-           [[10, 1, 1, 100, 160], [11, 2, 1, 300, 340], [12, 3, 1, 900, 950]])
+    _write(raw / "rally.csv", ["rally_id", "set_id", "rally_num", "start_frame", "end_frame", "lose_reason"],
+           [[10, 1, 1, 100, 160, "Failed Return"], [11, 2, 1, 300, 340, "Net Fault "], [12, 3, 1, 900, 950, "Out of Bounds"]])
     head = ["shot_id", "rally_id", "shot_num", "start_frame_num", "end_frame_num", "player", "ball_type",
             "A", "B", "C", "D"] + [f"player_{k}_{c}" for k in "ABCD" for c in "xy"]
     pos = [20, 14, 40, 34, 25, 114, 45, 104]  # A, B near (small y), C, D far
@@ -51,6 +51,7 @@ def test_labels_writes_bfmd_compatible_rallies(tmp_path):
     assert doc["schema"] == D.SCHEMA and doc["event"] == "MD"
     assert doc["rallies"] == [[100, 160], [300, 340]] and doc["hits"] == [100, 120, 300]
     assert doc["shots"][1]["player"] == "D"
+    assert doc["events"] == {"bounce": [160]}  # the net fault is not a landing
 
 
 def test_label_hitters_by_position_and_scoring(tmp_path):
