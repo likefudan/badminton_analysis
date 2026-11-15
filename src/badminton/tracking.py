@@ -38,6 +38,7 @@ from .court import CourtCalibration
 
 MAX_SPEED = 8.0  # m/s: faster than any badminton player moves on court
 REACQUIRE_S = 3.0  # after this long without the player, take whoever step 1 found
+SETTLE_S = 0.3  # ...or sooner, once the same someone has been there this long: the video was cut
 SAME_PERSON_HIST = 0.25  # torso colour distance below which a far jump is still the same person
 BRIDGE_MAX_SPEED = 5.0  # m/s: a gap needing a faster run than this is not filled (likely two people)
 MAX_GAP_S = 0.8  # bridge missing / airborne stretches up to this long (a jump smash with take-off and landing ~0.7 s)
@@ -182,6 +183,22 @@ class _Live:
         self.last_t = None
         self.vel = np.zeros(2)
         self.hist = None
+        self.pending: list[tuple[int, int]] = []  # (frame row, detection) refused as "too far to be this player"
+        self.pending_xy = None
+        self.pending_t = self.pending_since = None
+
+    def refuse(self, i: int, p: int, xy, t: float) -> bool:
+        """Remember a detection that is too far away to be this player. True once the same
+        someone has been followed for SETTLE_S: then it is the player after an edit cut
+        (dead time cut out, rally clips), not a bystander picked for a few frames."""
+        if self.pending_xy is not None and \
+                np.linalg.norm(xy - self.pending_xy) > MAX_SPEED * (t - self.pending_t) + 0.5:
+            self.pending = []  # someone else again
+        if not self.pending:
+            self.pending_since = t
+        self.pending.append((i, p))
+        self.pending_xy, self.pending_t = np.asarray(xy, float), t
+        return t - self.pending_since >= SETTLE_S
 
     def predict(self, t: float) -> np.ndarray:
         dt = min(t - self.last_t, MAX_GAP_S)
@@ -219,7 +236,7 @@ def track_players(
     time_s = np.asarray(data["time_s"], float)
     F = len(time_s)
     valid, side, court_xy = data["valid"], data["side"], data["court_xy"]
-    cuts = np.zeros(F, bool) if cuts is None else np.asarray(cuts, bool)
+    cuts = np.zeros(F, bool) if cuts is None else np.array(cuts, bool)
     live: list[_Live] = []
     for i in range(F):
         t = time_s[i]
@@ -254,7 +271,15 @@ def track_players(
                             _hist_distance(tr.hist, feat) > SAME_PERSON_HIST:
                         # nobody runs that fast and the shirt does not match: someone else
                         # (step 1 picked a bystander while the player was missed)
-                        continue
+                        if not tr.refuse(i, p, court_xy[i, p], t):
+                            continue
+                        # ...unless they stay: the video was cut here and this is the player.
+                        # The frames refused meanwhile are given back.
+                        cuts[tr.pending[0][0]] = True
+                        for k, q in tr.pending[:-1]:
+                            tr.det[k] = q
+                        tr.last_xy, tr.vel = None, np.zeros(2)
+                tr.pending, tr.pending_xy = [], None
                 tr.det[i] = p
                 tr.update(court_xy[i, p], t, feat)
 

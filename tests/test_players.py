@@ -1,7 +1,7 @@
 import numpy as np
 
 from badminton.court import CourtCalibration
-from badminton.players import FAR, NEAR, court_box_filter, foot_points, select_players
+from badminton.players import FAR, NEAR, PlayerSelector, court_box_filter, foot_points, select_players
 from badminton.pose import PoseResult
 from conftest import H, W, fake_person, marker_pixels
 
@@ -69,3 +69,34 @@ def test_box_filter_drops_people_off_court_before_pose(camera):
     pose = make_pose(camera, [(1.5, 2.0), (4.5, 11.5), (-3.5, 4.0), (3.0, -4.0), (7.0, 12.0)])
     keep = court_box_filter(calib)(pose.bboxes)
     assert keep.tolist() == [True, True, False, False, True]
+
+
+def test_jumping_far_player_is_kept_where_they_stood(camera):
+    """A jump at the far baseline projects the feet metres behind it: off the court for the
+    floor homography. The player stood there a moment ago, so they are still a player."""
+    calib = CourtCalibration(marker_pixels(camera, SIX), (W, H))
+    standing = make_pose(camera, [(1.5, 3.0), (4.5, 4.0), (2.0, 9.0), (4.0, 12.9)])
+    b, k, s = fake_person(camera, 4.0, 12.9, lift=0.6)
+    jump = PoseResult(np.vstack([standing.bboxes[:3], b]), np.concatenate([standing.keypoints[:3], k[None]]),
+                      np.vstack([standing.scores[:3], s]))
+    assert calib.to_court(foot_points(jump))[3, 1] > 13.4 + 2.0  # beyond the end margin
+    assert len(select_players(jump, calib).pose) == 3  # frame by frame: dropped
+    select = PlayerSelector(calib)
+    assert len(select(standing, 0.0).pose) == 4
+    keep = select.box_filter()(jump.bboxes)
+    assert keep.all()
+    players = select(jump, 0.2)
+    assert len(players.pose) == 4 and players.airborne.tolist() == [False, False, False, True]
+    assert sorted(players.side.tolist()) == [NEAR, NEAR, FAR, FAR]
+    # long after anyone stood there, the same box is someone else
+    assert len(select(jump.select([3]), 5.0).pose) == 0
+
+
+def test_bystander_behind_the_court_is_not_a_jumper(camera):
+    """Someone further away whose box happens to overlap a player's is too small to be a
+    player in the air over our court."""
+    calib = CourtCalibration(marker_pixels(camera, SIX), (W, H))
+    select = PlayerSelector(calib)
+    select(make_pose(camera, [(3.0, 3.0), (3.0, 12.5)]), 0.0)
+    far_away = make_pose(camera, [(3.0, 3.0), (3.0, 22.0)])
+    assert len(select(far_away, 0.1).pose) == 1
