@@ -8,7 +8,8 @@ const Label = (() => {
   const CHUNK = 8;            // 一次请求取几帧
   const AHEAD = 3;            // 往后预取几个块
   const KEEP_BLOBS = 480;     // 压缩的图最多留多少张（整帧和原图局部一起算，约 60 MB）
-  const SNAP_PX = 16;         // 点在候选点这么近（屏幕像素）就吸到候选点上
+  const SNAP_PX = 22;         // 点在候选点 / 弱信号这么近（屏幕像素）就吸过去：手指点不准
+  const LOUPE_SNAP_PX = 20;   // 放大镜里同样（放大镜里的像素）
   const DRAG_PX = 8;          // 手指移动超过这么多算拖动，不算点
   const FINE = 0.3;           // 拖动时点移动的比例：手指走 10 像素，点走 3 像素
   const LOUPE_SPAN = 1 / 20;  // 放大镜里看到的宽度占视频宽度的比例（4K 里是 192 个像素）
@@ -475,6 +476,8 @@ const Label = (() => {
       g.strokeStyle = "rgba(255,255,255,.7)"; g.lineWidth = 1;
       for (const [x, y] of R.cand[L.i] || []) { g.beginPath(); g.arc(x * s, y * s, 7, 0, 7); g.stroke(); }
     }
+    // 热图弱信号：蓝色虚线小圈，点在附近就吸过去
+    drawWeak(g, (x, y) => [x * s, y * s], 6);
     // 模型的预测
     const p = R.pred[L.i];
     if (p[0]) ring(g, p[1] * s, p[2] * s, 12, "#ff8c00", 2.5);
@@ -493,6 +496,27 @@ const Label = (() => {
     pad(s);
     loupe(s, h);
     renderInfo();
+  }
+
+  // 这一帧可以「吸过去」的点：模型的候选点和热图弱信号（视频像素）
+  function snapTargets() {
+    const R = rally();
+    return [...((R.cand && R.cand[L.i]) || []), ...((R.weak && R.weak[L.i]) || [])];
+  }
+  function nearestTarget(x, y, maxDist) {
+    let best = null, bd = maxDist;
+    for (const [cx, cy] of snapTargets()) {
+      const d = Math.hypot(cx - x, cy - y);
+      if (d < bd) { bd = d; best = { x: cx, y: cy }; }
+    }
+    return best;
+  }
+  function drawWeak(g, at, r) {
+    const R = rally();
+    if (!R.weak) return;
+    g.strokeStyle = "rgba(90,200,250,.85)"; g.lineWidth = 1; g.setLineDash([2, 2]);
+    for (const [x, y] of R.weak[L.i] || []) { const [a, b] = at(x, y); g.beginPath(); g.arc(a, b, r, 0, 7); g.stroke(); }
+    g.setLineDash([]);
   }
 
   function ring(g, x, y, r, color, width) {
@@ -551,6 +575,7 @@ const Label = (() => {
       g.strokeStyle = "rgba(255,255,255,.6)"; g.lineWidth = 1;
       for (const [x, y] of R.cand[L.i] || []) { const [a, b] = at(x, y); g.beginPath(); g.arc(a, b, 9, 0, 7); g.stroke(); }
     }
+    drawWeak(g, at, 9);
     if (p[0]) { const [a, b] = at(p[1], p[2]); ring(g, a, b, 14, "#ff8c00", 2); }
     const lab = L.labels.get(frameOf(L.r, L.i));
     if (L.pending) { const [a, b] = at(L.pending.x, L.pending.y); cross(g, a, b, "#2f81f7"); }
@@ -752,13 +777,9 @@ const Label = (() => {
     if (t.dragging) return;
     const rect = $l("lCanvas").getBoundingClientRect(), s = layout().s;
     let x = (e.clientX - rect.left) / s, y = (e.clientY - rect.top) / s;
-    // 吸到最近的候选点
-    const R = rally();
-    let best = SNAP_PX / s;
-    for (const [cx, cy] of (R.cand && R.cand[L.i]) || []) {
-      const d = Math.hypot(cx - x, cy - y);
-      if (d < best) { best = d; x = cx; y = cy; }
-    }
+    // 吸到最近的候选点或弱信号
+    const snap = nearestTarget(x, y, SNAP_PX / s);
+    if (snap) ({ x, y } = snap);
     L.pending = { x, y };
     L.focus = { x, y };
     L.msg = "";
@@ -795,7 +816,8 @@ const Label = (() => {
     ltouch = null;
     if (t.dragging) { follow(L.pending); draw(); return; }
     const pt = loupePoint(e), [vw, vh] = L.state.video.size;
-    L.pending = { x: clamp(pt.x, 0, vw), y: clamp(pt.y, 0, vh) };
+    const snap = nearestTarget(pt.x, pt.y, LOUPE_SNAP_PX / pt.z);  // 放大镜里点在弱信号附近也吸过去
+    L.pending = snap || { x: clamp(pt.x, 0, vw), y: clamp(pt.y, 0, vh) };
     follow(L.pending);
     L.msg = "";
     draw();
