@@ -190,41 +190,60 @@ def read_prediction_csv(path: str | Path, n_frames: int | None = None) -> np.nda
     return rows_to_array(rows, n_frames)
 
 
-def save_predictions(path: str | Path, path_pred: np.ndarray, raw: np.ndarray | None, candidates: list | None) -> None:
-    """candidates: per frame an array (k, >=3) of x, y, peak in VIDEO pixels."""
+def _flat(per_frame: list) -> np.ndarray:
+    flat = [np.column_stack([np.full(len(c), f), np.asarray(c)[:, :3]]) for f, c in enumerate(per_frame) if len(c)]
+    return np.concatenate(flat) if flat else np.zeros((0, 4))
+
+
+def _unflat(flat: np.ndarray, frames: int) -> list:
+    out = [np.zeros((0, 3))] * frames
+    if len(flat):
+        fr = flat[:, 0].astype(int)
+        for f in np.unique(fr):
+            out[f] = flat[fr == f, 1:]
+    return out
+
+
+def save_predictions(path: str | Path, path_pred: np.ndarray, raw: np.ndarray | None, candidates: list | None,
+                     weak: list | None = None) -> None:
+    """candidates (and weak, the faint heatmap peaks): per frame an array (k, >=3) of x, y,
+    peak in VIDEO pixels."""
     data = {"path": path_pred}
     if raw is not None:
         data["raw"] = raw
     if candidates is not None:
-        flat = [np.column_stack([np.full(len(c), f), np.asarray(c)[:, :3]]) for f, c in enumerate(candidates) if len(c)]
-        data["cand"] = np.concatenate(flat) if flat else np.zeros((0, 4))
+        data["cand"] = _flat(candidates)
         data["cand_frames"] = np.array(len(candidates))
+    if weak is not None:
+        data["weak"] = _flat(weak)
+        data["weak_frames"] = np.array(len(weak))
     np.savez_compressed(path, **data)
 
 
 def load_predictions(path: str | Path):
     d = np.load(path)
     raw = d["raw"] if "raw" in d else None
-    cands = None
-    if "cand" in d:
-        cands = [np.zeros((0, 3))] * int(d["cand_frames"])
-        flat = d["cand"]
-        if len(flat):
-            fr = flat[:, 0].astype(int)
-            for f in np.unique(fr):
-                cands[f] = flat[fr == f, 1:]
+    cands = _unflat(d["cand"], int(d["cand_frames"])) if "cand" in d else None
     return d["path"], raw, cands
 
 
-def predict(video: str | Path, court: str | Path | None = None, tracknet_dir=None, progress=None):
+def load_weak(path: str | Path) -> list | None:
+    """The faint heatmap peaks saved with the predictions (None in older caches)."""
+    d = np.load(path)
+    return _unflat(d["weak"], int(d["weak_frames"])) if "weak" in d else None
+
+
+def predict(video: str | Path, court: str | Path | None = None, tracknet_dir=None, progress=None,
+            weak: list | None = None):
     """Run TrackNetV3 on the video: (path, raw, candidates) as save_predictions takes them.
-    With a court calibration the path uses the airspace mask as `badminton shuttle --court` does."""
+    With a court calibration the path uses the airspace mask as `badminton shuttle --court` does.
+    A list given as `weak` receives per frame the faint heatmap peaks (x, y, peak) in video pixels."""
     from .shuttle import HEIGHT, WIDTH, track_shuttle
     from .shuttle_path import rows_from_candidates
     from .video import probe
 
     info = probe(video)
-    debug: dict = {}
+    debug: dict = {"weak": []} if weak is not None else {}
     rows, tm = track_shuttle(video, tracknet_dir, progress=progress, debug=debug)
     calib = None
     if court:
@@ -239,6 +258,9 @@ def predict(video: str | Path, court: str | Path | None = None, tracknet_dir=Non
     sx, sy = info.width / WIDTH, info.height / HEIGHT
     cands = [np.column_stack([c[:, 0] * sx, c[:, 1] * sy, c[:, 2]]) if len(c) else np.zeros((0, 3))
              for c in debug["candidates"][:n]]
+    if weak is not None:
+        weak[:] = [np.column_stack([c[:, 0] * sx, c[:, 1] * sy, c[:, 2]]) if len(c) else np.zeros((0, 3))
+                   for c in debug["weak"][:n]]
     return rows_to_array(path_rows, n), rows_to_array(rows, n), cands
 
 
