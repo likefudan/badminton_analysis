@@ -23,7 +23,7 @@ fast wrist near the shuttle as well, but the same side cannot hit twice in a
 row. A kink with nobody within reach is the shuttle landing or a tracking
 error. The hitter is the player the chosen evidence belongs to.
 
-Two optional steps follow (docs/hits.md, BFMD 上的改进):
+Three optional steps follow (docs/hits.md, BFMD 上的改进):
 
   * a hit / bounce / neither classifier on each candidate (gradient-boosted
     trees trained on BFMD by scripts/train_hit_classifier.py, weights in the
@@ -33,6 +33,12 @@ Two optional steps follow (docs/hits.md, BFMD 上的改进):
     loses hits on phone recordings. Without the weights nothing changes.
   * refine_frames: each chosen hit moves (up to 2 frames at 30 fps) to where a
     once-bent line fits the shuttle track best.
+
+  * a side model (same kind of trees, trained on DShuttleNet by
+    scripts/train_side_model.py): which half of the court hit, from each half's
+    nearest wrist and from where the shuttle came and went along the court. It
+    takes evidence away from the half that does not look like the hitter, so a
+    missed hit no longer flips its neighbours through the alternation rule.
 
 Speeds and distances are in body heights of the player nearest to the shuttle
 (not pixels, not frames): the same stroke moves the shuttle fewer pixels on
@@ -85,6 +91,8 @@ REACH_BH = 1.3  # body heights: shuttle further than this from every wrist was n
 WRIST_SYNC_S = 0.1  # wrist peak and kink belong together within this
 W_KINK, W_WRIST, W_DIST, BIAS = 1.0, 0.5, 1.0, 0.8  # evidence weights, see evidence()
 W_MODEL = 2.0  # weight of the hit classifier's opinion, see evidence()
+W_SIDE = 1.0  # weight of the side model's opinion (which half of the court hit), see detect_hits()
+SIDE_S = 0.2  # the flight before / after a candidate is taken over this long for the side model
 KPT_THR = 0.3
 _WRISTS = (9, 10)
 
@@ -327,6 +335,9 @@ class Options:
     classifier: str = "bounce"  # how the hit / bounce / neither classifier is used: bounce, full, off
     model: "HitClassifier | None" = None  # its weights (run() loads them from the cache when None)
     w_model: float = W_MODEL  # see evidence()
+    side_model: "HitClassifier | None" = None  # which half hit (run() loads it from the cache when None)
+    w_side: float = W_SIDE  # see detect_hits()
+    use_side: bool = True  # False: ignore the side model even when its weights are there
     refine: bool = True  # move each chosen hit to where the track bends (refine_frames)
 
 
@@ -501,24 +512,24 @@ class HitClassifier:
     The file holds, per boosting round, one tree per class as flat arrays
     (feature, threshold, left, right, value, missing_left, leaf) plus a baseline."""
 
-    def __init__(self, doc: dict):
-        if not set(doc.get("features", [None])) <= set(FEATURES):
+    def __init__(self, doc: dict, features=FEATURES):
+        if not set(doc.get("features", [None])) <= set(features):
             raise ValueError("hit classifier was trained on other features")
         self.doc = doc
-        self.columns = np.array([FEATURES.index(f) for f in doc["features"]], int)
+        self.columns = np.array([list(features).index(f) for f in doc["features"]], int)
         self.baseline = np.asarray(doc["baseline"], float)
         self.trees = [[{k: np.asarray(v) for k, v in t.items()} for t in rnd] for rnd in doc["trees"]]
         self.classes = tuple(doc["classes"])
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> "HitClassifier | None":
-        """The model in `path` (default: the badminton cache folder), None if there is none."""
+    def load(cls, path: str | Path | None = None, file: str = HIT_MODEL_FILE, features=FEATURES) -> "HitClassifier | None":
+        """The model in `path` (default: `file` in the badminton cache folder), None if there is none."""
         if path is None:
             from .coreml_native import CACHE_DIR
 
-            path = CACHE_DIR / HIT_MODEL_FILE
+            path = CACHE_DIR / file
         try:
-            return cls(json.loads(Path(path).read_text()))
+            return cls(json.loads(Path(path).read_text()), features)
         except (OSError, ValueError, KeyError):
             return None
 
@@ -548,9 +559,62 @@ class HitClassifier:
         return e / e.sum(1, keepdims=True)
 
 
+# --- which half of the court hit (optional, weights outside the repo) -------------------------
+
+SIDE_MODEL_FILE = "hit_side_model.json"
+SIDE_FEATURES = ("dist_near", "dist_far", "wrist_near", "wrist_far", "along_in", "along_out")
+
+
+def court_axis(court) -> np.ndarray | None:
+    """Unit vector in the image that points from the near half to the far half along the
+    middle of the court (None without a calibration)."""
+    if court is None:
+        return None
+    from .court import NET_Y, WIDTH
+
+    a, b = court.to_image(np.array([[WIDTH / 2, NET_Y - 3.0], [WIDTH / 2, NET_Y + 3.0]]))
+    d = np.asarray(b, float) - np.asarray(a, float)
+    n = float(np.hypot(*d))
+    return d / n if n > 0 and np.isfinite(n) else None
+
+
+def side_features(cands: list[dict], shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
+                  frame_h: float, axis: np.ndarray) -> np.ndarray:
+    """(len(cands), len(SIDE_FEATURES)) numbers that tell which half of the court hit.
+
+    In the image a shuttle high above the near players is next to the far players'
+    hands as well, so "a wrist within reach" often holds for both halves. What tells
+    them apart: how near and how fast the nearest wrist of each half is, and where the
+    shuttle came from and goes to along the court (`axis`, court_axis): the half that
+    hits receives a shuttle flying towards it and sends it away. All in body heights
+    (mean of the tracked players, so the number does not depend on who is nearest)."""
+    xy = _interp_gaps(shuttle.xy, int(round(GAP_MAX_S * fps)))
+    n = len(xy)
+    d = max(1, int(round(SIDE_S * fps)))
+    bh = np.stack([p.body_h for p in players]) if players else np.zeros((0, n))
+    X = np.full((len(cands), len(SIDE_FEATURES)), np.nan)
+    for r, c in enumerate(cands):
+        i = c["frame"]
+        f = []
+        for s in (0, 1):
+            ks = [k for k, p in enumerate(players) if p.side == s]
+            k = min(ks, key=lambda k: c["dist_bh"][k], default=None)
+            f.append((min(c["dist_bh"][k], 5.0), c["wrist"][k]) if k is not None else (5.0, 0.0))
+        row = [f[0][0], f[1][0], f[0][1], f[1][1], np.nan, np.nan]
+        col = bh[:, i][np.isfinite(bh[:, i])] if len(bh) else np.zeros(0)
+        scale = float(col.mean()) if len(col) else REF_BH_FRAC * frame_h
+        if np.isfinite(xy[i, 0]):
+            if i - d >= 0 and np.isfinite(xy[i - d, 0]):
+                row[4] = float((xy[i] - xy[i - d]) @ axis) / scale
+            if i + d < n and np.isfinite(xy[i + d, 0]):
+                row[5] = float((xy[i + d] - xy[i]) @ axis) / scale
+        X[r] = row
+    return X
+
 
 def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float, frame_h: float,
-                opts: Options | None = None, frame_w: float | None = None, cands: list[dict] | None = None) -> list[dict]:
+                opts: Options | None = None, frame_w: float | None = None, cands: list[dict] | None = None,
+                axis: np.ndarray | None = None) -> list[dict]:
     """Hits as dicts (frame, evidence, hitter); see hits_json for the saved form.
 
     Picks the set of candidates with the largest total evidence such that two hits
@@ -574,13 +638,22 @@ def detect_hits(shuttle: ShuttleTrack, players: list[PlayerSignals], fps: float,
     rally_gap = RALLY_GAP_S * fps
     same_side = SAME_SIDE_MIN_S * fps
     sides = sorted({p.side for p in players}) or [None]
+    if (opts.use_side and opts.side_model is not None and axis is not None and sides == [0, 1] and cands
+            and "p_near" not in cands[0]):
+        for c, p in zip(cands, opts.side_model.proba(side_features(cands, shuttle, players, fps, frame_h, axis))[:, 0]):
+            c["p_near"] = float(p)
     # per candidate and side: the best player on that side and the evidence
     ev = []
     for c in cands:
         row = {}
         for s in sides:
             ks = [k for k, p in enumerate(players) if p.side == s] if s is not None else [None]
-            row[s] = max(((evidence(c, k, opts), k) for k in ks), key=lambda t: t[0])
+            e, k = max(((evidence(c, k, opts), k) for k in ks), key=lambda t: t[0])
+            if opts.use_side and s is not None and c.get("p_near") is not None:
+                # the side model only takes evidence away from the half it thinks did not
+                # hit: it settles who hit, it does not make a hit out of a weak candidate
+                e += opts.w_side * min(0.0, 2 * (c["p_near"] if s == 0 else 1 - c["p_near"]) - 1)
+            row[s] = (e, k)
         ev.append(row)
     # best[j][s]: largest total of a selection whose last hit is candidate j by side s
     n = len(cands)
@@ -827,10 +900,14 @@ def run(shuttle_csv, skeleton_npz, court=None, players_per_side: int = 1, opts: 
     opts = opts or Options()
     if opts.classifier != "off" and opts.model is None:
         opts = replace(opts, model=HitClassifier.load())
-    hits = drop_lone_hits(detect_hits(shuttle, players, fps, frame_h, opts, float(data["frame_size"][0])), fps)
+    if opts.use_side and opts.side_model is None:
+        opts = replace(opts, side_model=HitClassifier.load(file=SIDE_MODEL_FILE, features=SIDE_FEATURES))
+    hits = drop_lone_hits(detect_hits(shuttle, players, fps, frame_h, opts, float(data["frame_size"][0]),
+                                      axis=court_axis(court)), fps)
     if opts.refine:
         hits = refine_frames(hits, shuttle, fps)
-    return hits, {"fps": fps, "model": opts.model if opts.classifier != "off" else None, "frame_h": frame_h, "shuttle": shuttle, "players": players, "tracking": tracking,
+    return hits, {"fps": fps, "model": opts.model if opts.classifier != "off" else None,
+                  "side_model": opts.side_model if opts.use_side else None, "frame_h": frame_h, "shuttle": shuttle, "players": players, "tracking": tracking,
                   "stride": int(np.median(np.diff(data["frame"]))) if len(data["frame"]) > 1 else 1}
 
 
