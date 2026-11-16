@@ -218,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="击球/落地分类器（权重在 ~/.cache/badminton/hit_classifier.json，没有就不用）：bounce 只压低像落地的候选"
                         "（默认，各种画面都不变差），full 按击球概率加减分（转播画面上更准，手机录像上会漏拍），off 不用")
     s.add_argument("--no-refine", action="store_true", help="不按球轨迹折点微调击球帧")
+    s.add_argument("--no-side-model", action="store_true",
+                   help="不用「哪一边打的」模型（权重在 ~/.cache/badminton/hit_side_model.json，没有就不用），只靠轮流击球判断上下半场")
     s.add_argument("--labels", help="人工标注的击球 CSV（Frame, Player, Note），给了就报告准确率、召回率和 F1")
     s.add_argument("--manual", help="人工核对过的击球 CSV：不做识别，直接写成来源为「人工」的击球文件")
 
@@ -925,7 +927,8 @@ def cmd_hits(a) -> int:
     names = json.loads(names_path.read_text()) if names_path.exists() else {}
     per_side = 1 if a.singles else _players_per_side(data_path)
     hits, ctx = H.run(shuttle_path, data_path, CourtCalibration.load(a.court), per_side,
-                      H.Options(use_wrist=not a.no_wrist, classifier=a.classifier, refine=not a.no_refine), names)
+                      H.Options(use_wrist=not a.no_wrist, classifier=a.classifier, refine=not a.no_refine,
+                                use_side=not a.no_side_model), names)
     fps = ctx["fps"]
     if a.classifier != "off" and ctx["model"] is None:
         print(f"没有击球分类器权重（{H.HIT_MODEL_FILE}），按不用分类器识别；训练方法见 scripts/train_hit_classifier.py")

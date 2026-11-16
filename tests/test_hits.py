@@ -279,3 +279,58 @@ def test_bounce_mode_only_takes_evidence_away():
     always_hit = H.HitClassifier(_stump("kink", 1e9, left=(5.0, 0.0, 0.0), right=(5.0, 0.0, 0.0)))
     same = frames(H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(model=always_hit)))
     assert same == base  # bounce mode ignores P(hit)
+
+
+UP = np.array([0.0, -1.0])  # court_axis of a camera behind the near baseline: far is up in the image
+
+
+def _side_stump(feature, thr, left, right):
+    """A side model of one tree: logit of "near" is `left` at or below `thr` (and when unknown), else `right`."""
+    k = H.SIDE_FEATURES.index(feature)
+    tree = {"feature": [k, 0, 0], "threshold": [thr, 0, 0], "left": [1, 0, 0], "right": [2, 0, 0],
+            "value": [0.0, left, right], "missing_left": [1, 0, 0], "leaf": [0, 1, 1]}
+    return H.HitClassifier({"features": list(H.SIDE_FEATURES), "classes": ["near", "far"], "baseline": [0.0],
+                            "trees": [[tree]]}, H.SIDE_FEATURES)
+
+
+def test_side_features_follow_the_flight_along_the_court():
+    sh, pl = track(rally()), players()
+    cands = [c for c in H.candidates(sh, pl, FPS, FRAME_H, H.Options()) if min(abs(c["frame"] - f) for f in HIT_FRAMES) <= 1]
+    X = H.side_features(cands, sh, pl, FPS, FRAME_H, UP)
+    assert X.shape == (len(cands), len(H.SIDE_FEATURES))
+    a_in, a_out = H.SIDE_FEATURES.index("along_in"), H.SIDE_FEATURES.index("along_out")
+    near = np.array([min(range(len(HIT_FRAMES)), key=lambda k: abs(HIT_FRAMES[k] - c["frame"])) % 2 == 0 for c in cands])
+    # the near half receives a shuttle flying towards it (down the image) and sends it away; the
+    # far half's shuttle comes down out of its arc and goes up into the next, so it moves little
+    assert X[near, a_in].max() < X[~near, a_in].min() and X[near, a_out].min() > X[~near, a_out].max()
+    assert (X[near, a_in] < -0.5).all() and (X[near, a_out] > 0.5).all()
+
+
+def test_court_axis_points_from_the_near_half_to_the_far_half():
+    class Court:
+        def to_image(self, xy):  # a camera behind the near baseline: far (larger y) is higher in the image
+            return np.stack([100 * xy[:, 0], 1000 - 50 * xy[:, 1]], 1)
+
+    assert np.allclose(H.court_axis(Court()), UP)
+    assert H.court_axis(None) is None
+
+
+def test_side_model_settles_who_hit_but_makes_no_hits():
+    sh, pl = track(rally()), players()
+    base = H.detect_hits(sh, pl, FPS, FRAME_H)
+    right = _side_stump("along_out", 0.5, left=-4.0, right=4.0)  # near iff the shuttle leaves fast towards the far half
+    with_model = H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(side_model=right), axis=UP)
+    assert [(h["frame"], h["side"]) for h in with_model] == [(h["frame"], h["side"]) for h in base]
+    # a model that is sure of the opposite takes every hit's evidence away from the half that hit:
+    # nothing is added, and what is left has less evidence
+    wrong = _side_stump("along_out", 0.5, left=4.0, right=-4.0)
+    hurt = H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(side_model=wrong, w_side=1.0), axis=UP)
+    assert len(hurt) <= len(base) and sum(h["evidence"] for h in hurt) < sum(h["evidence"] for h in base)
+    # switched off, or without a calibration, the model is not asked
+    for kw, ax in ((dict(side_model=wrong, use_side=False), UP), (dict(side_model=wrong), None)):
+        off = H.detect_hits(sh, pl, FPS, FRAME_H, H.Options(**kw), axis=ax)
+        assert [(h["frame"], h["side"]) for h in off] == [(h["frame"], h["side"]) for h in base]
+
+
+def test_side_model_file_is_optional(tmp_path):
+    assert H.HitClassifier.load(tmp_path / "none.json", features=H.SIDE_FEATURES) is None
