@@ -23,7 +23,7 @@ fast wrist near the shuttle as well, but the same side cannot hit twice in a
 row. A kink with nobody within reach is the shuttle landing or a tracking
 error. The hitter is the player the chosen evidence belongs to.
 
-Two optional steps follow (docs/hits.md, BFMD 上的改进):
+Three optional steps follow (docs/hits.md, BFMD 上的改进):
 
   * a hit / bounce / neither classifier on each candidate (gradient-boosted
     trees trained on BFMD by scripts/train_hit_classifier.py, weights in the
@@ -33,6 +33,12 @@ Two optional steps follow (docs/hits.md, BFMD 上的改进):
     loses hits on phone recordings. Without the weights nothing changes.
   * refine_frames: each chosen hit moves (up to 2 frames at 30 fps) to where a
     once-bent line fits the shuttle track best.
+
+  * a side model (same kind of trees, trained on DShuttleNet by
+    scripts/train_side_model.py): which half of the court hit, from each half's
+    nearest wrist and from where the shuttle came and went along the court. It
+    takes evidence away from the half that does not look like the hitter, so a
+    missed hit no longer flips its neighbours through the alternation rule.
 
 Speeds and distances are in body heights of the player nearest to the shuttle
 (not pixels, not frames): the same stroke moves the shuttle fewer pixels on
