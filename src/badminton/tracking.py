@@ -38,7 +38,7 @@ from .court import CourtCalibration
 
 MAX_SPEED = 8.0  # m/s: faster than any badminton player moves on court
 REACQUIRE_S = 3.0  # after this long without the player, take whoever step 1 found
-SETTLE_S = 0.3  # ...or sooner, once the same someone has been there this long: the video was cut
+SETTLE_S = 0.3  # ...or sooner, once the same someone has been there this long and the other players jumped too: the video was cut
 SAME_PERSON_HIST = 0.25  # torso colour distance below which a far jump is still the same person
 BRIDGE_MAX_SPEED = 5.0  # m/s: a gap needing a faster run than this is not filled (likely two people)
 MAX_GAP_S = 0.8  # bridge missing / airborne stretches up to this long (a jump smash with take-off and landing ~0.7 s)
@@ -186,6 +186,7 @@ class _Live:
         self.pending: list[tuple[int, int]] = []  # (frame row, detection) refused as "too far to be this player"
         self.pending_xy = None
         self.pending_t = self.pending_since = None
+        self.settled_t = None  # when this track was last taken up again after a cut
 
     def refuse(self, i: int, p: int, xy, t: float) -> bool:
         """Remember a detection that is too far away to be this player. True once the same
@@ -273,7 +274,17 @@ def track_players(
                         # (step 1 picked a bystander while the player was missed)
                         if not tr.refuse(i, p, court_xy[i, p], t):
                             continue
-                        # ...unless they stay: the video was cut here and this is the player.
+                        # ...unless they stay and the others moved off at the same moment too:
+                        # the video was cut here and this is the player. (One track alone is
+                        # a bystander picked for a while, or a jump projected metres away.)
+                        since = tr.pending_since
+                        others = [o for o in live if o is not tr and o.last_t is not None]
+                        moved = [(bool(o.pending) and o.pending_t >= since) or
+                                 (o.settled_t is not None and o.settled_t >= since) for o in others]
+                        carried_on = sum(o.last_t >= since and not m for o, m in zip(others, moved))
+                        if not any(moved) or carried_on > (len(others) - 1) // 2:
+                            continue
+                        tr.settled_t = t
                         # The frames refused meanwhile are given back.
                         cuts[tr.pending[0][0]] = True
                         for k, q in tr.pending[:-1]:
