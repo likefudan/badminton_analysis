@@ -175,3 +175,30 @@ def test_person_parked_behind_the_baseline_is_not_the_player(camera):
     assert np.isnan(far_track.xy[16:39]).all()
     stats = player_stats(far_track, t, np.ones(F, bool), [(0, F)])
     assert stats.max_speed_mps < 1.0
+
+
+def test_players_are_taken_up_again_soon_after_an_edit_cut():
+    """A rally clip puts both players somewhere else from one frame to the next. They did not
+    "run impossibly fast": after SETTLE_S of the same someone standing there, that is the player,
+    and the frames refused meanwhile are given back."""
+    from badminton.tracking import SETTLE_S, track_players
+
+    fps, F = 30.0, 90
+    xy = np.zeros((F, 2, 2))
+    xy[:45, 0], xy[:45, 1] = (1.5, 2.0), (4.5, 5.0)
+    xy[45:, 0], xy[45:, 1] = (5.5, 0.5), (0.5, 5.5)  # after the cut: both far from where anyone stood
+    data = {"time_s": np.arange(F) / fps, "frame": np.arange(F), "valid": np.ones((F, 2), bool),
+            "side": np.zeros((F, 2), int), "court_xy": xy}
+    tr = track_players(data, None, 2)
+    assert len(tr.tracks) == 2
+    for t in tr.tracks:
+        assert t.seen.all()  # nothing lost, not even the SETTLE_S of waiting
+        assert np.isfinite(t.xy[60:]).all()
+    assert tr.cuts[45] and tr.cuts.sum() == 1
+    # a bystander picked for less than SETTLE_S is still refused
+    xy2 = np.zeros((F, 1, 2)) + (3.0, 3.0)
+    xy2[40:40 + int(SETTLE_S * fps) - 2, 0] = (3.0, -1.5)
+    data2 = {"time_s": np.arange(F) / fps, "frame": np.arange(F), "valid": np.ones((F, 1), bool),
+             "side": np.zeros((F, 1), int), "court_xy": xy2}
+    t = track_players(data2, None, 1).tracks[0]
+    assert not t.seen[40:40 + int(SETTLE_S * fps) - 2].any() and t.seen[:40].all()

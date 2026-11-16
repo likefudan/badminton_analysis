@@ -17,9 +17,10 @@ The rally clip is the one scripts/bfmd_hits.py makes, so the steps are:
 `score` reports, besides the moment (±3 and ±6 frames, as bfmd_hits), how
 often the hitter is right for the hits found within the first tolerance: the
 side (near / far half of the court) and the person. Our hitter is a track id;
-it is turned into A/B/C/D by where that player stands at the hit (feet on the
-court through our calibration) against where the labels put the four players
-at the nearest labelled shot.
+it is turned into A/B/C/D by where the tracked players of that half stand at
+the hit against where the labels put the two players of that half at the
+nearest labelled shot (paired, see pair_letters; --by-feet for the older
+nearest-to-the-box-bottom rule).
 
 The downloaded files are untrusted data: this only reads CSV.
 """
@@ -148,6 +149,75 @@ def track_feet(clip: Path) -> dict[int, np.ndarray]:
     return out
 
 
+def track_ground(clip: Path) -> dict[int, dict]:
+    """Per tracked player: side (0 near, 1 far) and the floor position (metres) per clip frame, with
+    airborne frames bridged as the tracker does (a jump projects the feet metres away from the player)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from badminton.court import CourtCalibration
+    from badminton.tracking import load_npz, track_players
+
+    data = load_npz(clip.with_suffix(".skeleton.npz"))
+    court = CourtCalibration.load(clip.with_suffix(".court.json"))
+    frames = np.asarray(data["frame"], int)
+    n = int(frames[-1]) + 1
+    out = {}
+    for t in track_players(data, court, 2).tracks:
+        xy = np.full((n, 2), np.nan)
+        raw = np.full((n, 2), np.nan)
+        xy[frames], raw[frames] = t.xy, t.raw_xy
+        out[t.id] = {"side": t.side, "xy": xy, "raw": raw}
+    return out
+
+
+def _position(tr: dict, j: int, reach: int = 8):
+    """The track's floor position at clip frame j: the cleaned one, else the nearest within `reach`
+    frames, else as detected."""
+    for a in (tr["xy"], tr["raw"]):
+        lo, hi = max(0, j - reach), min(len(a), j + reach + 1)
+        ok = np.flatnonzero(np.isfinite(a[lo:hi]).all(1))
+        if len(ok):
+            return a[lo + ok[np.abs(lo + ok - j).argmin()]]
+    return None
+
+
+def pair_letters(tracks: dict, j: int, positions: dict, max_dist: float = 4.0) -> dict[int, str]:
+    """Which labelled player each track is at clip frame j: {track id: letter}.
+
+    On each half the tracks and the labelled players of that half are paired so that the
+    distances add up to the least; two partners are told apart by how they stand to each other,
+    so one of them being a metre or two off (a jump, a lunge, the label's own error) does
+    not hand them the partner's letter. A track further than `max_dist` from its letter gets none."""
+    from itertools import permutations
+
+    from badminton.court import NET_Y
+
+    out = {}
+    for side in (0, 1):
+        letters = [k for k, p in positions.items() if (p[1] >= NET_Y) == bool(side)]
+        here = [(i, _position(t, j)) for i, t in tracks.items() if t["side"] == side]
+        here = [(i, p) for i, p in here if p is not None]
+        if not letters or not here:
+            continue
+        here = here[:len(letters)] if len(here) > len(letters) else here
+        best = min(permutations(letters, len(here)),
+                   key=lambda perm: sum(np.hypot(*(p - np.array(positions[k]))) for (_, p), k in zip(here, perm)))
+        for (i, p), k in zip(here, best):
+            if np.hypot(*(p - np.array(positions[k]))) <= max_dist:
+                out[i] = k
+    return out
+
+
+def label_hitters_paired(dets: list[dict], shots: list[dict], tracks: dict) -> None:
+    """Fill each detection's `letter` from pair_letters at the labelled shot nearest in time."""
+    frames = np.array([s["frame"] for s in shots]) if shots else np.zeros(0, int)
+    for d in dets:
+        d["letter"], d["letter_dist"] = None, None
+        if not len(frames) or d.get("track") not in tracks:
+            continue
+        s = shots[int(np.abs(frames - d["frame"]).argmin())]
+        d["letter"] = pair_letters(tracks, d["clip_frame"], s["positions"]).get(d["track"])
+
+
 def nearest_letter(xy, positions: dict) -> tuple[str | None, float]:
     """Which labelled player (A–D) stands nearest to `xy` (metres), and how far (m)."""
     if xy is None or not np.isfinite(xy).all() or not positions:
@@ -202,14 +272,17 @@ def detections(clip: Path) -> list[dict]:
     return out
 
 
-def score_match(clip: Path, tols=(3, 6), shift: int = 0) -> dict:
+def score_match(clip: Path, tols=(3, 6), shift: int = 0, by_feet: bool = False) -> dict:
     res = B.score_match(clip, tols, shift)
     side = json.loads(clip.with_suffix(".framemap.json").read_text())
     doc = json.loads(Path(side["rallies_json"]).read_text())
     rallies = doc["rallies"]
     dets = [d for d in detections(clip) if B.in_spans(d["frame"], rallies, max(tols))]
     shots = [s for s in doc["shots"] if B.in_spans(s["frame"], rallies)]
-    label_hitters(dets, shots, track_feet(clip))
+    if by_feet:
+        label_hitters(dets, shots, track_feet(clip))
+    else:
+        label_hitters_paired(dets, shots, track_ground(clip))
     labels = [{"frame": s["frame"] + shift, "side": s["side"], "letter": s["player"]} for s in shots]
     res["event"] = doc.get("event", "")
     res["hitter"] = hitter_scores(dets, labels, tols[0])
@@ -220,7 +293,7 @@ def score_match(clip: Path, tols=(3, 6), shift: int = 0) -> dict:
 
 def cmd_score(a) -> int:
     tols = tuple(int(t) for t in a.tol.split(","))
-    rows = [score_match(Path(c), tols, a.shift) for c in a.clips]
+    rows = [score_match(Path(c), tols, a.shift, a.by_feet) for c in a.clips]
 
     def prf(c):
         p = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
@@ -271,6 +344,9 @@ def main(argv=None) -> int:
     s.add_argument("clips", nargs="+", help="bfmd_hits clip 输出的视频（旁边要有 framemap、court、skeleton、hits）")
     s.add_argument("--tol", default="3,6")
     s.add_argument("--shift", type=int, default=0, help="标注帧号整体加几帧再比")
+    s.add_argument("--by-feet", action="store_true",
+                   help="击球人按击球那一帧框底的位置找最近的标注球员（旧算法：起跳时脚的投影会偏出几米）；"
+                        "默认把同一边的两条轨迹和两名标注球员成对配")
     s.add_argument("--json", help="另存逐场结果")
     a = p.parse_args(argv)
     return {"labels": cmd_labels, "score": cmd_score}[a.cmd](a)

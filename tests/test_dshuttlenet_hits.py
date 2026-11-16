@@ -75,3 +75,23 @@ def test_nearest_letter_gives_up_without_a_position():
     assert D.nearest_letter(np.array([np.nan, 1.0]), {"A": (0, 0)}) == (None, float("inf"))
     k, d = D.nearest_letter(np.array([1.0, 1.0]), {"A": (0, 0), "B": (1, 2)})
     assert k == "B" and d == 1.0
+
+
+def test_pair_letters_tells_partners_apart_when_one_is_off():
+    """The far back player jumps: the feet project 3 m behind where the label has them, nearer
+    to nobody. Paired with the partner, each track still gets its own letter."""
+    positions = {"A": (2.0, 1.4), "B": (4.0, 3.4), "C": (2.5, 11.4), "D": (4.5, 8.0)}
+
+    def track(side, x, y):
+        return {"side": side, "xy": np.full((10, 2), np.nan), "raw": np.tile([[x, y]], (10, 1)).astype(float)}
+
+    tracks = {1: track(0, 2.1, 1.5), 2: track(0, 4.2, 3.0), 3: track(1, 4.4, 8.3), 4: track(1, 2.8, 14.6)}
+    assert D.pair_letters(tracks, 5, positions) == {1: "A", 2: "B", 3: "D", 4: "C"}
+    # by the feet alone the jumper is more than 2 m from everyone: no letter
+    assert D.nearest_letter(np.array([2.8, 14.6]), positions)[1] > 2.0
+    # the cleaned floor position wins over the detection, and a lone track takes the nearer letter
+    tracks[4]["xy"][3] = (2.6, 11.0)
+    assert D._position(tracks[4], 5).tolist() == [2.6, 11.0]
+    assert D.pair_letters({4: tracks[4]}, 5, positions) == {4: "C"}
+    # somewhere else entirely (a replay): nobody
+    assert D.pair_letters({4: track(1, 30.0, 40.0)}, 5, positions) == {}
