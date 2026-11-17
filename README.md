@@ -556,6 +556,8 @@ badminton strokes match.mp4 --court match.court.json --hits match.hits.json
 
 ## 许可证说明
 
+本仓库的代码采用 [Apache-2.0](LICENSE) 许可证，第三方声明见 [NOTICE](NOTICE)。
+
 羽毛球轨迹用的是 [TrackNetV3](https://github.com/qaz812345/TrackNetV3)（Chen & Wang，代码和权重都是 MIT 许可证）。它的代码和权重不在本仓库里；`shuttle.py` 按它的 `predict.py` 重写了推理流程，转换出来的 Core ML 模型只缓存在本机。
 
 检测和姿态模型来自 [rtmlib](https://github.com/Tau-J/rtmlib)（Apache-2.0）：人体检测用的是它自带的 YOLOX（Megvii，Apache-2.0，在 COCO + HumanArt 上训练），姿态用 RTMPose。方案里写的是 RTMDet，两者都是 Apache-2.0；rtmlib 的现成模型配的是 YOLOX，先用它，远端漏检多再换。
