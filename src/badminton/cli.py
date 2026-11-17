@@ -241,13 +241,31 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-video", action="store_true", help="不输出带类型标签的视频")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
+    s = sub.add_parser("technique", help="按击球类型量动作：击球点、发力顺序、转体、起跳、步幅等（要先跑 strokes）")
+    s.add_argument("video")
+    s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+    s.add_argument("--strokes", help="badminton strokes 输出的 strokes.json，默认 <视频名>.strokes.json")
+    s.add_argument("--data", help="skeleton 生成的 .npz（逐帧），默认 <视频名>.skeleton.npz")
+    s.add_argument("--singles", action="store_true", help="单打：每边 1 人（要和跑 strokes 时一样）")
+    s.add_argument("--sides", default="near", choices=["near", "far", "both"],
+                   help="分析哪边的球员，默认 near（远端人太小，姿态不准）")
+    s.add_argument("--include-review", action="store_true", help="类型没把握的击球也算")
+    s.add_argument("--reference", help="technique-ref 生成的参考分布（比如职业比赛）；给了就标出偏离参考的数")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+
+    s = sub.add_parser("technique-ref", help="把多个 technique.json 合成参考分布（每种球每个指标的百分位）")
+    s.add_argument("output", help="输出的参考 JSON")
+    s.add_argument("inputs", nargs="+", help="badminton technique 输出的 *.technique.json")
+    s.add_argument("--min-n", type=int, default=10, help="一个指标至少要这么多拍才进参考，默认 10")
+
     a = p.parse_args(argv)
     return {"info": cmd_info, "hits": cmd_hits, "sdr": cmd_sdr, "calibrate": cmd_calibrate,
             "skeleton": cmd_skeleton, "bench": cmd_bench, "profile": cmd_profile,
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "annotate-strokes": cmd_annotate_strokes, "positioning": cmd_positioning,
-            "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes}[a.cmd](a)
+            "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes,
+            "technique": cmd_technique, "technique-ref": cmd_technique_ref}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -1025,6 +1043,56 @@ def cmd_strokes(a) -> int:
         mp4 = out_dir / f"{video.stem}.strokes.mp4"
         ST.draw_video(video, mp4, results, ctx["data"], ctx["tracking"])
         print(f"已写入 {mp4}（击球人头顶写类型；灰字带问号的是没把握的）")
+    return 0
+
+
+def cmd_technique(a) -> int:
+    from . import technique as TQ
+    from .court import CourtCalibration
+
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    data_path = Path(a.data) if a.data else video.with_suffix(".skeleton.npz")
+    strokes_path = Path(a.strokes) if a.strokes else out_dir / f"{video.stem}.strokes.json"
+    for path, how in ((data_path, "badminton skeleton --stride 1"), (strokes_path, "badminton strokes")):
+        if not path.exists():
+            raise SystemExit(f"找不到 {path}：先运行 {how}")
+    reference = json.loads(Path(a.reference).read_text()) if a.reference else None
+    sides = ("near", "far") if a.sides == "both" else (a.sides,)
+    per_side = 1 if a.singles else _players_per_side(data_path)
+    results, fps = TQ.run(data_path, strokes_path, CourtCalibration.load(a.court), per_side, sides,
+                          a.include_review, reference)
+    doc = TQ.technique_json(results, fps, str(video), {"skeleton": str(data_path), "strokes": str(strokes_path)},
+                            a.reference)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{video.stem}.technique.json"
+    out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    TQ.write_csv(results, out.with_suffix(".csv"))
+    ok = [r for r in results if r["ok"]]
+    print(f"{len(results)} 拍进了分析（{'、'.join(sides)}），{len(ok)} 拍关节看得清、算出了指标")
+    for g, gd in doc["summary"].items():
+        print(f"  {g}：{gd['n']} 拍")
+        for pid, pd in gd["players"].items():
+            who = pd["name"] or f"球员 {pid}"
+            parts = [f"{TQ.METRIC_NAMES[k].split('（')[0]} {pd[k]['mean']:.2f}±{pd[k]['std']:.2f}"
+                     for k in ("contact_height", "wrist_speed", "turn", "jump", "stance") if k in pd]
+            if "chain_order_ok_share" in pd:
+                parts.append(f"发力顺序对 {pd['chain_order_ok_share']:.0%}")
+            print(f"    {who}（{pd['n']} 拍）：" + "，".join(parts))
+    print(f"已写入 {out}、{out.with_suffix('.csv').name}")
+    return 0
+
+
+def cmd_technique_ref(a) -> int:
+    from . import technique as TQ
+
+    docs = [json.loads(Path(p).read_text()) for p in a.inputs]
+    ref = TQ.build_reference(docs, a.min_n)
+    Path(a.output).write_text(json.dumps(ref, ensure_ascii=False, indent=1))
+    for g, ms in ref["groups"].items():
+        n = max((m["n"] for m in ms.values()), default=0)
+        print(f"  {g}：{n} 拍，{len(ms)} 个指标")
+    print(f"已写入 {a.output}")
     return 0
 
 

@@ -511,6 +511,11 @@ badminton strokes match.mp4 --court match.court.json --hits match.hits.json
 
 给每拍写出击球人和技术类型（杀球、点杀、吊球、过渡吊球、放网、勾对角、推球、扑球、挑球、高远球、平高球、平抽、挡网、发球等），附带直线/对角，输出 `match.strokes.json`、`.csv` 和带标签的 `match.strokes.mp4`。单打和双打都能用。主类型来自 BST 模型（需要另外下载权重），直线/对角和平高/高远是按下一拍击球人的位置推算的。还没有人工标注，所以没有准确率数字；劈杀、劈吊、收吊、搓球要等有了标注再做。双打另有一个用 DShuttleNet 训练的 9 类模型（`--doubles-model auto`，默认不开）：转播双打上判对 79%，BST 是 67%；手机录像上还没看出更好。说明见 [docs/stroke_types.md](docs/stroke_types.md)。
 
+## 击球动作指标（技术分析第 1 阶段）
+
+`badminton technique VIDEO --court VIDEO.court.json` 在击球类型的基础上，给近端球员每一拍量击球点高度、发力顺序、转体、起跳、随挥、步幅等，
+写成 `VIDEO.technique.json` 和 `.csv`；`badminton technique-ref` 把多段视频合成参考分布。详见 [docs/technique.md](docs/technique.md)。
+
 ## 代码结构
 
 | 文件 | 内容 |
