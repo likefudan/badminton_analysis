@@ -79,3 +79,25 @@ def test_path_keeps_this_courts_flight_over_a_brighter_one_next_door():
     assert on_ours.mean() > 0.9
     assert seen[90:].sum() < 5                              # only the next court is playing
 
+
+
+def test_next_courts_rally_between_two_of_ours_is_dropped():
+    """This court waits for a serve while a court further back rallies, and the path joins that rally
+    to ours into one stretch: the part between our flights is dropped when it holds enough flights
+    surely above another court; a short excursion and our own flights stay."""
+    from badminton.shuttle_tracks import drop_away_chains
+
+    def track(f0, n, x0):
+        f = np.arange(f0, f0 + n, dtype=float)
+        return np.c_[f, np.zeros(n), x0 + 10 * (f - f0), 500 + 0 * f, np.full(n, 0.8)]
+
+    tracks = [track(0, 40, 100), track(40, 20, 600), track(60, 20, 900), track(80, 10, 1300), track(90, 40, 1500)]
+    weights = np.array([1.0, 0.15, 0.15, 0.15, 1.0])
+    sure = np.array([False, True, True, False, False])
+    rows = [(int(f), 1, int(x), int(y)) for t in tracks for f, _, x, y, _ in t]
+    out = drop_away_chains(rows, tracks, weights, sure=sure)
+    seen = np.array([r[1] for r in out])
+    assert seen[:40].all() and seen[90:].all()                 # ours
+    assert not seen[40:90].any()                               # 40 points surely elsewhere in between
+    out = drop_away_chains(rows[:60] + [(f, 1, 0, 0) for f in range(60, 90)] + rows[90:], tracks, weights, sure=sure)
+    assert np.array([r[1] for r in out])[40:60].all()          # only 20 points elsewhere: kept

@@ -45,7 +45,7 @@ CROP_QUALITY = 90
 RALLIES = 3           # how many rallies to offer
 MAX_RALLY_S = 20.0    # longer rallies only when there are not enough short ones (a phone labels ~1 frame/s)
 MAX_FRAMES = 3600     # all chosen rallies together
-PREDICT_VERSION = "4"  # raise when the path selection (or what is cached) changes, so cached predictions are redone
+PREDICT_VERSION = "5"  # raise when the path selection (or what is cached) changes, so cached predictions are redone
 WEAK_PER_FRAME = 6     # faint heatmap peaks per frame in state.json (label.js looks there near the last label)
 
 
