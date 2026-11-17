@@ -182,3 +182,17 @@ def test_flight_over_another_court_is_dropped():
     seen = np.array([r[1] for r in rows])
     assert seen[5:5 + len(ours)].all()                     # this court's clear, top included
     assert seen[70:70 + len(theirs)].sum() < 0.2 * len(theirs)
+
+
+def test_short_clip_flight_is_not_static():
+    """5 % of a 4-second clip is a few frames: a shuttle hanging near the top of a lob would make
+    its cell "static" without the one-second minimum (IMG_0995 lost 31 % of its flying frames)."""
+    from badminton.shuttle_path import static_map, static_min_count
+
+    cands = [np.zeros((0, 3)) for _ in range(120)]
+    for f in range(40, 52):                                # 12 frames (10 %) in one cell
+        cands[f] = np.array([[100.0 + 0.1 * f, 50.0, 0.8]])
+    assert static_map(cands)[50 // 8, 104 // 8]
+    assert not static_map(cands, min_count=static_min_count(30.0)).any()
+    lamp = [np.array([[300.0, 20.0, 0.6]]) for _ in range(120)]
+    assert static_map(lamp, min_count=static_min_count(30.0))[20 // 8, 300 // 8]

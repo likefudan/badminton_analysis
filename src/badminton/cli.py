@@ -96,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--overlay", action="store_true", help="同时输出画了轨迹的视频 <视频名>.shuttle.mp4")
     s.add_argument("--court", help="球场标定：给了就用改进的选点（去掉静止干扰点、场地上方空间、按轨迹连续性挑点）")
     s.add_argument("--raw-output", help="另存 TrackNetV3 原版逐帧选点的结果（用来对比）")
+    s.add_argument("--no-tracks", action="store_true",
+                   help="和 --court 一起用：不按整段飞行挑本场的球（每帧只看 0.3 以上的候选，旧的选法）")
     s.add_argument("--frame-step", type=int, default=1,
                    help="每 N 帧送一帧给模型；60fps 视频建议 2（TrackNetV3 是用 30fps 训练的），跳过的帧用插值补")
     s.add_argument("--resize", default="pil", choices=["pil", "area"],
@@ -884,7 +886,10 @@ def cmd_shuttle(a) -> int:
                   f"{'只切球离镜头远、在整帧里太小的那部分画面' if roi else '没有球场标定，切整个画面'}），"
                   f"TrackNet 的计算量是不分块、窗口步长 1 时的 {len(views) / a.window_step:.1f} 倍")
     pick_path = bool(a.court or views)
-    debug = {} if pick_path else None
+    from .shuttle_tracks import judges_courts
+
+    by_tracks = bool(judges_courts(calib) and not views and not a.no_tracks)  # needs the full frame's peaks
+    debug = ({"weak": []} if by_tracks else {}) if pick_path else None
     rows, tm = track_shuttle(video, a.tracknet_dir, a.compute_units, inpaint=not a.no_inpaint,
                              max_frames=a.max_frames, progress=print_progress, resize=a.resize,
                              frame_step=a.frame_step, debug=debug, model_dir=a.model_dir, views=views,
@@ -892,7 +897,12 @@ def cmd_shuttle(a) -> int:
     measured = list(tm.measured)
     if a.raw_output:
         write_csv(rows, a.raw_output, row_sources(rows, measured))
-    if pick_path:
+    if by_tracks:
+        from .shuttle_tracks import rows_from_peaks
+
+        rows = rows_from_peaks(debug["weak"], (info.width, info.height), calib, measured=measured,
+                               fps=info.fps, frame_step=a.frame_step, n_frames=len(rows))
+    elif pick_path:
         from .shuttle_path import rows_from_candidates
 
         rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib, measured=measured,

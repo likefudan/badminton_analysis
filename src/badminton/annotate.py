@@ -243,17 +243,23 @@ def predict(video: str | Path, court: str | Path | None = None, tracknet_dir=Non
     from .video import probe
 
     info = probe(video)
-    debug: dict = {"weak": []} if weak is not None else {}
+    debug: dict = {"weak": []}
     rows, tm = track_shuttle(video, tracknet_dir, progress=progress, debug=debug)
     calib = None
     if court:
         from .court import CourtCalibration
 
         calib = CourtCalibration.load(court)
-    # the same path selection as `badminton shuttle` (gravity check on flights included)
-    path_rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib,
-                                     measured=None if getattr(tm, "measured", None) is None else list(tm.measured),
-                                     fps=info.fps, n_frames=len(rows))
+    # the same path selection as `badminton shuttle` (by tracklets with a court, else per candidate)
+    measured = None if getattr(tm, "measured", None) is None else list(tm.measured)
+    from .shuttle_tracks import judges_courts, rows_from_peaks
+
+    if judges_courts(calib):
+        path_rows = rows_from_peaks(debug["weak"], (info.width, info.height), calib, measured=measured,
+                                    fps=info.fps, n_frames=len(rows))
+    else:
+        path_rows = rows_from_candidates(debug["candidates"], (info.width, info.height), calib, measured=measured,
+                                         fps=info.fps, n_frames=len(rows))
     n = len(rows)
     sx, sy = info.width / WIDTH, info.height / HEIGHT
     cands = [np.column_stack([c[:, 0] * sx, c[:, 1] * sy, c[:, 2]]) if len(c) else np.zeros((0, 3))
