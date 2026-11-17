@@ -47,6 +47,7 @@ MIN_TRACK = 4          # points: shorter tracklets are noise (unless a single bl
 STRONG = 0.5           # a peak this high counts even alone
 FIT_MIN = 8            # points needed to fit a 3D flight
 FIT_MAX_POINTS = 40    # longer tracklets are fitted on their first FIT_MAX_POINTS points
+FIT_BATCH = 200        # tracklets fitted together
 FIT_RMS = 0.003        # of the frame width: a fit this far off (rms) says nothing (a hit inside, two objects)
 CHAIN_OWN_POINTS = 10  # a stretch of the path with fewer points of flights above this court than this ...
                        # and some of flights above another court is dropped
@@ -264,8 +265,11 @@ def track_weights(tracks: list, calib, fps: float | None) -> np.ndarray:
     which = [i for i, t in enumerate(tracks) if len(t) >= FIT_MIN]
     if not which:
         return w
+    ff = FlightFit(calib, fps)
+    fits = []
     with np.errstate(all="ignore"):  # diverging trial steps are rejected by the fit
-        fits = FlightFit(calib, fps).fit([tracks[i] for i in which])
+        for k in range(0, len(which), FIT_BATCH):  # bounded memory on long videos
+            fits += ff.fit([tracks[i] for i in which[k:k + FIT_BATCH]])
     for i, (rms, inside, _) in zip(which, fits):
         if inside < OWN_SHARE and rms <= FIT_RMS * calib.frame_size[0]:
             w[i] = AWAY_WEIGHT
