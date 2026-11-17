@@ -54,6 +54,8 @@ FIT_RMS = 0.003        # of the frame width: a fit this far off (rms) says nothi
 CHAIN_OWN_POINTS = 10  # a stretch of the path with fewer points of flights above this court than this ...
                        # and some of flights above another court is dropped
 AWAY_RUN = 30          # points of flights surely above another court between two of this court's (drop_away_chains)
+FAR_FROM_HANDS = 1.5   # body heights: a flight never this close to a wrist of this court's players is elsewhere
+HAND_WINDOW = 3        # video frames around each point to look for a wrist
 AWAY_ANCHOR = 6        # points a flight above this court must give the path to count as one of this court's
 G = 9.81
 TERMINAL = 6.8         # m/s, a feather shuttle's terminal speed
@@ -295,11 +297,48 @@ def surely_away(tracks: list, weights: np.ndarray, frame_size: tuple[int, int]) 
     return out
 
 
+def hands_from_skeleton(skeleton_npz, calib, n_frames: int) -> tuple[np.ndarray, np.ndarray]:
+    """This court's players' wrists from the skeleton step: (wrists (N, K, 2) video pixels, body
+    heights (N, K) pixels), K = two wrists of every tracked player, NaN where not seen."""
+    from .hits import player_signals
+    from .tracking import load_npz, track_players
+
+    data = load_npz(skeleton_npz)
+    per_side = int(max(1, np.round(np.nanmax(data["valid"].sum(1)) / 2))) if len(data["valid"]) else 1
+    sig = player_signals(data, track_players(data, calib, per_side), n_frames)
+    if not sig:
+        return np.full((n_frames, 0, 2), np.nan), np.full((n_frames, 0), np.nan)
+    wr = np.concatenate([p.wrists for p in sig], axis=1)
+    bh = np.repeat(np.stack([p.body_h for p in sig], 1), 2, axis=1)
+    return wr, bh
+
+
+def hand_distance(tracks: list, hands, frame_step: int = 1, win: int = HAND_WINDOW) -> np.ndarray:
+    """Per tracklet: how close it comes to any wrist of this court's players, in that player's body
+    heights (within +-win video frames of each point). inf where no player is seen around it."""
+    wr, bh = hands
+    out = np.full(len(tracks), np.inf)
+    n = len(wr)
+    for i, t in enumerate(tracks):
+        f = (t[:, 0] * frame_step).astype(int)
+        best = np.inf
+        for off in range(-win, win + 1):
+            g = np.clip(f + off, 0, n - 1)
+            d = np.hypot(wr[g, :, 0] - t[:, 2:3], wr[g, :, 1] - t[:, 3:4]) / bh[g]
+            with np.errstate(all="ignore"):
+                m = np.nanmin(d) if np.isfinite(d).any() else np.inf
+            best = min(best, m)
+        out[i] = best
+    return out
+
+
 def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
                     measured: list | None = None, fps: float | None = None, frame_step: int = 1,
-                    n_frames: int | None = None, debug: dict | None = None) -> list:
+                    n_frames: int | None = None, debug: dict | None = None, hands=None) -> list:
     """Like shuttle_path.rows_from_candidates, but from the heatmap peaks of each processed frame
-    (shuttle.weak_peaks rows (x, y, peak) in heatmap pixels) and choosing by tracklets."""
+    (shuttle.weak_peaks rows (x, y, peak) in heatmap pixels) and choosing by tracklets.
+    hands: this court's players' wrists (hands_from_skeleton), if known: a flight that never comes
+    near any of them is another court's."""
     w, h = frame_size
     scale = (w / 512, h / 288)
     rate_fps = (fps / frame_step) if fps else None
@@ -318,6 +357,11 @@ def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_f
     tracks = link(px, w, rate_fps)
     tracks = [t for t in tracks if len(t) >= MIN_TRACK or t[:, 4].max() >= STRONG]
     weights = track_weights(tracks, calib, rate_fps)
+    far = np.zeros(len(tracks), bool)
+    if hands is not None and len(tracks):
+        hd = hand_distance(tracks, hands, frame_step)
+        far = np.isfinite(hd) & (hd > FAR_FROM_HANDS) & np.array([len(t) >= FIT_MIN for t in tracks])
+        weights = np.where(far, AWAY_WEIGHT, weights)
     reward = [np.where(c[:, 2] >= sp.MIN_SCORE, c[:, 2] - sp.REWARD_OFFSET, -np.inf) if len(c) else np.zeros(0)
               for c in cands]
     for t, wt in zip(tracks, weights):
@@ -333,7 +377,7 @@ def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_f
     rows = sp.rows_from_candidates(nodes, frame_size, calib, 0, measured, fps, frame_step, n_frames, scored=True)
     if CHAIN_OWN_POINTS > 0 and calib is not None:
         rows = drop_away_chains(rows, tracks, weights, frame_step, measured,
-                                surely_away(tracks, weights, frame_size))
+                                surely_away(tracks, weights, frame_size) | far)
     return [(f + start_frame, v, x, y) for f, v, x, y in rows]
 
 
