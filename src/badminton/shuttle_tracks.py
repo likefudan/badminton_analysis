@@ -47,10 +47,14 @@ MIN_TRACK = 4          # points: shorter tracklets are noise (unless a single bl
 STRONG = 0.5           # a peak this high counts even alone
 FIT_MIN = 8            # points needed to fit a 3D flight
 FIT_MAX_POINTS = 40    # longer tracklets are fitted on their first FIT_MAX_POINTS points
+LOW_RISE = 0.07        # of the frame height (150 px in 4K): see surely_away
+MOVING = 0.001         # of the frame width per frame (4 px in 4K)
 FIT_BATCH = 200        # tracklets fitted together
 FIT_RMS = 0.003        # of the frame width: a fit this far off (rms) says nothing (a hit inside, two objects)
 CHAIN_OWN_POINTS = 10  # a stretch of the path with fewer points of flights above this court than this ...
                        # and some of flights above another court is dropped
+AWAY_RUN = 30          # points of flights surely above another court between two of this court's (drop_away_chains)
+AWAY_ANCHOR = 6        # points a flight above this court must give the path to count as one of this court's
 G = 9.81
 TERMINAL = 6.8         # m/s, a feather shuttle's terminal speed
 DEPTHS = (4.0, 9.0, 18.0, 35.0)  # m: starting guesses along the first point's ray
@@ -276,6 +280,21 @@ def track_weights(tracks: list, calib, fps: float | None) -> np.ndarray:
     return w
 
 
+def surely_away(tracks: list, weights: np.ndarray, frame_size: tuple[int, int]) -> np.ndarray:
+    """Tracklets judged above another court whose movement agrees: they move (median step of at least
+    MOVING of the frame width per frame) but rise or fall less than LOW_RISE of the frame height. This
+    court's shuttle, a few metres from the camera, rises and falls far more; one held before a serve
+    does not move, and one misjudged by the fit usually does not stay that flat."""
+    w, h = frame_size
+    out = np.zeros(len(tracks), bool)
+    for i, (t, wt) in enumerate(zip(tracks, weights)):
+        if wt >= 1.0 or len(t) < FIT_MIN:
+            continue
+        step = np.hypot(*np.diff(t[:, 2:4], axis=0).T) / np.maximum(np.diff(t[:, 0]), 1)
+        out[i] = np.median(step) >= MOVING * w and np.ptp(t[:, 3]) < LOW_RISE * h
+    return out
+
+
 def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
                     measured: list | None = None, fps: float | None = None, frame_step: int = 1,
                     n_frames: int | None = None, debug: dict | None = None) -> list:
@@ -313,20 +332,25 @@ def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_f
         debug.update(tracks=tracks, weights=weights)
     rows = sp.rows_from_candidates(nodes, frame_size, calib, 0, measured, fps, frame_step, n_frames, scored=True)
     if CHAIN_OWN_POINTS > 0 and calib is not None:
-        rows = drop_away_chains(rows, tracks, weights, frame_step, measured)
+        rows = drop_away_chains(rows, tracks, weights, frame_step, measured,
+                                surely_away(tracks, weights, frame_size))
     return [(f + start_frame, v, x, y) for f, v, x, y in rows]
 
 
 def drop_away_chains(rows: list, tracks: list, weights: np.ndarray, frame_step: int = 1,
-                     measured: list | None = None) -> list:
-    """Remove stretches of the chosen path (no gap over shuttle_path.MAX_GAP processed frames) that hold
-    fewer than CHAIN_OWN_POINTS points of flights fitted above this court and some of flights fitted
-    above another: when this court is not playing, the path otherwise follows whatever flies elsewhere."""
+                     measured: list | None = None, sure: np.ndarray | None = None) -> list:
+    """When this court is not playing, the path follows whatever flies elsewhere. Remove
+      * stretches of the chosen path (no gap over shuttle_path.MAX_GAP processed frames) with fewer than
+        CHAIN_OWN_POINTS points of flights fitted above this court and some fitted above another;
+      * inside a longer stretch, every part between two flights above this court (AWAY_ANCHOR points
+        used at least) that holds AWAY_RUN or more points of flights surely above another court
+        (`sure`, see surely_away): the wait before a serve, while the next court rallies, joins this
+        court's rally into one stretch."""
     kind = {}
-    for t, wt in zip(tracks, weights):
+    for ti, (t, wt) in enumerate(zip(tracks, weights)):
         if len(t) >= FIT_MIN:
             for f, _, x, y, _ in t:
-                kind.setdefault(int(f), []).append((x, y, wt >= 1.0))
+                kind.setdefault(int(f), []).append((x, y, ti, wt >= 1.0))
     rows = list(rows)
     seen = [i for i, r in enumerate(rows) if r[1]]
     if not seen:
@@ -340,20 +364,42 @@ def drop_away_chains(rows: list, tracks: list, weights: np.ndarray, frame_step: 
             runs.append(cur)
             cur = [i]
     runs.append(cur)
+
+    def drop(idx):
+        for i in idx:
+            rows[i] = (rows[i][0], 0, 0, 0)
+            if measured is not None:
+                measured[i] = False
+
     for run in runs:
-        n_own = n_away = 0
+        label = []  # per point: (tracklet, above this court) or None
         for i in run:
             f, _, x, y = rows[i]
-            if f % frame_step:
-                continue
-            for a, b, own in kind.get(f // frame_step, ()):
-                if abs(x - a) <= 2 and abs(y - b) <= 2:
-                    n_own += own
-                    n_away += not own
-                    break
-        if n_own < CHAIN_OWN_POINTS and n_away > 0:
-            for i in run:
-                rows[i] = (rows[i][0], 0, 0, 0)
-                if measured is not None:
-                    measured[i] = False
+            hit = None
+            if f % frame_step == 0:
+                for a, b, ti, own in kind.get(f // frame_step, ()):
+                    if abs(x - a) <= 2 and abs(y - b) <= 2:
+                        hit = (ti, own)
+                        break
+            label.append(hit)
+        n_own = sum(1 for q in label if q and q[1])
+        n_away = sum(1 for q in label if q and not q[1])
+        if n_away > 0 and n_own < CHAIN_OWN_POINTS:
+            drop(run)
+            continue
+        if AWAY_RUN <= 0 or sure is None:
+            continue
+        used = {}
+        for q in label:
+            if q and q[1]:
+                used[q[0]] = used.get(q[0], 0) + 1
+        anchor = [bool(q and q[1] and used[q[0]] >= AWAY_ANCHOR) for q in label]
+        part = []
+        for k, i in enumerate(run + [None]):
+            if i is None or anchor[k]:
+                if sum(1 for j in part if label[j] and sure[label[j][0]]) >= AWAY_RUN:
+                    drop([run[j] for j in part])
+                part = []
+            else:
+                part.append(k)
     return rows
