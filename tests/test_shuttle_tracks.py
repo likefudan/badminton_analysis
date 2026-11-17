@@ -1,0 +1,81 @@
+import numpy as np
+
+from tests.test_shuttle_path import _flight
+
+
+def _scene(fps: float = 30.0):
+    """A low camera beside the court (like the phone clips) and its court calibration."""
+    from tests.conftest import Camera
+    from badminton.court import MARKERS, CourtCalibration
+
+    w, h = 1920, 1080
+    cam = Camera(pos=(8.5, -1.5, 1.9), target=(2.0, 8.0, 1.5), f=900.0, size=(w, h))
+    names = ["near_left_corner", "near_right_corner", "far_left_corner", "far_right_corner",
+             "near_short_service_left", "far_short_service_right"]
+    calib = CourtCalibration({n: tuple(p) for n, p in zip(names, cam.project(np.array([MARKERS[n] for n in names])))},
+                             (w, h))
+    return cam, calib, (w, h)
+
+
+def _peaks(n, flights, size, noise=0.7, seed=0):
+    """Per frame heatmap peaks (x, y, peak) in heatmap pixels from [(first frame, pixels, peak)]."""
+    w, h = size
+    rng = np.random.default_rng(seed)
+    out = [[] for _ in range(n)]
+    for f0, px, pk in flights:
+        for i, (x, y) in enumerate(px):
+            if 0 <= x < w and 0 <= y < h and f0 + i < n:
+                x, y = np.array([x, y]) + rng.normal(0, noise, 2)
+                out[f0 + i].append((x * 512 / w, y * 288 / h, pk))
+    return [np.array(sorted(o, key=lambda r: -r[2]), float).reshape(-1, 3) for o in out]
+
+
+def test_link_follows_two_crossing_flights():
+    from badminton.shuttle_tracks import link
+
+    t = np.arange(40.0)
+    a = np.c_[100 + 20 * t, 500 - 30 * t + 0.8 * t**2]
+    b = np.c_[900 - 20 * t, 400 - 25 * t + 0.8 * t**2]
+    cands = [np.array([[*a[i], 0.8], [*b[i], 0.7]]) for i in range(40)]
+    tracks = [tr for tr in link(cands, 1920, 30.0) if len(tr) >= 5]
+    assert len(tracks) == 2
+    for tr in tracks:
+        assert len(tr) == 40
+        dx = np.diff(tr[:, 2])
+        assert (dx > 0).all() or (dx < 0).all()             # stays on the same flight through the crossing
+
+
+def test_flight_fit_tells_this_court_from_the_next():
+    from badminton.shuttle_tracks import FlightFit
+
+    fps = 30.0
+    cam, calib, size = _scene(fps)
+    ours = cam.project(_flight([3.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.0, fps))
+    theirs = cam.project(_flight([-8.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.0, fps))
+    tracks = [np.c_[np.arange(len(p)), np.zeros(len(p)), p, np.ones(len(p))] for p in (ours, theirs)]
+    (r1, in1, d1), (r2, in2, d2) = FlightFit(calib, fps).fit(tracks)
+    assert r1 < 1.0 and r2 < 1.0          # both fit within a pixel
+    assert in1 > 0.9 and in2 < 0.1
+    assert d2 > d1
+
+
+def test_path_keeps_this_courts_flight_over_a_brighter_one_next_door():
+    """Both courts play at once and the next court's shuttle lights up the heatmap more: choosing by
+    flights keeps this court's shuttle. When only the next court plays, nothing is reported."""
+    from badminton.shuttle_tracks import rows_from_peaks
+
+    fps = 30.0
+    cam, calib, size = _scene(fps)
+    ours = cam.project(_flight([3.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.6, fps))
+    theirs = cam.project(_flight([-8.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.6, fps))
+    later = cam.project(_flight([-8.0, 12.0, 2.4], [0.5, -11.0, 9.0], 1.6, fps))
+    n = 150
+    peaks = _peaks(n, [(5, ours, 0.55), (5, theirs, 0.9), (90, later, 0.9)], size)
+    rows = rows_from_peaks(peaks, size, calib, fps=fps)
+    seen = np.array([r[1] for r in rows])
+    xy = np.array([r[2:] for r in rows], float)
+    m = len(ours)
+    on_ours = seen[5:5 + m].astype(bool) & (np.hypot(*(xy[5:5 + m] - ours).T) < 6)
+    assert on_ours.mean() > 0.9
+    assert seen[90:].sum() < 5                              # only the next court is playing
+

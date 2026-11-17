@@ -36,6 +36,7 @@ from __future__ import annotations
 import numpy as np
 
 STATIC_FRAC = 0.05
+STATIC_SECONDS = 1.0  # ... and in at least this many seconds of frames: in a short clip 5 % is a single flight
 STATIC_CELL = 8  # heatmap pixels
 MIN_SCORE = 0.3
 MAX_GAP = 5  # frames the path may skip between two candidates
@@ -60,8 +61,15 @@ AWAY_RADIUS = 0.004   # of the frame width: candidates this close to a dropped p
 FLIGHT_TOL = 0.006    # of the frame width: a flight goes on while each point is this close to where it was heading
 
 
-def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, frac: float = STATIC_FRAC) -> np.ndarray:
-    """Boolean grid (cells of `cell` heatmap pixels): True where blobs sit too often."""
+def static_min_count(rate: float | None) -> int:
+    """Fewest frames a static cell must light up in, besides STATIC_FRAC of all (rate: processed frames per second)."""
+    return int(round(STATIC_SECONDS * (rate or 30.0)))
+
+
+def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, frac: float = STATIC_FRAC,
+               min_count: int = 0) -> np.ndarray:
+    """Boolean grid (cells of `cell` heatmap pixels): True where blobs sit too often (in more than `frac`
+    of all frames and in at least `min_count` frames)."""
     gh, gw = hm_shape[0] // cell + 1, hm_shape[1] // cell + 1
     freq = np.zeros((gh, gw))
     for c in candidates:
@@ -70,8 +78,7 @@ def static_map(candidates: list, hm_shape=(288, 512), cell: int = STATIC_CELL, f
             seen.add((int(y // cell), int(x // cell)))
         for k in seen:
             freq[k] += 1
-    freq /= max(1, len(candidates))
-    hot = freq > frac
+    hot = (freq > frac * max(1, len(candidates))) & (freq >= min_count)
     # a blob near a cell boundary lands in either neighbour: grow by one cell
     grown = hot.copy()
     grown[1:] |= hot[:-1]
@@ -120,8 +127,10 @@ def speed_unit(frame_width: int, fps: float | None, frame_step: int = 1) -> floa
 
 
 def choose_path(candidates: list, scale: tuple[float, float], static: np.ndarray | None = None,
-                mask: np.ndarray | None = None, cell: int = STATIC_CELL, speed_unit: float = 1.0) -> np.ndarray:
+                mask: np.ndarray | None = None, cell: int = STATIC_CELL, speed_unit: float = 1.0,
+                scored: bool = False) -> np.ndarray:
     """candidates: per frame an array of (x, y, peak, ...) in heatmap pixels.
+    scored: the third column is already the candidate's reward (shuttle_tracks), not a heatmap peak.
     Returns (F, 3): visibility, x, y in video pixels."""
     sx, sy = scale
     free_speed, max_speed, speed_scale = FREE_SPEED * speed_unit, MAX_SPEED * speed_unit, SPEED_SCALE * speed_unit
@@ -129,14 +138,14 @@ def choose_path(candidates: list, scale: tuple[float, float], static: np.ndarray
     nodes = []  # (frame, x, y, reward)
     for f, c in enumerate(candidates):
         for x, y, peak, *_ in c:
-            if peak < MIN_SCORE:
+            if not scored and peak < MIN_SCORE:
                 continue
             if static is not None and static[min(static.shape[0] - 1, int(y // cell)), min(static.shape[1] - 1, int(x // cell))]:
                 continue
             X, Y = x * sx, y * sy
             if mask is not None and not mask[min(mask.shape[0] - 1, int(Y)), min(mask.shape[1] - 1, int(X))]:
                 continue
-            nodes.append((f, X, Y, peak - REWARD_OFFSET))
+            nodes.append((f, X, Y, peak if scored else peak - REWARD_OFFSET))
     out = np.zeros((F, 3))
     if not nodes:
         return out
@@ -398,7 +407,7 @@ def fill_short_gaps(path: np.ndarray, max_gap: int = 3) -> np.ndarray:
 
 def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=None, start_frame: int = 0,
                          measured: list | None = None, fps: float | None = None, frame_step: int = 1,
-                         n_frames: int | None = None) -> list:
+                         n_frames: int | None = None, scored: bool = False) -> list:
     """Full pipeline on TrackNetV3 candidates: static map, airspace mask, path, still runs and flights over
     other courts (with a calibration), short gaps.
 
@@ -411,10 +420,10 @@ def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=No
     position is a blob TrackNet found in that frame, False where the row is
     filled by interpolation (a short gap, a skipped frame) or has no shuttle."""
     w, h = frame_size
-    static = static_map(candidates)
+    static = None if scored else static_map(candidates, min_count=static_min_count(fps / frame_step if fps else None))
     mask = airspace_mask(calib) if calib is not None else None
     scale = (w / 512, h / 288)
-    chosen = choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step))
+    chosen = choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step), scored=scored)
     if calib is not None:  # without the camera a still shuttle in the air cannot be told from one on the floor
         rate = (round(fps) if fps else 30.0) / frame_step
         on_floor = floor_test(calib)
@@ -434,7 +443,8 @@ def rows_from_candidates(candidates: list, frame_size: tuple[int, int], calib=No
                     c = candidates[f]
                     near = np.hypot(c[:, 0] * scale[0] - chosen[f, 1], c[:, 1] * scale[1] - chosen[f, 2]) < AWAY_RADIUS * w
                     candidates[f] = c[~near]
-            chosen = still(choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step)))
+            chosen = still(choose_path(candidates, scale, static, mask, speed_unit=speed_unit(w, fps, frame_step),
+                                       scored=scored))
     path = fill_short_gaps(chosen)
     if frame_step > 1:
         from .shuttle import expand_rows
