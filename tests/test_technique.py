@@ -33,7 +33,7 @@ def swing(peaks_s=(-0.12, -0.08, -0.05, -0.02), contact=1.4, turn_px=40.0, jump_
         kp[:, j, 0] += 15 * _sig((t - th) / w)
     kp[:, sh, 0] -= s * turn_px * _sig((t - ts) / w)  # racket shoulder comes round
     kp[:, el, 1] = -100 - 60 * _sig((t - te) / w)
-    kp[:, wr, 1] = -100 - contact * TORSO
+    kp[:, wr, 1] = -100 - contact * TORSO + 60 * (t / 0.3) ** 2  # highest at the hit
     kp[:, wr, 0] = s * 60 - s * 150 * _sig((t - tw) / w)
     if jump_px:
         bump = np.exp(-((t + 0.05) / 0.12) ** 2)
@@ -203,3 +203,28 @@ def test_csv_written(tmp_path):
     TQ.write_csv([r], tmp_path / "x.csv")
     text = (tmp_path / "x.csv").read_text()
     assert "contact_height" in text and "a；b" in text
+
+
+def test_left_right_label_flips_do_not_change_the_numbers():
+    rng = np.random.default_rng(1)
+    kp, sc, t = swing(contact=1.3, jump_px=30)
+    clean = TQ.stroke_metrics(kp, sc, t, FPS, "杀球")["metrics"]
+    flipped = kp.copy()
+    pairs = [(TQ.L_SH, TQ.R_SH), (TQ.L_EL, TQ.R_EL), (TQ.L_WR, TQ.R_WR)]
+    whole = rng.random(len(t)) < 0.3  # the model swaps the whole body's labels in these frames
+    for a, b in pairs:
+        one = rng.random(len(t)) < 0.1  # ... and single joints in these
+        f = whole ^ one
+        flipped[f, a], flipped[f, b] = kp[f, b], kp[f, a]
+    r = TQ.stroke_metrics(flipped, sc, t, FPS, "杀球")
+    m = r["metrics"]
+    for k in ("contact_height", "wrist_speed", "jump", "backswing_elbow"):
+        assert m[k] == pytest.approx(clean[k], abs=0.1), k
+    assert m["chain_order_ok"] is True
+
+
+def test_contact_is_the_top_of_the_swing():
+    kp, sc, t = swing(contact=1.4)
+    r = TQ.stroke_metrics(kp, sc, t - 0.1, FPS, "杀球")  # hit detected 0.1 s late
+    assert r["metrics"]["contact_shift_ms"] == pytest.approx(-100, abs=20)
+    assert r["metrics"]["contact_height"] == pytest.approx(1.4, abs=0.05)

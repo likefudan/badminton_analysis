@@ -60,7 +60,8 @@ GROUPS = OVERHEAD + LOW
 BEFORE_S, AFTER_S = 0.8, 0.4  # window around the hit
 KPT_THR = 0.3  # keypoint score below this counts as not seen
 MIN_SEEN = 0.7  # share of the window the core joints must be seen in
-CHAIN_WIN = (-0.4, 0.1)  # where the speed peaks of the kinetic chain are looked for (s from the hit)
+CHAIN_WIN = (-0.5, 0.15)  # where the speed peaks of the kinetic chain are looked for (s from the contact)
+CONTACT_SEARCH_S = 0.15  # overhead: the contact is the racket wrist's highest point this close to the detected hit
 PREP_WIN = (-0.6, -0.1)  # preparation, for backswing and disguise
 TURN_WIN = (-0.6, 0.3)
 JUMP_BASE = (-0.8, -0.5)  # ankles before the take-off
@@ -166,13 +167,85 @@ def stroke_window(data: dict, row_of: np.ndarray, det_index: np.ndarray, hit_fra
     return kp, sc, (f - hit_frame) / fps
 
 
-def racket_side(kp: np.ndarray, t: np.ndarray) -> int:
-    """Which wrist holds the racket in this stroke: the one that moved fastest near the hit.
-    Returns the COCO index of the right (R_WR) or left (L_WR) wrist."""
-    near = (t >= CHAIN_WIN[0]) & (t <= CHAIN_WIN[1])
-    fps = 1 / np.median(np.diff(t)) if len(t) > 1 else 30.0
-    peaks = [np.nanmax(_speed(kp[:, w], fps)[near]) if near.any() else 0 for w in (R_WR, L_WR)]
-    return R_WR if peaks[0] >= peaks[1] else L_WR
+def _track_pair(P: np.ndarray, S: np.ndarray, k0: int, first_is_racket: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Two points per frame (n, 2, 2) whose labels may swap from frame to frame -> the same two
+    points as (racket, other), kept apart by continuity (constant-velocity prediction) going out
+    both ways from frame k0, where the racket one is given."""
+    n = len(P)
+    out = np.full((n, 2, 2), np.nan)
+    outS = np.zeros((n, 2), bool)
+    order = [0, 1] if first_is_racket else [1, 0]
+    out[k0], outS[k0] = P[k0, order], S[k0, order]
+    for step in (1, -1):
+        last = out[k0].copy()
+        prev = np.full((2, 2), np.nan)
+        k = k0 + step
+        while 0 <= k < n:
+            pred = np.where(np.isfinite(prev), 2 * last - prev, last)
+            pts, ok = P[k], S[k] & np.isfinite(P[k]).all(-1)
+            if ok.all():
+                keep = np.nansum(np.linalg.norm(pts - pred, axis=-1))
+                swap = np.nansum(np.linalg.norm(pts[::-1] - pred, axis=-1))
+                assigned = pts if keep <= swap else pts[::-1]
+                got = np.array([True, True])
+            elif ok.any():
+                p = pts[ok.argmax()]
+                d = np.linalg.norm(pred - p, axis=-1)
+                slot = int(np.nanargmin(d)) if np.isfinite(d).any() else 0
+                assigned = np.full((2, 2), np.nan)
+                assigned[slot] = p
+                got = np.arange(2) == slot
+            else:
+                got = np.array([False, False])
+                assigned = np.full((2, 2), np.nan)
+            out[k], outS[k] = assigned, got
+            for j in range(2):
+                if got[j]:
+                    prev[j], last[j] = last[j], assigned[j]
+                else:
+                    prev[j] = np.nan  # no velocity across a gap
+            k += step
+    return out, outS
+
+
+def assign_arms(kp: np.ndarray, seen: np.ndarray, t: np.ndarray, group: str) -> tuple[np.ndarray, np.ndarray, str]:
+    """The pose model's left / right labels flip when a player turns side- or back-on, so the
+    racket arm is not taken from the labels. At the frame nearest the hit where both wrists are
+    seen, the racket wrist is the higher one (overhead strokes) or the one farther from the
+    shoulders (others); from there each joint pair is followed by continuity. Returns copies where
+    R_SH / R_EL / R_WR are the racket arm and L_* the other arm, plus the label ("R" / "L") the
+    pose model gave the racket wrist at that frame (for information only)."""
+    kp, seen = kp.copy(), seen.copy()
+    both = seen[:, [L_WR, R_WR]].all(1) & np.isfinite(kp[:, [L_WR, R_WR]]).all((1, 2))
+    if not both.any():
+        return kp, seen, "?"
+    k0 = int(np.flatnonzero(both)[np.argmin(np.abs(t[both]))])
+    wl, wr = kp[k0, L_WR], kp[k0, R_WR]
+    if group in OVERHEAD:
+        r_is_racket = wr[1] <= wl[1]
+    else:
+        ref = np.nanmean(kp[k0, [L_SH, R_SH]], 0)
+        r_is_racket = np.linalg.norm(wr - ref) >= np.linalg.norm(wl - ref) if np.isfinite(ref).all() \
+            else wr[1] <= wl[1]
+    label = "R" if r_is_racket else "L"
+    chain = None  # racket point of the previous joint in the chain, per frame
+    for li, ri in ((L_WR, R_WR), (L_EL, R_EL), (L_SH, R_SH)):
+        P = kp[:, [ri, li]]
+        S = seen[:, [ri, li]]
+        if chain is None:
+            first = bool(r_is_racket)
+            k = k0
+        else:  # the joint of this pair nearer the racket arm's previous joint, where both are seen
+            ok = S.all(1) & np.isfinite(P).all((1, 2)) & np.isfinite(chain).all(1)
+            if not ok.any():
+                continue
+            k = int(np.flatnonzero(ok)[np.argmin(np.abs(t[ok]))])
+            first = np.linalg.norm(P[k, 0] - chain[k]) <= np.linalg.norm(P[k, 1] - chain[k])
+        pair, pairS = _track_pair(P, S, k, first)
+        kp[:, ri], kp[:, li] = pair[:, 0], pair[:, 1]
+        seen[:, ri], seen[:, li] = pairS[:, 0], pairS[:, 1]
+        chain = pair[:, 0]
+    return kp, seen, label
 
 
 def _at(t: np.ndarray, s: float) -> int:
@@ -185,19 +258,27 @@ def _between(t: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float, group: str,
                    wrist: int | None = None) -> dict:
-    """The numbers of one stroke (see the module doc). `wrist`: racket wrist, guessed if None.
-    Returns {"ok": bool, "reason": str, "racket_hand": "R"/"L", "metrics": {...}, "prep": (k, 17, 2) or None}."""
+    """The numbers of one stroke (see the module doc). `wrist`: force the racket wrist by its
+    pose-model label (tests); by default the racket arm is found by assign_arms, since the labels flip.
+    Returns {"ok": bool, "reason": str, "racket_hand": "R"/"L", "metrics": {...}, "prep": (k, 17, 2) or None};
+    racket_hand is the pose model's label of the racket wrist near the hit, for information only."""
     seen = sc >= KPT_THR
+    if wrist is None:
+        kp_raw, seen, hand = assign_arms(kp_raw, seen, t, group)
+    else:
+        hand = "R" if wrist == R_WR else "L"
+        if wrist == L_WR:  # move the racket arm into the R_* slots
+            sw = [L_SH, R_SH, L_EL, R_EL, L_WR, R_WR]
+            kp_raw, seen = kp_raw.copy(), seen.copy()
+            kp_raw[:, sw] = kp_raw[:, [R_SH, L_SH, R_EL, L_EL, R_WR, L_WR]]
+            seen[:, sw] = seen[:, [R_SH, L_SH, R_EL, L_EL, R_WR, L_WR]]
+    wrist, elbow, shoulder, other_sh = R_WR, R_EL, R_SH, L_SH
     core = [L_SH, R_SH, L_HIP, R_HIP]
     kp = fill_and_smooth(kp_raw, seen, fps)
     if len(t) < 5 or not np.isfinite(kp[:, core]).all():
         return {"ok": False, "reason": "击球前后没拍到这个人", "metrics": {}}
-    wrist = wrist if wrist is not None else racket_side(kp, t)
-    elbow, shoulder = (R_EL, R_SH) if wrist == R_WR else (L_EL, L_SH)
-    other_sh = L_SH if shoulder == R_SH else R_SH
     need = core + [elbow, wrist]
     seen_share = float(seen[:, need].all(1).mean())
-    hand = "R" if wrist == R_WR else "L"
     if seen_share < MIN_SEEN or not np.isfinite(kp[:, need]).all():
         return {"ok": False, "reason": f"关节只有 {seen_share:.0%} 的时间看得清", "racket_hand": hand, "metrics": {},
                 "seen_share": round(seen_share, 2)}
@@ -209,6 +290,11 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
         return {"ok": False, "reason": "量不出躯干长度", "metrics": {}}
     h = _at(t, 0.0)
     m: dict = {}
+    if group in OVERHEAD:  # the detected hit can be a few frames off: take the racket wrist's top
+        near = np.flatnonzero(_between(t, -CONTACT_SEARCH_S, CONTACT_SEARCH_S))
+        h = int(near[np.argmin(kp[near, wrist, 1])])
+        m["contact_shift_ms"] = round(float(t[h]) * 1000)
+        t = t - t[h]
     m["contact_height"] = up * (kp[h, wrist, 1] - msh[h, 1]) / torso
     speed_w = _speed(kp[:, wrist], fps) / torso
     chain = _between(t, *CHAIN_WIN)
@@ -256,8 +342,6 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
     if sel.sum() >= 2:
         ts = np.linspace(PREP_WIN[0], PREP_WIN[1], PREP_SAMPLES)
         rel = (kp - mhip[:, None, :]) / torso
-        if hand == "L":
-            rel[..., 0] *= -1
         prep_pose = np.stack([[np.interp(ts, t, rel[:, j, d]) for d in range(2)] for j in range(17)]).transpose(2, 0, 1)
     m = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in m.items()}
     return {"ok": True, "reason": "", "racket_hand": hand, "metrics": m, "seen_share": round(seen_share, 2),
@@ -350,19 +434,13 @@ def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near"
     out = []
     picks = [s for s in strokes if s.get("group") in GROUPS and s.get("side") in sides
              and (include_review or not s.get("needs_review")) and s.get("player_id") in by_id]
-    # racket hand per player: majority over their strokes
-    hands: dict = {}
     windows = []
     for s in picks:
         tr = by_id[s["player_id"]]
         kp, sc, t = stroke_window(data, row_of, tr.det_index, int(s["frame"]), fps)
         windows.append((kp, sc, t))
-        smooth = fill_and_smooth(kp, sc >= KPT_THR, fps_eff)
-        if np.isfinite(smooth[:, [L_WR, R_WR]]).all() and len(t) >= 5:
-            hands.setdefault(s["player_id"], []).append(racket_side(smooth, t))
-    hand_of = {p: max(set(v), key=v.count) for p, v in hands.items()}
     for s, (kp, sc, t) in zip(picks, windows):
-        r = stroke_metrics(kp, sc, t, fps_eff, s["group"], hand_of.get(s["player_id"]))
+        r = stroke_metrics(kp, sc, t, fps_eff, s["group"])
         tr = by_id[s["player_id"]]
         row = int(np.argmin(np.abs(np.asarray(data["frame"]) - int(s["frame"]))))  # nearest processed frame
         airborne = bool(tr.airborne[row]) if row >= 0 and getattr(tr, "airborne", None) is not None else None
