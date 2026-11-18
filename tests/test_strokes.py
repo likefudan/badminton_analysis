@@ -155,3 +155,61 @@ def test_serve_rule():
     assert ST.serve_rule(hits, 1, 30.0, tracks) == 0
     hits[0]["player_id"] = 9  # first hitter not tracked: up to the models
     assert ST.serve_rule(hits, 0, 30.0, tracks) == -1
+
+
+def _physics_always(kind):
+    """A physics model of one round that is sure of `kind` whatever it is shown."""
+    from badminton.hits import HitClassifier
+
+    trees = [{"feature": [0], "threshold": [0.0], "left": [0], "right": [0], "value": [10.0 if c == kind else 0.0],
+              "missing_left": [1], "leaf": [1]} for c in ST.PHYSICS_CLASSES]
+    return HitClassifier({"features": list(ST.PHYSICS_FEATURES), "classes": list(ST.PHYSICS_CLASSES),
+                          "baseline": [0.0] * len(ST.PHYSICS_CLASSES), "trees": [trees]}, ST.PHYSICS_FEATURES)
+
+
+def test_physics_features_measure_the_flight():
+    hits, tracks = _rally()
+    by_id = {t.id: t for t in tracks}
+    data = {"bbox": np.tile([[100.0, 300.0, 180.0, 500.0]], (200, 3, 1))}  # feet at y 500, box 200 px high
+    upright = {t.id: np.full(200, 200.0) for t in tracks}
+    shuttle = np.full((200, 2), np.nan)
+    shuttle[10] = (140, 250)  # 1.25 body heights above the feet: overhead
+    shuttle[40] = (140, 400)  # 0.5: underhand
+    f = ST.physics_features(hits, 0, 30.0, by_id, upright, data, shuttle)
+    # hit 4.7 m from the net, reply hit 5.3 m from it one second later, half a metre across
+    assert f == pytest.approx([4.7, 5.3, 1.0, 1.0, 0.5])
+    assert ST.physics_features(hits, 1, 30.0, by_id, upright, data, shuttle)[3] == 0.0
+    last = ST.physics_features(hits, 3, 30.0, by_id, upright, data, shuttle)
+    assert last[0] == pytest.approx(4.3) and np.isnan(last[[1, 2, 4]]).all()  # no reply: only where it was hit from
+    # a crouching player's short box does not turn a low shuttle into an overhead one
+    data["bbox"][40, 1] = (100, 420, 180, 500)
+    assert ST.physics_features(hits, 1, 30.0, by_id, upright, data, shuttle)[3] == 0.0
+
+
+def test_physics_decides_the_kind_and_bst_the_type_inside_it():
+    pytest.importorskip("torch")
+    from badminton import bst
+
+    skel = _skeleton(F=120)
+    tracks = [_Track(1, 0, np.zeros(120, int), np.tile([[4.0, 3.0]], (120, 1))),
+              _Track(2, 1, np.ones(120, int), np.tile([[2.0, 10.0]], (120, 1)))]
+    model = bst.build_model(n_class=ST.N_CLASSES_FULL).eval()
+    hits = [{"frame": 20, "player_id": 1}, {"frame": 50, "player_id": 2}, {"frame": 80, "player_id": 1}]
+    args = (skel, _Tracking(tracks), hits, np.full((120, 2), np.nan), _calib(), [model], 30.0)
+    plain = ST.classify_hits(*args)
+    lifted = ST.classify_hits(*args, physics=_physics_always("lift"))
+    assert lifted[0]["model"] == "rule" and lifted[0]["physics"] is None  # the serve rule comes first
+    for a, b in zip(plain[1:], lifted[1:]):
+        assert a["model"] == "bst" and b["model"] == "bst+physics"
+        assert b["group"] == "挑球" and b["type"] in ("挑球", "防守挑球") and b["physics"]["kind"] == "挑球"
+        assert b["prob"] > 0.5 or b["alternatives"][0]["type"] in ("挑球", "防守挑球")
+    assert ST.classify_hits(*args, physics=_physics_always("lift"), w_physics=0.0)[1]["model"] == "bst"
+
+
+def test_physics_file_is_optional(tmp_path):
+    import json
+
+    assert ST.load_physics(tmp_path / "none.json") is None
+    other = {"features": list(ST.PHYSICS_FEATURES), "classes": ["hit", "bounce"], "baseline": [0.0], "trees": []}
+    (tmp_path / "other.json").write_text(json.dumps(other))
+    assert ST.load_physics(tmp_path / "other.json") is None  # some other model's file
