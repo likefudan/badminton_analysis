@@ -37,9 +37,9 @@ badminton technique VIDEO.mp4 --court VIDEO.court.json              # 写 VIDEO.
 仓库自带职业近端参考 `src/badminton/technique_ref_pro_near.json`：FineBadminton 14 场 1080p 单打转播，用标注的击球时刻和类型（`scripts/finebadminton_strokes.py` 转成 strokes.json），只取近端球员，约 1,800 拍。`badminton technique` 默认就和它比（`--reference none` 关掉，或给自己的 JSON）。
 远端球员的击球点低 0.3–0.4 个躯干长、起跳是假的（往后退时脚在画面里往上走），所以用户的近端录像只和近端参考比。
 
-每个数字都写百分位（`percentiles`）；只有比较可信的几项落在 10% 以下或 90% 以上时写进 `notes`：击球点、手腕速度、引拍肘高、随挥、两脚间距、膝角、躯干前倾、吊球伪装。
+每个数字都写百分位（`percentiles`）；只有比较可信的几项落在 10% 以下或 90% 以上时写进 `notes`：击球点、两脚间距、膝角、躯干前倾、吊球伪装。
 转体（和机位高度有关，转播机位比手机高）、起跳（前后移动被当成起跳）、肘角（职业杀球 p10 只有 42–78°，多是姿态错）和发力顺序（职业高手位也只有 31% 判为「对」）照样算、写进 JSON，但不写提示。
-手腕速度也要打折看：转播 25 fps、人小，手机 30/60 fps、人大，噪声不同。
+手腕速度、随挥、引拍肘高也不写提示：转播从后方高处拍，向前挥拍大多是纵深方向、画面里显得小；手机在侧面拍时同样的动作在画面里是横向的，会被系统性地判成「偏高」。等有和转播机位一致的录像再打开。
 
 自己合参考：`badminton technique-ref ref.json A.technique.json B.technique.json ...`（每种球、每个指标的 10/25/50/75/90 百分位）。
 

@@ -98,9 +98,11 @@ METRIC_NAMES = {
 # numbers compared with a reference and written into notes. Left out, after the pro run on FineBadminton
 # (14 broadcast matches): turn (shoulder-line width depends on camera height), jump (moving forward / back
 # shows as ankles rising), elbow_deg (p10 of pro smashes 42-78 deg: pose errors), and the swing order
-# (only 31% of pro overhead strokes come out "in order" at 25-30 fps). They stay in the JSON.
-FLAG_METRICS = ("contact_height", "wrist_speed", "backswing_elbow", "follow_through", "stance", "knee_deg",
-                "trunk_lean", "disguise")
+# (only 31% of pro overhead strokes come out "in order" at 25-30 fps). Also left out after checking frames
+# of the user's clips: wrist_speed, follow_through and backswing_elbow, since the broadcast camera films from
+# high behind, where the forward swing is mostly depth and shows up small, while a phone at the side sees it
+# across the picture. They stay in the JSON.
+FLAG_METRICS = ("contact_height", "stance", "knee_deg", "trunk_lean", "disguise")
 DEFAULT_REFERENCE = Path(__file__).with_name("technique_ref_pro_near.json")
 # metric -> True if larger is the "more" direction worth a flag text (for reference flags both ends are reported)
 NUMERIC = list(METRIC_NAMES)
