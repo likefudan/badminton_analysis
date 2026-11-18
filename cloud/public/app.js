@@ -832,12 +832,14 @@ async function renderDetail() {
     v.title ? v.filename : "", fmtDate(shotAt(v)), m.duration ? fmtDur(m.duration) : "",
     m.width ? `${m.width}×${m.height}${m.fps ? ` ${Math.round(m.fps)} 帧` : ""}` : "", fmtBytes(v.size),
     v.options && v.options.mode === "doubles" ? "双打" : "单打",
+    v.options && v.options.region ? "有分析区域" : "",
   ].filter(Boolean).join(" · ");
   const st = $("dStatus");
   st.textContent = statusText(v);
   st.className = v.job && v.job.status === "failed" ? "bad" : v.job && v.job.status === "done" ? "ok" : "quiet";
   st.hidden = Boolean(v.job && v.job.status === "done");
   renderProgress(v);
+  if (typeof renderRegion === "function") renderRegion(v); // region.js
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
   $("dRetry").hidden = !(v.status === "uploaded" && v.job && ["failed", "done", "archived"].includes(v.job.status));

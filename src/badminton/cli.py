@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--show-roi", action="store_true", help="画出检测区域")
     s.add_argument("--full-frame", action="store_true", help="在整幅画面上检测，不裁到球场区域")
     s.add_argument("--encoder", default="libx264", help="ffmpeg 编码器，Mac 上可用 h264_videotoolbox")
+    s.add_argument("--region", help="分析区域 JSON（网页上画的）：脚不在区域里的人不算")
 
     s = sub.add_parser("bench", help="测速：比较不同推理后端的速度")
     s.add_argument("video")
@@ -97,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--court", help="球场标定：给了就用改进的选点（去掉静止干扰点、场地上方空间、按轨迹连续性挑点）")
     s.add_argument("--raw-output", help="另存 TrackNetV3 原版逐帧选点的结果（用来对比）")
     s.add_argument("--skeleton", help="和 --court 一起用：skeleton 的 .npz（本场球员）。从来没靠近本场球员手腕的飞行算别的场地的")
+    s.add_argument("--region", help="分析区域 JSON（网页上画的，见 region.py）：区域外的候选点直接丢掉")
     s.add_argument("--no-tracks", action="store_true",
                    help="和 --court 一起用：不按整段飞行挑本场的球（每帧只看 0.3 以上的候选，旧的选法）")
     s.add_argument("--frame-step", type=int, default=1,
@@ -146,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--duration", type=float, help="只处理前多少秒（试跑）")
     s.add_argument("--cuts")
     s.add_argument("--no-cut", action="store_true", help="不剪精简视频和最长回合集锦")
+    s.add_argument("--region", help="分析区域 JSON（网页上画的）：传给骨架，脚不在区域里的人不算")
     _model_args(s)
 
     s = sub.add_parser("annotate", help="标注羽毛球位置（浏览器里逐帧确认或点击），为微调 TrackNetV3 准备数据")
@@ -490,7 +493,7 @@ def cmd_skeleton(a) -> int:
     opts = SkeletonOptions(
         stride=a.stride, start_s=a.start, duration_s=a.duration,
         players_per_side=1 if a.singles else 2, draw_court=not a.no_court,
-        draw_roi=a.show_roi, use_roi=not a.full_frame, encoder=a.encoder,
+        draw_roi=a.show_roi, use_roi=not a.full_frame, encoder=a.encoder, region=_load_region(a.region),
     )
     res = run_skeleton(a.video, est, out, out.with_suffix(".npz"), calib, opts, print_progress)
     print(f"已写入 {out} 和 {out.with_suffix('.npz')}")
@@ -781,6 +784,8 @@ def cmd_analyze(a) -> int:
             args.append("--singles")
         if a.duration:
             args += ["--duration", str(a.duration)]
+        if a.region:
+            args += ["--region", a.region]
         if a.det_model:
             args += ["--det-model", a.det_model]
         if a.pose_model:
@@ -888,6 +893,17 @@ def cmd_stabilize(a) -> int:
     return 0
 
 
+def _load_region(path):
+    if not path:
+        return None
+    from .region import Region
+
+    region = Region.load(path)
+    if region is None:
+        print(f"分析区域 {path} 里没有有效的多边形，按整个画面分析")
+    return region
+
+
 def cmd_shuttle(a) -> int:
     from .pipeline import print_progress
     from .shuttle import row_sources, track_shuttle, write_csv
@@ -930,6 +946,18 @@ def cmd_shuttle(a) -> int:
                              frame_step=a.frame_step, debug=debug, model_dir=a.model_dir, views=views,
                              window_step=a.window_step)
     measured = list(tm.measured)
+    region = _load_region(a.region)
+    if region is not None:
+        if debug:
+            for key in ("weak", "candidates"):
+                if isinstance(debug.get(key), list):
+                    debug[key] = region.filter_points(debug[key], (512, 288))  # heatmap pixels of the full frame
+        if not pick_path:  # the reference per-frame choice: just blank the frames whose shuttle is outside
+            size = (info.width, info.height)
+            rows = [(f, 0, 0, 0) if vis and not region.contains_px(x, y, size) else (f, vis, x, y)
+                    for f, vis, x, y in rows]
+            measured = [m and r[1] for m, r in zip(measured, rows)]
+        print(f"分析区域：{len(region.keep)} 块只看、{len(region.drop)} 块抹掉，区域外的球不算")
     if a.raw_output:
         write_csv(rows, a.raw_output, row_sources(rows, measured))
     if by_tracks:

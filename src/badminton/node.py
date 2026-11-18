@@ -429,7 +429,7 @@ def web_video(src: Path, dst: Path) -> Path:
     return dst if done.returncode == 0 and dst.exists() and dst.stat().st_size else src
 
 
-def cover_image(video: Path, dst: Path, seconds: float) -> Path | None:
+def cover_image(video: Path, dst: Path, seconds: float, width: int = 640) -> Path | None:
     """A small picture of the recording for the list on the web page."""
     if dst.exists():
         return dst
@@ -437,7 +437,7 @@ def cover_image(video: Path, dst: Path, seconds: float) -> Path | None:
     if not ffmpeg:
         return None
     done = subprocess.run([ffmpeg, "-y", "-v", "error", "-ss", f"{max(0.0, seconds):.2f}", "-i", str(video), "-frames:v", "1",
-                           "-vf", "scale=640:-2", "-q:v", "5", str(dst)], stdin=subprocess.DEVNULL)
+                           "-vf", f"scale={width}:-2", "-q:v", "5", str(dst)], stdin=subprocess.DEVNULL)
     return dst if done.returncode == 0 and dst.exists() else None
 
 
@@ -510,7 +510,8 @@ SHUTTLE_VERSION = "7"  # raise when shuttle tracking changes, so recordings alre
 _SEEN = re.compile(r"(\d+) 帧有球（([\d.]+)%）")
 
 
-def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, log: list[str], run=None) -> Path | None:
+def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, log: list[str], run=None,
+                  region: Path | None = None) -> Path | None:
     """Shuttle track drawn on the skeleton video. Returns the combined video, or None when it could not be
     made: the shuttle model is the least reliable part, so a failure here does not fail the whole job."""
     run = run or run_step
@@ -545,6 +546,8 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     npz = out_dir / f"{work.stem}.skeleton.npz"
     if npz.exists():  # this court's players: a flight that never comes near their hands is another court's
         args += ["--skeleton", str(npz)]
+    if region:
+        args += ["--region", str(region)]
     ok = run(args, log, on_line, on_frames) == 0 and csv.exists()
     if ok:
         progress.update("shuttle", percent=80, detail="把球的轨迹画到骨架视频上")
@@ -677,6 +680,28 @@ def ask_for_review(api: "Api", vid: str, progress: Progress, names: set[str]) ->
     progress.done("review")
 
 
+def use_region(raw, out_dir: Path, stem: str) -> Path | None:
+    """The analysis region drawn on the web page (options["region"]) as <stem>.region.json in out_dir.
+    When it differs from the one the results in out_dir were made with, those results are thrown away
+    (skeleton, shuttle, strokes...: all of them depend on it); the player names are kept."""
+    from .region import Region
+
+    region = Region.from_dict(raw)
+    path = out_dir / f"{stem}.region.json"
+    text = json.dumps(region.to_dict()) if region else ""
+    before = path.read_text() if path.exists() else ""
+    if text != before and out_dir.exists():
+        print("  分析区域改了，这个视频的结果全部重新算")
+        for p in out_dir.iterdir():
+            if p.is_file() and p.name != f"{stem}.players.json":
+                p.unlink()
+    if region is None:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
 def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str]) -> list[Path]:
     """The normal one-click pipeline, without anything that needs a person at the keyboard."""
     from .video import probe  # needs OpenCV; imported late so the node itself starts without it
@@ -706,7 +731,10 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
         progress.done("calibrate", chosen)
     if court.with_suffix(".png").exists():
         extra.append(court.with_suffix(".png"))
+    region = use_region(options.get("region"), out_dir, work.stem)
     args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir)]
+    if region:
+        args += ["--region", str(region)]
     if options.get("mode") != "doubles":
         args.append("--singles")
     if options.get("names"):
@@ -733,7 +761,7 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
     for key in ("skeleton", "label", "stats", "cut"):  # anything analyze did not announce
         if progress.steps[key]["status"] == "pending":
             progress.skip(key, "这次没有运行")
-    combined = track_shuttle(work, court, out_dir, progress, log)
+    combined = track_shuttle(work, court, out_dir, progress, log, region=region)
     stroke_technique(work, court, out_dir, options.get("mode") != "doubles", progress, log)
     rally_points(work, court, out_dir, options.get("mode") != "doubles")
     review_inputs(work, court, out_dir, log)
@@ -1111,10 +1139,13 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
                 name = name[:-4] + f.suffix.lower()
             print(f"  上传 {name}（{f.stat().st_size / 1e6:.1f} MB）")
             api.upload_result(vid, f, name)
-        cover = cover_image(local.with_name(local.stem + "_sdr.mp4") if local.with_name(local.stem + "_sdr.mp4").exists() else local,
-                            web_dir / "cover.jpg", (progress.video_seconds or 0) * 0.1)
+        shown = local.with_name(local.stem + "_sdr.mp4") if local.with_name(local.stem + "_sdr.mp4").exists() else local
+        cover = cover_image(shown, web_dir / "cover.jpg", (progress.video_seconds or 0) * 0.1)
         if cover:
             api.upload_result(vid, cover, "cover.jpg")
+        frame = cover_image(shown, web_dir / "frame.jpg", (progress.video_seconds or 0) * 0.1, width=1280)
+        if frame:  # the picture the analysis region is drawn on
+            api.upload_result(vid, frame, "frame.jpg")
         progress.done("upload", f"{len(files)} 个文件")
         ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
         stop.set()

@@ -399,6 +399,8 @@ badminton analyze match.mp4 --names "1=小王,2=小李,3=老张,4=老刘"
 
 单打加 `--singles`；只想先试一分钟加 `--duration 60`。站位报告也可以单独跑：`badminton positioning match.mp4 --court match.court.json`。
 
+固定机位时可以只分析画面的一部分：在网页的「处理」里点「画分析区域」，在画面上点出多边形，选「只看这里」或「抹掉这里」，保存后按新区域重新分析（每个视频单独存）。命令行用 `--region region.json`（`analyze`、`skeleton`、`shuttle` 都认），格式是 `{"keep": [[[x, y], ...]], "drop": [...]}`，坐标是画面宽高的比例（0–1）。区域外的球（TrackNet 的候选点）和脚不在区域里的人都不算；「只看这里」要把场地上方的空中也框进去。
+
 每对搭档一张站位卡片（`match.positioning.near.png` / `far.png`），外加 `match.positioning.json`：
 
 - **站位形式**：两人连线和球网的夹角。大于 60° 算前后站位（进攻阵形），小于 30° 算左右站位（防守阵形），中间算过渡。给出各占回合内时间的比例，以及前后站位时各自在前面的时间。
