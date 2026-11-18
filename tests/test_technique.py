@@ -147,6 +147,7 @@ def test_analyse_video_and_reference():
     assert doc["summary"]["杀球"]["players"]["7"]["n"] == 4
 
     ref = TQ.build_reference([doc], min_n=4)
+    assert "contact_shift_ms" not in ref["groups"]["杀球"]  # bookkeeping, not technique
     assert ref["groups"]["杀球"]["contact_height"]["p50"] == pytest.approx(1.35, abs=0.05)
     notes, pct = TQ.flags_for("杀球", {"contact_height": 0.9}, ref)
     assert pct["contact_height"] == 0 and "偏低" in notes[0]

@@ -537,14 +537,16 @@ def summary(results: list[dict]) -> dict:
 
 
 def build_reference(docs: list[dict], min_n: int = 10) -> dict:
-    """Percentiles of every number per group over the strokes of several technique.json files."""
+    """Percentiles of every technique number (METRIC_NAMES) per group over the strokes of several
+    technique.json files. Bookkeeping numbers such as contact_shift_ms are left out: they say how
+    far the detected hit was off, not how the stroke was played."""
     groups: dict = {}
     for doc in docs:
         for r in doc["strokes"]:
             if not r.get("ok"):
                 continue
             for k, v in r["metrics"].items():
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                if k in METRIC_NAMES and isinstance(v, (int, float)) and not isinstance(v, bool):
                     groups.setdefault(r["group"], {}).setdefault(k, []).append(v)
     out = {}
     for g, ms in groups.items():
