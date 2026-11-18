@@ -274,13 +274,13 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     first = p.to_json()
     assert first["etaSeconds"] is None and first["elapsedSeconds"] == 10
     assert first["steps"][0]["seconds"] == 10 and "estimateSeconds" not in first["steps"][3]
-    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("upload", 12), ("review", 30)):
+    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("technique", 4), ("upload", 12), ("review", 30)):
         p.start(key)          # starting the next step finishes the one before
         clock.t += seconds
     p.done("review")
     done = p.to_json()
-    assert [s["status"] for s in done["steps"]] == ["done"] * 10
-    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 12, 30]
+    assert [s["status"] for s in done["steps"]] == ["done"] * 11
+    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 4, 12, 30]
     assert done["etaSeconds"] == 0
 
     # second recording, twice as long and twice as big: estimates scale with it
@@ -292,7 +292,7 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     j = p2.to_json()
     assert j["steps"][0]["etaSeconds"] == 12
     assert j["steps"][3]["estimateSeconds"] == 80           # skeleton: 40 s for 20 s of video -> 80 s for 40 s
-    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 24 + 60
+    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 8 + 24 + 60
     p2.start("sdr")
     clock.t += 6
     assert p2.to_json()["steps"][1]["etaSeconds"] == 10     # 16 s expected, 6 s gone
@@ -413,3 +413,72 @@ def test_review_inputs_use_what_the_analysis_produced(tmp_path):
     assert calls == [["review", str(tmp_path / "v.movement.json"), str(tmp_path / "v.positioning.json"),
                       "--court", str(court), "-o", str(tmp_path), "--shuttle", str(tmp_path / "v.shuttle.csv"),
                       "--video", str(work)]]
+    (tmp_path / "v.technique.json").write_text("{}")
+    calls.clear()
+    assert node.review_inputs(work, court, tmp_path, [], run=run)
+    assert calls[0][-2:] == ["--technique", str(tmp_path / "v.technique.json")]
+
+
+def technique_runner(fail=None, notes=2):
+    calls = []
+
+    def run(args, log, on_line=None, on_frames=None):
+        calls.append(args)
+        if args[0] == fail:
+            log.append("找不到 BST 权重")
+            return 1
+        out = Path(args[args.index("-o") + 1])
+        stem = Path(args[1]).stem
+        if args[0] == "strokes":
+            (out / f"{stem}.strokes.json").write_text("{}")
+        else:
+            (out / f"{stem}.technique.json").write_text(json.dumps(
+                {"strokes": [{"ok": True, "notes": ["a"] * notes}, {"ok": False}]}))
+        return 0
+
+    return run, calls
+
+
+def test_stroke_technique_runs_strokes_then_technique(tmp_path, monkeypatch):
+    from badminton import strokes as ST
+
+    weights = tmp_path / "bst.pt"
+    weights.write_bytes(b"w")
+    monkeypatch.setattr(ST, "DEFAULT_WEIGHTS", weights)
+    work, court = tmp_path / "v.mp4", tmp_path / "v.court.json"
+    progress = quiet_progress()
+    run, calls = technique_runner()
+    assert node.stroke_technique(work, court, tmp_path, True, progress, [], run=run) is None  # no inputs yet
+    assert progress.steps["technique"]["status"] == "skipped" and not calls
+    for name in ("v.skeleton.npz", "v.shuttle.csv"):
+        (tmp_path / name).write_bytes(b"x")
+    progress = quiet_progress()
+    out = node.stroke_technique(work, court, tmp_path, True, progress, [], run=run)
+    assert out == tmp_path / "v.technique.json"
+    assert [c[0] for c in calls] == ["strokes", "technique"]
+    assert "--singles" in calls[0] and "--no-video" in calls[0] and calls[1][calls[1].index("--strokes") + 1] == str(tmp_path / "v.strokes.json")
+    step = progress.steps["technique"]
+    assert step["status"] == "done" and step["detail"] == "1 拍算出了动作，2 条提示"
+    # nothing changed: not run again
+    assert node.stroke_technique(work, court, tmp_path, True, quiet_progress(), [], run=run) == out
+    assert len(calls) == 2
+
+
+def test_stroke_technique_failure_or_no_weights_only_skips(tmp_path, monkeypatch):
+    from badminton import strokes as ST
+
+    for name in ("v.skeleton.npz", "v.shuttle.csv"):
+        (tmp_path / name).write_bytes(b"x")
+    monkeypatch.setattr(ST, "DEFAULT_WEIGHTS", tmp_path / "missing.pt")
+    progress = quiet_progress()
+    run, calls = technique_runner()
+    assert node.stroke_technique(tmp_path / "v.mp4", tmp_path / "c.json", tmp_path, False, progress, [], run=run) is None
+    assert "BST" in progress.steps["technique"]["detail"] and not calls
+    (tmp_path / "bst.pt").write_bytes(b"w")
+    monkeypatch.setattr(ST, "DEFAULT_WEIGHTS", tmp_path / "bst.pt")
+    run, calls = technique_runner(fail="technique")
+    progress = quiet_progress()
+    assert node.stroke_technique(tmp_path / "v.mp4", tmp_path / "c.json", tmp_path, False, progress, [], run=run) is None
+    step = progress.steps["technique"]
+    assert step["status"] == "skipped" and "找不到 BST 权重" in step["detail"]
+    assert "--singles" not in calls[0]

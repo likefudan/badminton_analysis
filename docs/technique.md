@@ -45,3 +45,9 @@ badminton technique VIDEO.mp4 --court VIDEO.court.json              # 写 VIDEO.
 
 `summary` 里每种球、每个人有均值和标准差；`steadiness` 是「同一个人拍与拍之间的波动 ÷ 所有人的波动」（至少两个人各有 3 拍才算，只有一个人时这个比值恒为 1），
 越小说明这个指标越能区分人、越值得信。第 1 阶段的门槛就是看这几个指标在真实录像上稳不稳。
+
+## 在网站上
+
+Mac 处理节点（`badminton node`）在羽毛球追踪之后自动跑 `badminton strokes` 和 `badminton technique`（需要 BST 权重；没有或失败时只跳过这一步），
+`technique.json` 随结果上传。网站结果页「概况」里的「击球动作（和职业比）」按人、按球种列出上面五项的中位数、职业中位数和偏离拍数，
+有提示的拍点时间就跳到视频的那一刻。AI 报告的提示词里多一节【击球动作】（`badminton review --technique`），报告多一个「击球动作」小节。

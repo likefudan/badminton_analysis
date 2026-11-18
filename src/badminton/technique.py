@@ -577,12 +577,61 @@ def build_reference(docs: list[dict], min_n: int = 10) -> dict:
 # ---------------------------------------------------------------- files
 
 
+def reference_summary(reference: dict | None) -> dict:
+    """p10 / p50 / p90 of the noted numbers only, per group: what the web page and the review show."""
+    out: dict = {}
+    for g, ms in ((reference or {}).get("groups") or {}).items():
+        keep = {k: {q: v[q] for q in ("p10", "p50", "p90", "n") if q in v} for k, v in ms.items() if k in FLAG_METRICS}
+        if keep:
+            out[g] = keep
+    return out
+
+
 def technique_json(results: list[dict], fps: float, video: str = "", inputs: dict | None = None,
-                   reference: str | None = None) -> dict:
+                   reference: str | None = None, reference_doc: dict | None = None) -> dict:
     strokes = [{k: v for k, v in r.items() if k != "prep"} for r in results]
     return {"schema": SCHEMA, "video": video, "fps": fps, "inputs": inputs or {}, "reference": reference,
             "rules": RULES, "window_s": [-BEFORE_S, AFTER_S], "metric_names": METRIC_NAMES,
+            "noted_metrics": list(FLAG_METRICS), "reference_summary": reference_summary(reference_doc),
             "summary": summary(results), "strokes": strokes}
+
+
+def _median(vals: list) -> float | None:
+    v = [x for x in vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    return round(float(np.median(v)), 2) if v else None
+
+
+def digest(doc: dict, max_examples: int = 4) -> dict:
+    """Short version of a technique.json for the AI review: per player and stroke group the number of
+    strokes, the median of each noted number next to the pro median, how many strokes fell outside the
+    pros' 10..90% range on it, and a few example notes with their time. Only the noted numbers."""
+    ref = doc.get("reference_summary") or {}
+    players: dict = {}
+    for r in doc.get("strokes", []):
+        if not r.get("ok"):
+            continue
+        pid = str(r["player_id"])
+        p = players.setdefault(pid, {"id": r["player_id"], "name": r.get("player_name") or "", "side": r.get("side"),
+                                     "groups": {}, "examples": []})
+        g = p["groups"].setdefault(r["group"], {"n": 0, "values": {}, "outside": {}})
+        g["n"] += 1
+        for k in FLAG_METRICS:
+            v = r["metrics"].get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                g["values"].setdefault(k, []).append(v)
+            pc = (r.get("percentiles") or {}).get(k)
+            if pc is not None and (pc <= 10 or pc >= 90):
+                g["outside"][k] = g["outside"].get(k, 0) + 1
+        if r.get("notes") and len(p["examples"]) < max_examples:
+            p["examples"].append({"time_s": r["time_s"], "type": r["type"], "notes": r["notes"]})
+    for p in players.values():
+        for gname, g in p["groups"].items():
+            g["metrics"] = {k: {"median": _median(v), "pro_median": ref.get(gname, {}).get(k, {}).get("p50"),
+                                "outside_pro_range": g["outside"].get(k, 0)} for k, v in g.pop("values").items()}
+            g.pop("outside")
+    skipped = sum(1 for r in doc.get("strokes", []) if not r.get("ok"))
+    return {"players": list(players.values()), "skipped": skipped, "has_reference": bool(ref),
+            "metric_names": {k: METRIC_NAMES[k] for k in FLAG_METRICS}}
 
 
 def write_csv(results: list[dict], path: str | Path) -> None:

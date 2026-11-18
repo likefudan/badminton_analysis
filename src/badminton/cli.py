@@ -197,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--fps", type=float, help="羽毛球 CSV 的帧率")
     s.add_argument("--shuttle-offset", type=float, default=0.0, help="羽毛球 CSV 第 0 帧在统计时间轴上的秒数")
     s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%%），写进数据质量说明")
+    s.add_argument("--technique", help="badminton technique 输出的 technique.json：击球类型和每拍动作和职业的比较")
     s.add_argument("--response", help="把聊天模型的回答（文本文件）导入，生成 Markdown 和 HTML 报告")
     s.add_argument("--api", action="store_true",
                    help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
@@ -1075,7 +1076,7 @@ def cmd_technique(a) -> int:
     results, fps = TQ.run(data_path, strokes_path, CourtCalibration.load(a.court), per_side, sides,
                           a.include_review, reference, shuttle_path)
     doc = TQ.technique_json(results, fps, str(video), {"skeleton": str(data_path), "strokes": str(strokes_path)},
-                            ref_path)
+                            Path(ref_path).name if ref_path else None, reference)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{video.stem}.technique.json"
     out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
@@ -1274,8 +1275,13 @@ def cmd_review(a) -> int:
             print("--shuttle 需要帧率：加 --video <分析用的视频> 或 --fps 30")
             return 1
         shuttle = rv.shuttle_stats(a.shuttle, fps, movement.get("rallies", []), a.shuttle_offset)
+    technique = None
+    if a.technique:
+        from .technique import digest
+
+        technique = digest(json.loads(Path(a.technique).read_text()))
     summary = rv.build_summary(movement, source=stem, extras=extras, calib=calib, shuttle=shuttle,
-                               shuttle_accuracy_pct=a.shuttle_accuracy)
+                               shuttle_accuracy_pct=a.shuttle_accuracy, technique=technique)
     previous = json.loads(Path(a.previous).read_text()) if a.previous else None
     out_dir = Path(a.out_dir) if a.out_dir else path.parent
     out_dir.mkdir(parents=True, exist_ok=True)

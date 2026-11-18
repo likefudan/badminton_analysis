@@ -861,6 +861,14 @@ async function renderDetail() {
       for (const p of mv.players || []) if (p.name) names[p.id] = p.name;
     } catch {}
   }
+  if (have.has("technique.json")) {
+    try {
+      const doc = await (await fetch(resultUrl(v, "technique.json"))).json();
+      if (openId !== v.id || key !== shownKey) return;
+      const card = techniqueCard(doc, names);
+      if (card) stats.append(card);
+    } catch {}
+  }
   const panes = { videos: $("tVideos"), cards: $("tCards") };
   for (const pane of Object.values(panes)) pane.textContent = "";
   for (const [where, pattern, title] of RESULT_ORDER) {
@@ -1161,6 +1169,101 @@ function statsTable(mv) {
     for (const c of cells) row.insertCell().textContent = c;
   }
   wrap.append(table);
+  return wrap;
+}
+
+// ---------- 击球动作：每拍和职业近端参考比（badminton technique 的 technique.json） ----------
+// 只列提示用到的指标（noted_metrics）；手腕速度、转体、起跳等受机位影响，算了但不显示。
+
+const TECH_LABEL = {
+  contact_height: ["击球点", "", 2], stance: ["步幅", "", 2], knee_deg: ["膝角", "°", 0],
+  trunk_lean: ["前倾", "°", 0], disguise: ["像杀球", "", 2],
+};
+const median = (xs) => {
+  const a = xs.filter((x) => typeof x === "number" && isFinite(x)).sort((p, q) => p - q);
+  if (!a.length) return null;
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+};
+const fmtNum = (x, d) => (x == null ? "—" : x.toFixed(d));
+const fmtClock2 = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+function seekResultVideo(t) {
+  setTab("videos");
+  const vids = [...$("tVideos").querySelectorAll("video")];
+  const vid = vids.find((x) => /combined\.mp4|skeleton\.mp4/.test(decodeURIComponent(x.src))) || vids[0];
+  if (!vid) return;
+  const go = () => { vid.currentTime = Math.max(0, t - 1.5); vid.play().catch(() => {}); };
+  if (vid.readyState >= 1) go(); else vid.addEventListener("loadedmetadata", go, { once: true });
+  vid.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function techniqueCard(doc, names) {
+  const keys = (doc.noted_metrics || Object.keys(TECH_LABEL)).filter((k) => TECH_LABEL[k]);
+  const strokes = (doc.strokes || []).filter((r) => r.ok);
+  if (!strokes.length) return null;
+  const ref = doc.reference_summary || {};
+  const wrap = el("div", "tech");
+  wrap.append(el("h3", "", "击球动作（和职业比）"));
+  const players = new Map();
+  for (const r of strokes) {
+    if (!players.has(r.player_id)) players.set(r.player_id, []);
+    players.get(r.player_id).push(r);
+  }
+  for (const [pid, rs] of players) {
+    const who = rs[0].player_name || names[pid] || pid + " 号";
+    wrap.append(el("h4", "", `${who} · ${rs.length} 拍`));
+    const groups = new Map();
+    for (const r of rs) {
+      if (!groups.has(r.group)) groups.set(r.group, []);
+      groups.get(r.group).push(r);
+    }
+    const table = document.createElement("table");
+    const head = table.insertRow();
+    for (const t of ["类型", "指标", "你", "职业", "偏离"]) head.append(el("th", "", t));
+    for (const [g, gs] of groups) {
+      let first = true;
+      for (const k of keys) {
+        const vals = gs.map((r) => r.metrics[k]).filter((x) => typeof x === "number");
+        if (!vals.length) continue;
+        const [label, unit, d] = TECH_LABEL[k];
+        const pro = ref[g] && ref[g][k] ? ref[g][k].p50 : null;
+        const off = gs.filter((r) => r.percentiles && r.percentiles[k] != null && (r.percentiles[k] <= 10 || r.percentiles[k] >= 90)).length;
+        const row = table.insertRow();
+        row.insertCell().textContent = first ? `${g} ${gs.length}拍` : "";
+        row.insertCell().textContent = label;
+        row.insertCell().textContent = fmtNum(median(vals), d) + (unit === "°" ? "°" : "");
+        row.insertCell().textContent = pro == null ? "—" : fmtNum(pro, d) + (unit === "°" ? "°" : "");
+        const c = row.insertCell();
+        c.textContent = off ? `${off}拍` : "";
+        if (off) c.className = "warn";
+        first = false;
+      }
+    }
+    if (table.rows.length > 1) wrap.append(table);
+    const noted = rs.filter((r) => r.notes && r.notes.length);
+    if (noted.length) {
+      const det = document.createElement("details");
+      det.append(el("summary", "", `有提示的 ${noted.length} 拍（点时间跳到视频）`));
+      const ul = el("ul", "technotes");
+      for (const r of noted) {
+        const li = el("li");
+        const a = el("button", "linkish", fmtClock2(r.time_s));
+        a.onclick = () => seekResultVideo(r.time_s);
+        li.append(a, el("b", "", " " + r.type + "："), document.createTextNode(r.notes.join("；")));
+        ul.append(li);
+      }
+      det.append(ul);
+      wrap.append(det);
+    }
+  }
+  const skipped = (doc.strokes || []).length - strokes.length;
+  wrap.append(el("p", "quiet small",
+    "只看近端球员，比的是中位数。击球点 = 手腕高出肩多少，步幅 = 两脚间距，都以躯干长（肩到髋）为单位；" +
+    "像杀球 = 吊球的引拍和自己杀球的差别，1 左右说明看不出来。「偏离」= 低于职业第 10 或高于第 90 百分位的拍数。" +
+    "职业参考：14 场职业单打转播的近端球员。" +
+    "击球类型是模型认的，可能有错" + (skipped ? `；另有 ${skipped} 拍关节看不清或类型可能判错，没有算` : "") +
+    "。手腕速度、转体、起跳、发力顺序受机位影响大，算了但没列出。"));
   return wrap;
 }
 

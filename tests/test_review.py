@@ -346,3 +346,38 @@ def test_exact_calibration_has_no_reprojection_claim(camera):
                              calib.frame_size)
     s = rv.build_summary(movement_json(), calib=noisy)
     assert s["camera"]["reprojection_error_px"] > 0 and "重投影" in rv.summary_text(s)
+
+
+def technique_digest():
+    from badminton import technique as TQ
+
+    doc = {"reference_summary": {"挑球": {"stance": {"p10": 0.37, "p50": 1.19, "p90": 1.84}}},
+           "strokes": [
+               {"ok": True, "player_id": 1, "player_name": "小王", "side": "near", "group": "挑球", "type": "挑球",
+                "time_s": 65.0, "metrics": {"stance": 0.29, "trunk_lean": 2.0, "wrist_speed": 9.0},
+                "percentiles": {"stance": 0, "wrist_speed": 95}, "notes": ["两脚间距（躯干长） 0.29 偏低"]},
+               {"ok": True, "player_id": 1, "player_name": "小王", "side": "near", "group": "挑球", "type": "挑球",
+                "time_s": 70.0, "metrics": {"stance": 1.1}, "percentiles": {"stance": 45}, "notes": []},
+               {"ok": False, "player_id": 1, "group": "杀球", "type": "杀球", "time_s": 80.0, "metrics": {}},
+           ]}
+    return TQ.digest(doc)
+
+
+def test_technique_digest_keeps_only_noted_numbers():
+    t = technique_digest()
+    (p,) = t["players"]
+    g = p["groups"]["挑球"]
+    assert g["n"] == 2 and "wrist_speed" not in g["metrics"]  # measured, but not a noted number
+    assert g["metrics"]["stance"] == {"median": 0.7, "pro_median": 1.19, "outside_pro_range": 1}
+    assert t["skipped"] == 1 and p["examples"][0]["time_s"] == 65.0
+
+
+def test_technique_goes_into_the_prompt_only_when_there():
+    s = rv.build_summary(movement_json(), source="match", technique=technique_digest())
+    system, user = rv.build_prompt(s)
+    assert "【击球动作】" in user and "## 击球动作" in user
+    assert "两脚间距（躯干长） 中位数 0.70（职业 1.19），1 拍超出职业范围" in user
+    assert "例：65.0 秒 挑球" in user and "另有 1 拍" in user
+    assert "没有每一拍的击球类型" not in user
+    plain = rv.build_prompt(rv.build_summary(movement_json(), source="match"))[1]
+    assert "【击球动作】" not in plain and "## 击球动作" not in plain
