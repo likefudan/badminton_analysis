@@ -101,3 +101,31 @@ def test_next_courts_rally_between_two_of_ours_is_dropped():
     assert not seen[40:90].any()                               # 40 points surely elsewhere in between
     out = drop_away_chains(rows[:60] + [(f, 1, 0, 0) for f in range(60, 90)] + rows[90:], tracks, weights, sure=sure)
     assert np.array([r[1] for r in out])[40:60].all()          # only 20 points elsewhere: kept
+
+
+def test_flight_never_near_our_players_hands_is_dropped():
+    """With this court's players known, a flight that never comes within FAR_FROM_HANDS body heights
+    of any of their wrists is another court's, even where its 3D fit cannot tell."""
+    from badminton.shuttle_tracks import hand_distance, rows_from_peaks
+
+    fps = 30.0
+    cam, calib, size = _scene(fps)
+    ours = cam.project(_flight([3.0, 2.0, 2.4], [0.5, 11.0, 9.0], 1.4, fps))
+    n = len(ours) + 10
+    peaks = _peaks(n, [(0, ours, 0.7)], size)
+
+    def hands_at(xy):
+        wr = np.full((n, 2, 2), np.nan)
+        wr[:, 0] = xy
+        return wr, np.full((n, 2), 400.0)
+
+    near, far = hands_at(ours[0] + [30, 40]), hands_at([100.0, 1000.0])
+    d = {}
+    seen = np.array([r[1] for r in rows_from_peaks(peaks, size, calib, fps=fps, hands=near, debug=d)])
+    assert seen[3:len(ours) - 3].mean() > 0.9
+    assert hand_distance(d["tracks"][:1], near)[0] < 0.2 and hand_distance(d["tracks"][:1], far)[0] > 1.5
+    seen = np.array([r[1] for r in rows_from_peaks(peaks, size, calib, fps=fps, hands=far)])
+    assert seen.sum() == 0
+    none = (np.full((n, 2, 2), np.nan), np.full((n, 2), np.nan))           # nobody seen: no judgement
+    seen = np.array([r[1] for r in rows_from_peaks(peaks, size, calib, fps=fps, hands=none)])
+    assert seen[3:len(ours) - 3].mean() > 0.9

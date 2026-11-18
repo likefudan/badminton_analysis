@@ -505,7 +505,7 @@ def auto_calibrate_video(work: Path, court: Path, duration: float, progress: Pro
 _ANALYZE_STAGES = (("== 2/4", "skeleton"), ("== 3/4", "label"), ("== 4/4", "stats"), ("== 剪掉死球时间", "cut"))
 
 
-SHUTTLE_VERSION = "5"  # raise when shuttle tracking changes, so recordings already on this Mac are tracked again
+SHUTTLE_VERSION = "6"  # raise when shuttle tracking changes, so recordings already on this Mac are tracked again
 _SEEN = re.compile(r"(\d+) 帧有球（([\d.]+)%）")
 
 
@@ -540,7 +540,11 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
         progress.update("shuttle", percent=done * 80 // total, detail=f"逐帧找球 {done}/{total} 帧")
 
     mark = len(log)
-    ok = run(["shuttle", str(work), "--court", str(court), "-o", str(csv)], log, on_line, on_frames) == 0 and csv.exists()
+    args = ["shuttle", str(work), "--court", str(court), "-o", str(csv)]
+    npz = out_dir / f"{work.stem}.skeleton.npz"
+    if npz.exists():  # this court's players: a flight that never comes near their hands is another court's
+        args += ["--skeleton", str(npz)]
+    ok = run(args, log, on_line, on_frames) == 0 and csv.exists()
     if ok:
         progress.update("shuttle", percent=80, detail="把球的轨迹画到骨架视频上")
         ok = run(["overlay", str(skeleton), "--shuttle", str(csv), "-o", str(combined)], log, None, None) == 0

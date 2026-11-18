@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--overlay", action="store_true", help="同时输出画了轨迹的视频 <视频名>.shuttle.mp4")
     s.add_argument("--court", help="球场标定：给了就用改进的选点（去掉静止干扰点、场地上方空间、按轨迹连续性挑点）")
     s.add_argument("--raw-output", help="另存 TrackNetV3 原版逐帧选点的结果（用来对比）")
+    s.add_argument("--skeleton", help="和 --court 一起用：skeleton 的 .npz（本场球员）。从来没靠近本场球员手腕的飞行算别的场地的")
     s.add_argument("--no-tracks", action="store_true",
                    help="和 --court 一起用：不按整段飞行挑本场的球（每帧只看 0.3 以上的候选，旧的选法）")
     s.add_argument("--frame-step", type=int, default=1,
@@ -919,8 +920,13 @@ def cmd_shuttle(a) -> int:
     if by_tracks:
         from .shuttle_tracks import rows_from_peaks
 
+        hands = None
+        if a.skeleton:
+            from .shuttle_tracks import hands_from_skeleton
+
+            hands = hands_from_skeleton(a.skeleton, calib, len(rows))
         rows = rows_from_peaks(debug["weak"], (info.width, info.height), calib, measured=measured,
-                               fps=info.fps, frame_step=a.frame_step, n_frames=len(rows))
+                               fps=info.fps, frame_step=a.frame_step, n_frames=len(rows), hands=hands)
     elif pick_path:
         from .shuttle_path import rows_from_candidates
 
