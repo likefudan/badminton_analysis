@@ -56,12 +56,12 @@ def test_overhead_numbers():
     assert r["prep"].shape == (TQ.PREP_SAMPLES, 17, 2)
 
 
-def test_chain_out_of_order_is_flagged():
+def test_chain_out_of_order_is_measured_but_not_noted():
     kp, sc, t = swing(peaks_s=(-0.02, -0.05, -0.08, -0.15))  # wrist first, hip last
     r = TQ.stroke_metrics(kp, sc, t, FPS, "杀球")
     assert r["metrics"]["chain_order_ok"] is False
     notes, _ = TQ.flags_for("杀球", r["metrics"], None)
-    assert any("发力顺序" in n for n in notes)
+    assert not any("发力顺序" in n for n in notes)  # measured, but not reliable enough to tell the player
 
 
 def test_low_contact_and_no_turn_flagged_without_reference():
@@ -274,3 +274,15 @@ def test_overhead_type_with_hand_below_shoulder_is_skipped():
     kp, sc, t = swing(contact=-0.5)  # BST said drop, but it was hit below the shoulders
     r = TQ.stroke_metrics(kp, sc, t, FPS, "吊球")
     assert not r["ok"] and "类型可能判错" in r["reason"]
+
+
+def test_unreliable_metrics_get_percentiles_but_no_notes(tmp_path):
+    ref = {"groups": {"杀球": {"turn": {"p10": 0.3, "p25": 0.4, "p50": 0.5, "p75": 0.6, "p90": 0.7},
+                               "contact_height": {"p10": 0.6, "p25": 0.9, "p50": 1.1, "p75": 1.2, "p90": 1.35}}}}
+    notes, pct = TQ.flags_for("杀球", {"turn": 1.1, "contact_height": 0.3}, ref)
+    assert pct == {"turn": 100, "contact_height": 0}
+    assert len(notes) == 1 and "击球点" in notes[0]
+    assert TQ.load_reference("none") == (None, None)
+    p = tmp_path / "r.json"
+    p.write_text('{"groups": {}}')
+    assert TQ.load_reference(p)[0] == {"groups": {}}

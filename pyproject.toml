@@ -36,7 +36,7 @@ badminton = "badminton.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-badminton = ["*.html"]
+badminton = ["*.html", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -95,6 +95,13 @@ METRIC_NAMES = {
     "trunk_lean": "躯干前倾（度）",
     "disguise": "吊球像杀球的程度（越小越像）",
 }
+# numbers compared with a reference and written into notes. Left out, after the pro run on FineBadminton
+# (14 broadcast matches): turn (shoulder-line width depends on camera height), jump (moving forward / back
+# shows as ankles rising), elbow_deg (p10 of pro smashes 42-78 deg: pose errors), and the swing order
+# (only 31% of pro overhead strokes come out "in order" at 25-30 fps). They stay in the JSON.
+FLAG_METRICS = ("contact_height", "wrist_speed", "backswing_elbow", "follow_through", "stance", "knee_deg",
+                "trunk_lean", "disguise")
+DEFAULT_REFERENCE = Path(__file__).with_name("technique_ref_pro_near.json")
 # metric -> True if larger is the "more" direction worth a flag text (for reference flags both ends are reported)
 NUMERIC = list(METRIC_NAMES)
 
@@ -429,9 +436,6 @@ def flags_for(group: str, m: dict, reference: dict | None) -> tuple[list[str], d
     """Plain-language notes and per-metric percentiles."""
     notes, pct = [], {}
     if group in OVERHEAD:
-        if m.get("chain_order_ok") is False:
-            c = m.get("chain_ms", {})
-            notes.append("发力顺序：" + "、".join(f"{k} {v:+d}ms" for k, v in c.items()) + "，不是从髋到手腕依次加速")
         if reference is None:
             if m.get("contact_height") is not None and m["contact_height"] < RULES["contact_low"]:
                 notes.append(f"击球点偏低：手腕只高出肩 {m['contact_height']:.2f} 个躯干长")
@@ -444,13 +448,26 @@ def flags_for(group: str, m: dict, reference: dict | None) -> tuple[list[str], d
             if p is None:
                 continue
             pct[k] = round(p)
-            if p <= 10 or p >= 90:
+            if k in FLAG_METRICS and (p <= 10 or p >= 90):
                 where = "偏低" if p <= 10 else "偏高"
                 notes.append(f"{METRIC_NAMES.get(k, k)} {v} {where}（参考的第 {round(p)} 百分位，中位数 {ref[k]['p50']}）")
     return notes, pct
 
 
 # ---------------------------------------------------------------- whole video
+
+
+def load_reference(path: str | Path | None = "auto") -> tuple[dict | None, str | None]:
+    """"auto": the pro reference shipped with the package (near-court players of 14 FineBadminton
+    matches), if present; "none" / None: no reference; else a technique-ref JSON file."""
+    if path in (None, "none"):
+        return None, None
+    p = DEFAULT_REFERENCE if path == "auto" else Path(path)
+    if not p.exists():
+        if path == "auto":
+            return None, None
+        raise FileNotFoundError(p)
+    return json.loads(p.read_text()), str(p)
 
 
 def frame_rows(frames: np.ndarray) -> np.ndarray:
