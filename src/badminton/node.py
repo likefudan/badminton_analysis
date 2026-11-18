@@ -761,7 +761,7 @@ def result_name(path: Path, stem: str) -> str:
 # least sure about (`badminton annotate-pack`) and uploads them. Labels made on the page come
 # back with the "labels" task and are written next to the recording as <video>.labels.csv.
 
-TASKS = ("process", "annotate", "labels", "strokes", "stroke-labels")
+TASKS = ("process", "annotate", "labels", "strokes", "stroke-labels", "rally-labels")
 
 
 def local_recording(cfg: Config, video: dict) -> tuple[Path, Path]:
@@ -991,6 +991,55 @@ def sync_stroke_labels(api: Api, cfg: Config, video: dict) -> None:
         print(f"  同步击球类型标注失败：{e}")
 
 
+# ---------- who won each rally, set on the result page ----------
+# "rally-labels": the winners a person clicked in 「回合和得失分」 are written next to the recording as
+# <video>.points.labels.csv (frame,winner,note); points.json and the AI report's summary are made again
+# with them and uploaded, so the page and the next report use them.
+
+RALLY_LABEL_UPLOADS = ("points.json", "review.request.json", "review.summary.json")
+
+
+def write_rally_labels_csv(path: Path, labels: dict) -> int:
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["frame", "winner", "note"])
+        for frame in sorted(labels, key=int):
+            lab = labels[frame]
+            w.writerow([int(frame), lab["winner"], lab.get("note", "")])
+    return len(labels)
+
+
+def sync_rally_labels(api: Api, cfg: Config, video: dict, run=None) -> None:
+    vid = video["id"]
+    try:
+        data = api.json("GET", f"/videos/{vid}/rally-labels")
+        job_dir, work = local_recording(cfg, video)
+        out_dir = next((d for d in (job_dir / "analysis", job_dir / "analysis-doubles")
+                        if (d / f"{work.stem}.strokes.json").exists()), None)
+        court = work.with_suffix(".court.json")
+        if out_dir is None or not court.exists():
+            print(f"  {video['filename']}：这台 Mac 上没有这段录像的击球结果，回合胜负先留在网站上")
+        else:
+            labels_csv = work.with_suffix(".points.labels.csv")
+            n = write_rally_labels_csv(labels_csv, data.get("labels") or {})
+            singles = (video.get("options") or {}).get("mode") != "doubles"
+            log: list[str] = []
+            points = rally_points(work, court, out_dir, singles, run=run)
+            if points is None:
+                raise StepFailed("重算回合得失分失败")
+            review_inputs(work, court, out_dir, log, run=run)
+            for name in RALLY_LABEL_UPLOADS:
+                f = out_dir / f"{work.stem}.{name}"
+                if f.exists():
+                    api.upload_result(vid, f, name)
+            print(f"{time.strftime('%H:%M:%S')} 回合胜负已同步到 {labels_csv}（{n} 个），得失分已重算并上传")
+        api.json("POST", f"/videos/{vid}/rally-labels/synced", {"changedAt": data.get("changedAt")})
+    except Exception as e:
+        print(f"  同步回合胜负失败：{e}")
+
+
 # ---------- the loop ----------
 
 def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
@@ -1130,6 +1179,8 @@ def _loop(api: Api, cfg: Config, status: "node_status.Reporter", once: bool, int
                 sync_labels(api, cfg, video)
             elif video and task == "stroke-labels":
                 sync_stroke_labels(api, cfg, video)
+            elif video and task == "rally-labels":
+                sync_rally_labels(api, cfg, video)
             elif video:
                 if task == "annotate":
                     print(f"{time.strftime('%H:%M:%S')} 准备标注材料 {video['filename']}（{video['id']}）")

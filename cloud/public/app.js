@@ -873,8 +873,7 @@ async function renderDetail() {
     try {
       const doc = await (await fetch(resultUrl(v, "points.json"))).json();
       if (openId !== v.id || key !== shownKey) return;
-      const card = pointsCard(doc, names);
-      if (card) stats.append(card);
+      await showPoints(v, doc, names, stats);
     } catch {}
   }
   const panes = { videos: $("tVideos"), cards: $("tCards") };
@@ -1181,32 +1180,88 @@ function statsTable(mv) {
 }
 
 // ---------- 回合和得失分（badminton points 的 points.json） ----------
-// 谁赢是按「死球后谁在哪捡球」推的，只有看到捡球的回合才计分；其余回合列出来但写「没判出」。
+// 程序按「死球后谁在哪捡球」判谁赢，只有看到捡球的回合才计分。超级管理员可以在每个回合点谁赢
+// （或「不算」），点了马上存进 rally_labels、这里当场重算；Mac 节点稍后同步，重算 points.json 和 AI 报告的摘要。
 
 const SIDE_ZH = { near: "近端", far: "远端" };
+const COUNTED = new Set(["high", "manual"]);
 
-function pointsCard(doc, names) {
-  const players = doc.players || [];
-  const rallies = (doc.rallies || []).filter((r) => !r.dead_ball);
-  if (!players.length || !rallies.length) return null;
+// 和 points.apply_labels 一样：标注对到最后一拍最近的回合（1.5 秒以内）
+function applyRallyLabels(doc, labels) {
+  const fps = doc.fps || 30;
+  const rows = (doc.rallies || []).map((r) => {
+    const base = r.program || r;
+    return { ...r, winner_side: base.winner_side, confidence: base.confidence, dead_ball: base.dead_ball, label: null };
+  });
+  for (const [frame, lab] of Object.entries(labels || {})) {
+    let best = null;
+    for (const r of rows) if (!best || Math.abs(r.last_hit.frame - frame) < Math.abs(best.last_hit.frame - frame)) best = r;
+    if (!best || Math.abs(best.last_hit.frame - frame) > 1.5 * fps) continue;
+    best.label = { frame: Number(frame), winner: lab.winner };
+    best.confidence = "manual";
+    best.dead_ball = lab.winner === "none";
+    best.winner_side = lab.winner === "none" ? null : lab.winner;
+  }
+  let n = 0;
+  for (const r of rows) {
+    const side = r.last_hit.side;
+    r.n = r.dead_ball ? 0 : ++n;
+    r.ending = null;
+    r.error = null;
+    if (r.dead_ball || !r.winner_side || !side) continue;
+    if (r.winner_side === side) r.ending = "winner";
+    else {
+      r.ending = "error";
+      // 没过网 / 出界 只在球的位置和谁丢分对得上时才有，沿用程序算的
+      const orig = (doc.rallies || []).find((x) => x.last_hit.frame === r.last_hit.frame);
+      const how = orig && orig.error && orig.winner_side === r.winner_side ? orig.error.how : null;
+      r.error = { kind: r.error_kind_if_lost || (orig && orig.error && orig.error.kind) || "unforced", how };
+    }
+  }
+  const players = (doc.players || []).map((p) => ({ ...p, winners: 0, errors: 0, unforced_errors: 0, forced_errors: 0 }));
+  const sides = { near: { points: 0, winners: 0, errors: 0 }, far: { points: 0, winners: 0, errors: 0 } };
+  for (const r of rows) {
+    if (r.dead_ball || !r.winner_side || !COUNTED.has(r.confidence)) continue;
+    sides[r.winner_side].points += 1;
+    sides[r.winner_side][r.ending === "winner" ? "winners" : "errors"] += r.ending ? 1 : 0;
+    const p = players.find((x) => x.id === r.last_hit.player_id);
+    if (!p || !r.ending) continue;
+    if (r.ending === "winner") p.winners += 1;
+    else { p.errors += 1; p[r.error.kind + "_errors"] += 1; }
+  }
+  const real = rows.filter((r) => !r.dead_ball);
+  return {
+    rows, players, sides, total: real.length,
+    judged: real.filter((r) => r.winner_side && COUNTED.has(r.confidence)).length,
+    labelled: rows.filter((r) => r.label).length,
+  };
+}
+
+function pointsCard(doc, names, labels = {}, onLabel = null) {
+  if (!(doc.players || []).length || !(doc.rallies || []).length) return null;
+  const d = applyRallyLabels(doc, labels);
   const wrap = el("div", "tech points");
   wrap.append(el("h3", "", "回合和得失分"));
-  const s = doc.sides || {};
-  wrap.append(el("p", "small",
-    `${doc.rallies_total} 个回合，判出谁赢的 ${doc.rallies_judged} 个` +
-    (doc.rallies_judged ? `：近端 ${s.near.points} 分，远端 ${s.far.points} 分` : "") +
-    "。谁赢是看死球后谁弯腰捡球、在哪捡推出来的，没看到捡球的回合不判；击球类型是模型认的。"));
-  const groups = [...new Set(players.flatMap((p) => Object.keys(p.strokes || {})))]
-    .sort((a, b) => players.reduce((n, p) => n + (p.strokes[b] || 0) - (p.strokes[a] || 0), 0));
   const who = (p) => p.name || names[p.id] || p.id + " 号";
+  const sideName = (side) => {
+    const ps = d.players.filter((p) => p.side === side).map(who);
+    return SIDE_ZH[side] + (ps.length ? `（${ps.join("、")}）` : "");
+  };
+  wrap.append(el("p", "small",
+    `${d.total} 个回合，判出谁赢的 ${d.judged} 个` + (d.labelled ? `（${d.labelled} 个是你标的）` : "") +
+    (d.judged ? `：${sideName("near")} ${d.sides.near.points} 分，${sideName("far")} ${d.sides.far.points} 分` : "") +
+    "。程序是看死球后谁弯腰捡球、在哪捡推出来的，没看到捡球的回合不判" +
+    (onLabel ? "；下面每个回合可以自己点谁赢。" : "。") + "击球类型是模型认的。"));
+  const groups = [...new Set(d.players.flatMap((p) => Object.keys(p.strokes || {})))]
+    .sort((a, b) => d.players.reduce((n, p) => n + (p.strokes[b] || 0) - (p.strokes[a] || 0), 0));
   const table = document.createElement("table");
   const head = table.insertRow();
   head.append(el("th", "", ""));
-  for (const p of players) head.append(el("th", "", who(p)));
+  for (const p of d.players) head.append(el("th", "", who(p)));
   const line = (label, f, cls) => {
     const row = table.insertRow();
     row.insertCell().textContent = label;
-    for (const p of players) {
+    for (const p of d.players) {
       const c = row.insertCell();
       c.textContent = f(p);
       if (cls && f(p)) c.className = cls;
@@ -1219,29 +1274,82 @@ function pointsCard(doc, names) {
   line("主动失误", (p) => p.unforced_errors || "", "warn");
   line("受迫失误", (p) => p.forced_errors || "");
   wrap.append(table);
+
   const det = document.createElement("details");
-  det.append(el("summary", "", "每个回合（点时间跳到视频）"));
-  const ul = el("ul", "technotes");
-  const nameOf = (id) => { const p = players.find((x) => x.id === id); return p ? who(p) : id + " 号"; };
-  for (const r of rallies) {
+  det.open = Boolean(onLabel) && d.judged < d.total;
+  det.append(el("summary", "", onLabel ? "每个回合：点谁赢（点时间跳到视频）" : "每个回合（点时间跳到视频）"));
+  const ul = el("ul", "technotes rallies");
+  const nameOf = (id) => { const p = d.players.find((x) => x.id === id); return p ? who(p) : id + " 号"; };
+  for (const r of d.rows) {
+    // 程序当成「把球打回去」的一两拍，不显示，除非有人标过
+    if ((r.program || r).dead_ball && !r.label) continue;
     const li = el("li");
     const a = el("button", "linkish", fmtClock2(r.start_s));
     a.onclick = () => seekResultVideo(r.start_s + 1.5);
     let text;
-    if (r.confidence === "high" && r.winner_side) {
-      const last = r.last_hit;
+    const last = r.last_hit;
+    if (r.dead_ball) text = "不算回合";
+    else if (r.winner_side && COUNTED.has(r.confidence)) {
       const how = r.ending === "winner" ? "制胜球"
-        : (r.error.kind === "unforced" ? "主动失误" : "受迫失误") + (r.error.how ? `（${r.error.how}）` : "");
+        : r.ending === "error" ? (r.error.kind === "unforced" ? "主动失误" : "受迫失误") + (r.error.how ? `（${r.error.how}）` : "") : "";
       text = `${SIDE_ZH[r.winner_side]}得分：${nameOf(last.player_id)} ${last.needs_review ? "" : last.type + " "}${how}`;
-    } else {
-      text = "没判出谁赢";
+    } else text = "没判出谁赢";
+    const title = r.dead_ball ? " " : ` 回合 ${r.n} · ${r.hits} 拍：`;
+    li.append(a, el("b", "", title), document.createTextNode(text));
+    if (r.label) li.append(el("span", "by", " · 你标的"));
+    else if (r.confidence === "high") li.append(el("span", "by", " · 程序看到捡球"));
+    if (onLabel) {
+      const pick = el("span", "pick");
+      const now = r.label ? r.label.winner : null;
+      for (const [w, t] of [["near", "近端赢"], ["far", "远端赢"], ["none", "不算"]]) {
+        const btn = el("button", "plain" + (now === w ? " on" : ""), t);
+        btn.onclick = () => onLabel(r.label ? r.label.frame : last.frame, now === w ? null : w);
+        pick.append(btn);
+      }
+      li.append(pick);
     }
-    li.append(a, el("b", "", ` 回合 ${r.n} · ${r.hits} 拍：`), document.createTextNode(text));
     ul.append(li);
   }
   det.append(ul);
   wrap.append(det);
   return wrap;
+}
+
+// 在结果页上显示、并让超级管理员标谁赢
+async function showPoints(v, doc, names, holder) {
+  let labels = {};
+  const editable = isOwner();
+  if (editable) {
+    try { labels = (await api(`/videos/${v.id}/rally-labels`)).labels || {}; } catch {}
+  }
+  let card = null;
+  const draw = () => {
+    const next = pointsCard(doc, names, labels, editable ? save : null);
+    if (!next) return;
+    const wasOpen = card && card.querySelector("details") && card.querySelector("details").open;
+    if (card) {
+      if (wasOpen) next.querySelector("details").open = true;
+      card.replaceWith(next);
+    } else holder.append(next);
+    card = next;
+  };
+  async function save(frame, winner) {
+    const before = labels;
+    labels = { ...labels };
+    if (winner) labels[frame] = { winner }; else delete labels[frame];
+    draw();
+    try {
+      await api(`/videos/${v.id}/rally-labels`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: [winner ? { frame, winner } : { frame, delete: true }] }),
+      });
+    } catch (e) {
+      labels = before;
+      draw();
+      alert("没存上：" + e.message);
+    }
+  }
+  draw();
 }
 
 // ---------- 击球动作：每拍和职业近端参考比（badminton technique 的 technique.json） ----------

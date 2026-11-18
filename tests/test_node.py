@@ -441,6 +441,42 @@ def test_rally_points_runs_after_strokes_and_feeds_the_review(tmp_path):
     assert not (tmp_path / "v.points.json").exists()
 
 
+def test_sync_rally_labels_writes_csv_recomputes_and_uploads(tmp_path):
+    cfg = node.Config(url="http://x", token="t", name="mac", work_dir=tmp_path)
+    video = {"id": "a" * 8 + "-" + "b" * 27, "filename": "game.mp4", "options": {"mode": "doubles"}}
+    job = tmp_path / video["id"]
+    out = job / "analysis-doubles"
+    out.mkdir(parents=True)
+    (job / "game.mp4").write_text("")
+    (job / "game.court.json").write_text("{}")
+    for name in ("game.skeleton.npz", "game.shuttle.csv", "game.strokes.json", "game.movement.json"):
+        (out / name).write_text("{}")
+    calls, sent = [], []
+
+    def run(args, log, on_line=None, on_frames=None):
+        calls.append(args)
+        if args[0] == "points":
+            (out / "game.points.json").write_text("{}")
+        if args[0] == "review":
+            (out / "game.review.request.json").write_text("{}")
+        return 0
+
+    class FakeApi:
+        def json(self, method, path, body=None, **kw):
+            sent.append((method, path, body))
+            return {"labels": {"120": {"winner": "near", "note": ""}, "40": {"winner": "none", "note": "热身"}},
+                    "changedAt": "2026-11-18T03:00:00Z"} if method == "GET" else {}
+
+        def upload_result(self, vid, path, name):
+            sent.append(("UPLOAD", name, path.name))
+
+    node.sync_rally_labels(FakeApi(), cfg, video, run=run)
+    assert (job / "game.points.labels.csv").read_text().splitlines() == ["frame,winner,note", "40,none,热身", "120,near,"]
+    assert [c[0] for c in calls] == ["points", "review"] and "--singles" not in calls[0]
+    assert ("UPLOAD", "points.json", "game.points.json") in sent and ("UPLOAD", "review.request.json", "game.review.request.json") in sent
+    assert sent[-1] == ("POST", f"/videos/{video['id']}/rally-labels/synced", {"changedAt": "2026-11-18T03:00:00Z"})
+
+
 def technique_runner(fail=None, notes=2):
     calls = []
 

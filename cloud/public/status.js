@@ -10,7 +10,7 @@ const Mac = (() => {
   let error = "";
   const open = new Set();       // 展开了日志的任务：刷新后保持展开
   const ONLINE_MS = 90 * 1000;
-  const KIND = { process: "分析录像", annotate: "准备球位置标注", strokes: "准备击球类型标注", labels: "同步球位置标注", "stroke-labels": "同步击球类型标注" };
+  const KIND = { process: "分析录像", annotate: "准备球位置标注", strokes: "准备击球类型标注", labels: "同步球位置标注", "stroke-labels": "同步击球类型标注", "rally-labels": "同步回合胜负" };
   const now = () => Date.now() + skew;
   const ago = (iso) => (iso ? Math.max(0, (now() - new Date(iso)) / 1000) : NaN);
   const clock = (iso) => new Date(iso).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });

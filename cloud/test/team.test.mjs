@@ -209,6 +209,9 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   assert.equal((await putLabel(alice, 51)).status, 409);      // 管理员也不能写别人正在标的
   assert.equal((await putLabel(alice, 10)).status, 200);      // 别的地方管理员可以改
   assert.equal((await bob.put(`/videos/${vid}/stroke-labels`, { items: [{ frame: 100, type: "杀球" }] })).status, 403);
+  // 回合谁赢只有超级管理员能看能改，标注员不行
+  assert.equal((await bob.put(`/videos/${vid}/rally-labels`, { items: [{ frame: 100, winner: "near" }] })).status, 403);
+  assert.equal((await bob.get(`/videos/${vid}/rally-labels`)).status, 403);
   list = await (await carol.get("/tasks")).json();
   assert.ok(!list.tasks.some((t) => t.id === rally2.id)); // 别人领走的不显示
 

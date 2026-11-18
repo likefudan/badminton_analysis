@@ -266,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--shuttle", help="badminton shuttle 输出的 CSV，默认 <视频名>.shuttle.csv")
     s.add_argument("--players", help="球员名字文件，默认 <视频名>.players.json")
     s.add_argument("--singles", action="store_true", help="单打：每边 1 人（要和跑 strokes 时一样）")
+    s.add_argument("--labels", help="结果页上人标的谁赢（frame,winner,note），默认 <视频名>.points.labels.csv，有就用")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
     s = sub.add_parser("technique-ref", help="把多个 technique.json 合成参考分布（每种球每个指标的百分位）")
@@ -1124,7 +1125,8 @@ def cmd_points(a) -> int:
     players = Path(a.players) if a.players else video.with_suffix(".players.json")
     names = json.loads(players.read_text()) if players.exists() else {}
     per_side = 1 if a.singles else _players_per_side(data_path)
-    doc = PT.run(strokes_path, shuttle_path, data_path, CourtCalibration.load(a.court), per_side, names)
+    labels = Path(a.labels) if a.labels else video.with_suffix(".points.labels.csv")
+    doc = PT.run(strokes_path, shuttle_path, data_path, CourtCalibration.load(a.court), per_side, names, labels)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{video.stem}.points.json"
     out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))

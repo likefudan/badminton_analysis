@@ -440,6 +440,34 @@ test("标注：网页请求、节点领取切图任务、传图、网页按 Rang
   assert.equal((await call(`/videos/${v.id}/labels`)).status, 404);
 });
 
+test("回合谁赢：存、改回程序的判断、节点同步", async () => {
+  const json = { "content-type": "application/json" };
+  const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
+  const tasks = ["rally-labels"];
+  const data = randomBytes(100);
+  const v = await (await post("/videos", { filename: "rally.mp4", size: data.length, contentType: "video/mp4" })).json();
+  await call(`/videos/${v.id}/parts/1`, { method: "PUT", body: data });
+  await post(`/videos/${v.id}/complete`);
+  const put = (items) => call(`/videos/${v.id}/rally-labels`, { method: "PUT", headers: json, body: JSON.stringify({ items }) });
+  assert.equal((await put([{ frame: 10, winner: "me" }])).status, 400);
+  assert.equal((await put([{ frame: -1, winner: "near" }])).status, 400);
+  assert.equal((await put([])).status, 400);
+  assert.equal((await put([{ frame: 120, winner: "near" }, { frame: 40, winner: "none", note: " 热身 " }, { frame: 300, winner: "far" }])).status, 200);
+  const { changedAt } = await (await put([{ frame: 300, delete: true }, { frame: 120, winner: "far" }])).json();
+  const got = await (await call(`/videos/${v.id}/rally-labels`)).json();
+  assert.equal(got.changedAt, changedAt);
+  assert.deepEqual(Object.fromEntries(Object.entries(got.labels).map(([f, l]) => [f, [l.winner, l.note]])), { 40: ["none", "热身"], 120: ["far", ""] });
+  assert.equal((await (await call(`/videos/${v.id}`)).json()).rallyLabels.count, 2);
+
+  await new Promise((r) => setTimeout(r, 20));
+  const sync = await (await post("/node/claim", { node: "mac", tasks })).json();
+  assert.equal(sync.task, "rally-labels");
+  assert.equal(sync.video.id, v.id);
+  await post(`/videos/${v.id}/rally-labels/synced`, { changedAt });
+  assert.equal((await (await post("/node/claim", { node: "mac", tasks })).json()).video, null);
+  assert.equal((await call(`/videos/${v.id}`, { method: "DELETE" })).status, 200);
+});
+
 test("击球类型：请求、节点准备、读小视频、存标注、下载 CSV、同步", async () => {
   const json = { "content-type": "application/json" };
   const post = (path, body) => call(path, { method: "POST", headers: json, body: JSON.stringify(body ?? {}) });
