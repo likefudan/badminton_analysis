@@ -152,6 +152,42 @@ def test_analyse_video_and_reference():
     assert pct["contact_height"] == 0 and "偏低" in notes[0]
 
 
+def test_analyse_skeleton_run_every_other_frame():
+    """--stride 2 skeleton: frames without a skeleton row are not counted as unseen, and speeds stay per second."""
+    hits = [100, 201, 300]
+    n = 400
+    keypoints = np.full((n, 2, 17, 2), np.nan)
+    scores = np.zeros((n, 2, 17))
+    for h in hits:
+        kp, sc, t = swing()
+        f = (h + np.round(t * FPS)).astype(int)
+        keypoints[f, 0], scores[f, 0] = kp, sc
+    full = {"frame": np.arange(n), "keypoints": keypoints, "scores": scores}
+    half = {"frame": np.arange(0, n, 2), "keypoints": keypoints[::2], "scores": scores[::2]}
+    strokes = [{"frame": h, "player_id": 7, "side": "near", "type": "杀球", "group": "杀球", "needs_review": False}
+               for h in hits]
+    out = {}
+    for name, data in (("full", full), ("half", half)):
+        det = np.where(data["scores"][:, 0].any(1), 0, -1)
+        res = TQ.analyse(data, _Tracking([_Track(7, 0, det)]), strokes, FPS)
+        assert all(r["ok"] for r in res), [r["reason"] for r in res]
+        out[name] = res
+    for a, b in zip(out["full"], out["half"]):
+        assert b["seen_share"] == pytest.approx(1.0)
+        assert b["airborne_at_hit"] is False  # looked up at the nearest processed frame
+        assert b["metrics"]["contact_height"] == pytest.approx(a["metrics"]["contact_height"], abs=0.05)
+        assert b["metrics"]["wrist_speed"] == pytest.approx(a["metrics"]["wrist_speed"], rel=0.2)
+
+
+def test_steadiness_needs_two_players():
+    def r(pid, v):
+        return {"ok": True, "group": "杀球", "player_id": pid, "metrics": {"contact_height": v}}
+    one = [r(1, v) for v in (0.5, 0.7, 0.9, 1.1, 1.3, 1.5)]
+    assert TQ.summary(one)["杀球"]["steadiness"] == {}  # within == overall: always 1.0, says nothing
+    two = [r(1, v) for v in (0.5, 0.55, 0.6)] + [r(2, v) for v in (1.4, 1.45, 1.5)]
+    assert TQ.summary(two)["杀球"]["steadiness"]["contact_height"] < 0.2
+
+
 def test_percentile_interpolation():
     ref = {"p10": 1.0, "p25": 2.0, "p50": 3.0, "p75": 4.0, "p90": 5.0}
     assert TQ.percentile_of(3.0, ref) == 50

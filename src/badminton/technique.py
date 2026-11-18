@@ -145,10 +145,13 @@ def _speed(xy: np.ndarray, fps: float) -> np.ndarray:
 def stroke_window(data: dict, row_of: np.ndarray, det_index: np.ndarray, hit_frame: int, fps: float,
                   before_s: float = BEFORE_S, after_s: float = AFTER_S):
     """Keypoints, scores and times (s from the hit) of one tracked player around a hit.
-    Frames the player was not detected in come back NaN / score 0."""
+    Only frames the skeleton was run on are returned (with --stride 2 every other frame), so
+    the samples are 1 / effective_fps apart. Frames the player was not detected in come back
+    NaN / score 0."""
     n_frames = len(row_of)
     f = np.arange(hit_frame - round(before_s * fps), hit_frame + round(after_s * fps) + 1)
     f = f[(f >= 0) & (f < n_frames)]
+    f = f[row_of[f] >= 0]
     rows = row_of[f]
     kp = np.full((len(f), 17, 2), np.nan)
     sc = np.zeros((len(f), 17))
@@ -340,6 +343,9 @@ def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near"
             reference: dict | None = None) -> list[dict]:
     """One result per stroke of the chosen groups and sides."""
     row_of = frame_rows(data["frame"])
+    # skeleton run with --stride k: windows hold every k-th frame, so speeds and smoothing use fps / k
+    step = float(np.median(np.diff(data["frame"]))) if len(data["frame"]) > 1 else 1.0
+    fps_eff = fps / max(step, 1.0)
     by_id = {t.id: t for t in tracking.tracks}
     out = []
     picks = [s for s in strokes if s.get("group") in GROUPS and s.get("side") in sides
@@ -351,14 +357,14 @@ def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near"
         tr = by_id[s["player_id"]]
         kp, sc, t = stroke_window(data, row_of, tr.det_index, int(s["frame"]), fps)
         windows.append((kp, sc, t))
-        smooth = fill_and_smooth(kp, sc >= KPT_THR, fps)
+        smooth = fill_and_smooth(kp, sc >= KPT_THR, fps_eff)
         if np.isfinite(smooth[:, [L_WR, R_WR]]).all() and len(t) >= 5:
             hands.setdefault(s["player_id"], []).append(racket_side(smooth, t))
     hand_of = {p: max(set(v), key=v.count) for p, v in hands.items()}
     for s, (kp, sc, t) in zip(picks, windows):
-        r = stroke_metrics(kp, sc, t, fps, s["group"], hand_of.get(s["player_id"]))
+        r = stroke_metrics(kp, sc, t, fps_eff, s["group"], hand_of.get(s["player_id"]))
         tr = by_id[s["player_id"]]
-        row = row_of[min(int(s["frame"]), len(row_of) - 1)]
+        row = int(np.argmin(np.abs(np.asarray(data["frame"]) - int(s["frame"]))))  # nearest processed frame
         airborne = bool(tr.airborne[row]) if row >= 0 and getattr(tr, "airborne", None) is not None else None
         out.append({"frame": int(s["frame"]), "time_s": s.get("time_s", round(s["frame"] / fps, 3)),
                     "player_id": s["player_id"], "player_name": s.get("player_name", ""), "side": s["side"],
@@ -394,7 +400,8 @@ def summary(results: list[dict]) -> dict:
         for k in keys:
             allv = np.array([r["metrics"][k] for r in rs if isinstance(r["metrics"].get(k), (int, float))], float)
             within = [p[k]["std"] for p in gd["players"].values() if k in p and p[k]["n"] >= 3]
-            if len(allv) >= 6 and within and allv.std() > 0:
+            # needs two players: with one, within-player and overall spread are the same strokes (always 1.0)
+            if len(allv) >= 6 and len(within) >= 2 and allv.std() > 0:
                 gd["steadiness"][k] = round(float(np.mean(within) / allv.std()), 2)
         out[g] = gd
     return out
