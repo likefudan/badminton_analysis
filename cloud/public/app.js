@@ -869,6 +869,14 @@ async function renderDetail() {
       if (card) stats.append(card);
     } catch {}
   }
+  if (have.has("points.json")) {
+    try {
+      const doc = await (await fetch(resultUrl(v, "points.json"))).json();
+      if (openId !== v.id || key !== shownKey) return;
+      const card = pointsCard(doc, names);
+      if (card) stats.append(card);
+    } catch {}
+  }
   const panes = { videos: $("tVideos"), cards: $("tCards") };
   for (const pane of Object.values(panes)) pane.textContent = "";
   for (const [where, pattern, title] of RESULT_ORDER) {
@@ -1169,6 +1177,70 @@ function statsTable(mv) {
     for (const c of cells) row.insertCell().textContent = c;
   }
   wrap.append(table);
+  return wrap;
+}
+
+// ---------- 回合和得失分（badminton points 的 points.json） ----------
+// 谁赢是按「死球后谁在哪捡球」推的，只有看到捡球的回合才计分；其余回合列出来但写「没判出」。
+
+const SIDE_ZH = { near: "近端", far: "远端" };
+
+function pointsCard(doc, names) {
+  const players = doc.players || [];
+  const rallies = (doc.rallies || []).filter((r) => !r.dead_ball);
+  if (!players.length || !rallies.length) return null;
+  const wrap = el("div", "tech points");
+  wrap.append(el("h3", "", "回合和得失分"));
+  const s = doc.sides || {};
+  wrap.append(el("p", "small",
+    `${doc.rallies_total} 个回合，判出谁赢的 ${doc.rallies_judged} 个` +
+    (doc.rallies_judged ? `：近端 ${s.near.points} 分，远端 ${s.far.points} 分` : "") +
+    "。谁赢是看死球后谁弯腰捡球、在哪捡推出来的，没看到捡球的回合不判；击球类型是模型认的。"));
+  const groups = [...new Set(players.flatMap((p) => Object.keys(p.strokes || {})))]
+    .sort((a, b) => players.reduce((n, p) => n + (p.strokes[b] || 0) - (p.strokes[a] || 0), 0));
+  const who = (p) => p.name || names[p.id] || p.id + " 号";
+  const table = document.createElement("table");
+  const head = table.insertRow();
+  head.append(el("th", "", ""));
+  for (const p of players) head.append(el("th", "", who(p)));
+  const line = (label, f, cls) => {
+    const row = table.insertRow();
+    row.insertCell().textContent = label;
+    for (const p of players) {
+      const c = row.insertCell();
+      c.textContent = f(p);
+      if (cls && f(p)) c.className = cls;
+    }
+  };
+  line("击球", (p) => p.hits);
+  for (const g of groups) line(g, (p) => p.strokes[g] || "");
+  line("类型没把握", (p) => p.hits_unsure || "");
+  line("制胜球", (p) => p.winners || "");
+  line("主动失误", (p) => p.unforced_errors || "", "warn");
+  line("受迫失误", (p) => p.forced_errors || "");
+  wrap.append(table);
+  const det = document.createElement("details");
+  det.append(el("summary", "", "每个回合（点时间跳到视频）"));
+  const ul = el("ul", "technotes");
+  const nameOf = (id) => { const p = players.find((x) => x.id === id); return p ? who(p) : id + " 号"; };
+  for (const r of rallies) {
+    const li = el("li");
+    const a = el("button", "linkish", fmtClock2(r.start_s));
+    a.onclick = () => seekResultVideo(r.start_s + 1.5);
+    let text;
+    if (r.confidence === "high" && r.winner_side) {
+      const last = r.last_hit;
+      const how = r.ending === "winner" ? "制胜球"
+        : (r.error.kind === "unforced" ? "主动失误" : "受迫失误") + (r.error.how ? `（${r.error.how}）` : "");
+      text = `${SIDE_ZH[r.winner_side]}得分：${nameOf(last.player_id)} ${last.needs_review ? "" : last.type + " "}${how}`;
+    } else {
+      text = "没判出谁赢";
+    }
+    li.append(a, el("b", "", ` 回合 ${r.n} · ${r.hits} 拍：`), document.createTextNode(text));
+    ul.append(li);
+  }
+  det.append(ul);
+  wrap.append(det);
   return wrap;
 }
 

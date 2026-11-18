@@ -198,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--shuttle-offset", type=float, default=0.0, help="羽毛球 CSV 第 0 帧在统计时间轴上的秒数")
     s.add_argument("--shuttle-accuracy", type=float, help="人工核对过的羽毛球位置正确率（%%），写进数据质量说明")
     s.add_argument("--technique", help="badminton technique 输出的 technique.json：击球类型和每拍动作和职业的比较")
+    s.add_argument("--points", help="badminton points 输出的 points.json：每个回合谁赢、每人各类击球次数和失误")
     s.add_argument("--response", help="把聊天模型的回答（文本文件）导入，生成 Markdown 和 HTML 报告")
     s.add_argument("--api", action="store_true",
                    help="通过 Anthropic API 直接出点评（需要 ANTHROPIC_API_KEY；只发送统计摘要文字）。不加就只写提示词文件，不联网")
@@ -257,6 +258,16 @@ def main(argv: list[str] | None = None) -> int:
                    "none（不比）或 technique-ref 生成的 JSON；偏离参考 10%%/90%% 的数写进提示")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
+    s = sub.add_parser("points", help="每个回合谁赢、怎么结束，每人各类击球次数、制胜球和失误（要先跑 strokes）")
+    s.add_argument("video")
+    s.add_argument("--court", required=True, help="calibrate 生成的 court.json")
+    s.add_argument("--strokes", help="badminton strokes 输出的 strokes.json，默认 <视频名>.strokes.json")
+    s.add_argument("--data", help="skeleton 生成的 .npz，默认 <视频名>.skeleton.npz")
+    s.add_argument("--shuttle", help="badminton shuttle 输出的 CSV，默认 <视频名>.shuttle.csv")
+    s.add_argument("--players", help="球员名字文件，默认 <视频名>.players.json")
+    s.add_argument("--singles", action="store_true", help="单打：每边 1 人（要和跑 strokes 时一样）")
+    s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
+
     s = sub.add_parser("technique-ref", help="把多个 technique.json 合成参考分布（每种球每个指标的百分位）")
     s.add_argument("output", help="输出的参考 JSON")
     s.add_argument("inputs", nargs="+", help="badminton technique 输出的 *.technique.json")
@@ -269,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "annotate-strokes": cmd_annotate_strokes, "positioning": cmd_positioning,
             "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes,
-            "technique": cmd_technique, "technique-ref": cmd_technique_ref}[a.cmd](a)
+            "technique": cmd_technique, "technique-ref": cmd_technique_ref,
+            "points": cmd_points}[a.cmd](a)
 
 
 def _model_args(s: argparse.ArgumentParser) -> None:
@@ -1096,6 +1108,31 @@ def cmd_technique(a) -> int:
     return 0
 
 
+def cmd_points(a) -> int:
+    from . import points as PT
+    from .court import CourtCalibration
+
+    video = Path(a.video)
+    out_dir = Path(a.out_dir) if a.out_dir else video.parent
+    data_path = Path(a.data) if a.data else video.with_suffix(".skeleton.npz")
+    strokes_path = Path(a.strokes) if a.strokes else out_dir / f"{video.stem}.strokes.json"
+    shuttle_path = Path(a.shuttle) if a.shuttle else video.with_suffix(".shuttle.csv")
+    for path, how in ((data_path, "badminton skeleton"), (shuttle_path, "badminton shuttle"),
+                      (strokes_path, "badminton strokes")):
+        if not path.exists():
+            raise SystemExit(f"找不到 {path}：先运行 {how}")
+    players = Path(a.players) if a.players else video.with_suffix(".players.json")
+    names = json.loads(players.read_text()) if players.exists() else {}
+    per_side = 1 if a.singles else _players_per_side(data_path)
+    doc = PT.run(strokes_path, shuttle_path, data_path, CourtCalibration.load(a.court), per_side, names)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{video.stem}.points.json"
+    out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    print("\n".join(PT.summary_lines(doc)))
+    print(f"已写入 {out}")
+    return 0
+
+
 def cmd_technique_ref(a) -> int:
     from . import technique as TQ
 
@@ -1280,8 +1317,13 @@ def cmd_review(a) -> int:
         from .technique import digest
 
         technique = digest(json.loads(Path(a.technique).read_text()))
+    points = None
+    if a.points:
+        from .points import digest as points_digest
+
+        points = points_digest(json.loads(Path(a.points).read_text()))
     summary = rv.build_summary(movement, source=stem, extras=extras, calib=calib, shuttle=shuttle,
-                               shuttle_accuracy_pct=a.shuttle_accuracy, technique=technique)
+                               shuttle_accuracy_pct=a.shuttle_accuracy, technique=technique, points=points)
     previous = json.loads(Path(a.previous).read_text()) if a.previous else None
     out_dir = Path(a.out_dir) if a.out_dir else path.parent
     out_dir.mkdir(parents=True, exist_ok=True)

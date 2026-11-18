@@ -129,13 +129,14 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
 
 def build_summary(movement: dict, *, source: str = "", extras: dict | None = None, calib=None,
                   shuttle: dict | None = None, shuttle_accuracy_pct: float | None = None,
-                  technique: dict | None = None) -> dict:
+                  technique: dict | None = None, points: dict | None = None) -> dict:
     """Compact, deterministic match summary from a movement JSON.
 
     extras: other analysis JSONs by name (e.g. positioning), passed through compacted.
     calib: CourtCalibration, for camera height and per-player position precision.
     shuttle: shuttle_stats() output. shuttle_accuracy_pct: hand-audited accuracy, if known.
     technique: technique.digest() of the stroke technique (types and how each stroke compares with the pros).
+    points: points.digest(): who won the rallies that could be called, strokes and errors per player.
     """
     in_play = float(movement.get("in_play_s", 0.0))
     duration = float(movement.get("duration_s", 0.0))
@@ -221,6 +222,8 @@ def build_summary(movement: dict, *, source: str = "", extras: dict | None = Non
         summary["extras"] = {k: compact(v) for k, v in extras.items()}
     if technique and technique.get("players"):
         summary["technique"] = technique
+    if points and points.get("players"):
+        summary["points"] = points
     summary["caveats"] = _caveats(summary)
     return summary
 
@@ -254,7 +257,10 @@ def _caveats(s: dict) -> list[str]:
     """Data-quality notes worked out from the numbers themselves (Chinese, for the prompt and the report)."""
     m, d = s["match"], s["definitions"]
     out = [
-        ("击球类型是模型认的，只有近端球员有动作数字；没有比分、没有落点、不知道每个回合谁赢。" if s.get("technique") else
+        (("击球类型是模型认的，只有近端球员有动作数字；" if s.get("technique") else "击球类型是模型认的；")
+         + f"没有比分；{s['points']['rallies_total']} 个回合里只有 {s['points']['rallies_judged']} 个判出了谁赢"
+           "（看死球后谁在哪捡球），其余不知道。" if s.get("points") else
+         "击球类型是模型认的，只有近端球员有动作数字；没有比分、没有落点、不知道每个回合谁赢。" if s.get("technique") else
          "数据里只有跑动和站位：没有比分、没有每一拍的击球类型和落点、不知道每个回合谁赢。"),
         f"回合是按球员动作切的（有人超过 {d['rally_active_speed_mps']:g} 米/秒算回合中，都慢于它超过 "
         f"{d['rally_pause_min_s']:g} 秒算死球）：回合开头常漏 1–2 秒，慢节奏的相持可能被切成两段，"
@@ -370,6 +376,10 @@ def summary_text(s: dict) -> str:
             lines.append(t)
     if s.get("technique"):
         lines += technique_text(s["technique"])
+    if s.get("points"):
+        from .points import digest_text
+
+        lines += digest_text(s["points"])
     for name, extra in (s.get("extras") or {}).items():
         lines.append(f"【其他分析：{name}】")
         lines.append(json.dumps(extra, ensure_ascii=False, sort_keys=True))
@@ -438,6 +448,8 @@ COMPARE_REQUEST = """另外数据里有上一次的摘要。在「比赛概况�
 
 TECHNIQUE_REQUEST = """数据里有「【击球动作】」。在「三个练习建议」之前加一个二级标题「## 击球动作」：每位有数据的球员两三句，只谈超出职业范围的拍数多的那几项（击球点、两脚间距、膝角、躯干前倾、吊球像不像杀球），引用一两个例子的时间，说这在动作上可能意味着什么。要说明击球类型是模型认的、业余和职业单打转播的机位不同，所以这些只是提示，不是定论；拍数少于 3 的组不要下结论。"""
 
+POINTS_REQUEST = """数据里有「【回合和得失分】」。在「三个练习建议」之前加一个二级标题「## 得失分」：先说一共多少回合、其中多少个判出了谁赢；再说每位球员各类击球的次数（只说有把握的，并说明有多少拍没把握）、制胜球和失误（主动、受迫）各几次，引用回合编号和时间。判出的回合少于一半时要明说这些数只是一部分回合，不能代表整场，也不要据此说谁赢。失误记在「程序找到的最后一拍」的人头上，最后一拍漏掉时会记错人，这一点要提一句。"""
+
 ASK_REQUEST = """下面是球友的追问。根据上面的数据（以及你之前写的点评，如果有）回答，规则不变：只用给出的数字，带单位，引用回合编号和时间；数据答不了的就直说答不了，并说明需要什么数据。
 
 追问：{question}"""
@@ -482,6 +494,8 @@ def build_prompt(summary: dict, previous: dict | None = None) -> tuple[str, str]
         parts += ["", COMPARE_REQUEST]
     if summary.get("technique"):
         parts += ["", TECHNIQUE_REQUEST]
+    if summary.get("points"):
+        parts += ["", POINTS_REQUEST]
     return SYSTEM_PROMPT, "\n".join(parts)
 
 
