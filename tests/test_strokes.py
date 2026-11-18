@@ -129,5 +129,29 @@ def test_classify_hits_end_to_end():
     res = ST.classify_hits(skel, _Tracking(tracks), hits, np.full((90, 2), np.nan), _calib(), [model], 30.0)
     assert [r["side"] for r in res] == ["near", "far"]
     assert [r["opponent_id"] for r in res] == [2, 1]
-    for r in res:
+    # the first hit (3.7 m from the net, returned from 3.3 m) is a short serve by rule
+    assert res[0]["model"] == "rule" and res[0]["type"] == "发短球" and not res[0]["needs_review"]
+    for r in res[1:]:
         assert 0 <= r["prob"] <= 1 and r["group"] and len(r["alternatives"]) == 2
+        assert r["group"] not in ("发球", "未知") and r["type"] != "未知"  # never a serve mid-rally, never "unknown"
+
+
+def _serve_hits(first_y, reply_y, gap_frames=30):
+    tracks = {1: _Track(1, 0, np.zeros(200, int), np.tile([[4.0, first_y]], (200, 1))),
+              2: _Track(2, 1, np.ones(200, int), np.tile([[2.0, reply_y]], (200, 1)))}
+    hits = [{"frame": 10, "player_id": 1, "side": "near", "_row": 10},
+            {"frame": 10 + gap_frames, "player_id": 2, "side": "far", "_row": 10 + gap_frames}]
+    return hits, tracks
+
+
+def test_serve_rule():
+    hits, tracks = _serve_hits(4.5, 10.0)  # served 2.2 m from the net, returned 3.3 m from it: short
+    assert ST.serve_rule(hits, 0, 30.0, tracks) == 0 and ST.serve_rule(hits, 1, 30.0, tracks) is None
+    hits, tracks = _serve_hits(4.5, 12.5)  # returned from the back: long
+    assert ST.serve_rule(hits, 0, 30.0, tracks) == 1
+    hits, tracks = _serve_hits(0.5, 10.0)  # first hit from the back of the court: the serve was missed
+    assert ST.serve_rule(hits, 0, 30.0, tracks) is None
+    hits, tracks = _serve_hits(4.5, 10.0, gap_frames=120)  # 4 s later: a new rally, from the back
+    assert ST.serve_rule(hits, 1, 30.0, tracks) == 0
+    hits[0]["player_id"] = 9  # first hitter not tracked: up to the models
+    assert ST.serve_rule(hits, 0, 30.0, tracks) == -1

@@ -181,3 +181,16 @@ def test_labels_override_the_program_and_count(camera, monkeypatch, tmp_path):
     assert far["winners"] == 1 and far["errors"] == 1 and far["errors_by_type"] == {"杀球": 1}
     text = "\n".join(P.digest_text(P.digest(doc)))
     assert "3 个是球友在结果页上自己标的" in text and "近端得分（人标的）" in text
+
+
+def test_unsure_strokes_are_counted_apart_by_their_likeliest_group():
+    strokes = [_stroke(0.0, 1, "near", "发球"), _stroke(1.0, 2, "far", "吊球", review=True),
+               _stroke(2.0, 1, "near", "挑球"), _stroke(3.0, 2, "far", "吊球", review=True)]
+    rally = {"start_s": 0.0, "end_s": 3.0, "dead_ball": False, "confidence": "high", "ending": "winner",
+             "winner_side": "far", "error": None,
+             "last_hit": {"player_id": 2, "side": "far", "type": "吊球", "group": "吊球", "needs_review": True}}
+    far = P.player_table(strokes, [rally])[1]
+    assert far["strokes"] == {} and far["strokes_guess"] == {"吊球": 2} and far["hits_unsure"] == 2
+    assert far["winners_by_type"] == {"吊球?": 1}
+    doc = P.points_json(strokes, [rally], FPS)
+    assert any("猜是：吊球 2" in line for line in P.summary_lines(doc))

@@ -32,7 +32,8 @@ import numpy as np
 
 from . import bst
 from . import stroke_model as SM
-from .court import CourtCalibration
+from .court import NET_Y, CourtCalibration
+from .hits import RALLY_GAP_S
 from .provenance import DERIVED
 
 SCHEMA = "badminton.strokes/1"
@@ -84,6 +85,12 @@ OUTSIDE_KEEP = 0.15  # BST drops frames with a player outside the court; keep up
 GAP_FILL = 3  # bridge a player missing for at most this many samples (of 30 per second)
 REVIEW_PROB = 0.5  # below this the type is marked for checking
 REVIEW_OK = 0.6  # ... and when fewer than this share of the 30 samples had both players
+# serves: the models are trained on broadcast footage and miss most serves on phone recordings, so
+# the first hit of a rally is called a serve by rule and later hits can never be one
+SERVE_MAX_M = 5.3  # ... when the first hitter stands at most this far from the net (else the serve was missed;
+#   on IMG_1069 first hitters stood 0.8–5.0 m or 5.7–6.3 m from the net)
+SHORT_SERVE_REPLY_M = 4.2  # the receiver hits the return this close to the net or closer: 发短球, else 发长球
+SERVES = [SHUTTLESET_TYPES.index("發短球"), SHUTTLESET_TYPES.index("發長球")]
 
 
 def type_names(cls: int) -> tuple[str, str, str]:
@@ -211,6 +218,34 @@ def _position(track, row: int) -> np.ndarray | None:
     return xy if np.isfinite(xy).all() else None
 
 
+def rally_start(hits: list[dict], i: int, fps: float) -> bool:
+    """The first hit after a pause longer than hits.RALLY_GAP_S (as points.split_rallies cuts rallies)."""
+    return i == 0 or hits[i]["frame"] - hits[i - 1]["frame"] > RALLY_GAP_S * fps
+
+
+def _from_net(track, row: int) -> float | None:
+    xy = _position(track, row)
+    return None if xy is None else float(abs(xy[1] - NET_Y))
+
+
+def serve_rule(hits: list[dict], i: int, fps: float, by_id: dict) -> int | None:
+    """0 (发短球) / 1 (发长球) when hit i is a rally's first hit made from the front of the court;
+    -1 for a rally's first hit whose hitter was not placed (the models decide, serves allowed);
+    None when it cannot be a serve. Short or long by where the receiver hits the return; without
+    a return seen, short (what doubles players mostly serve)."""
+    h = hits[i]
+    if not rally_start(hits, i, fps):
+        return None
+    d = _from_net(by_id[h["player_id"]], h["_row"]) if h.get("player_id") in by_id else None
+    if d is None:
+        return -1
+    if d > SERVE_MAX_M:
+        return None
+    nxt = next_in_rally(hits, i, fps)
+    r = _from_net(by_id[nxt["player_id"]], nxt["_row"]) if nxt and nxt.get("player_id") in by_id else None
+    return 1 if r is not None and r > SHORT_SERVE_REPLY_M else 0
+
+
 def attributes(hits: list[dict], i: int, fps: float, by_id: dict, type_name: str) -> dict:
     """直线 / 对角 and 平高 / 高远 from where the reply was hit."""
     out: dict = {}
@@ -253,7 +288,7 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
         row_of = np.where(ok_gap, pick, -1)
     by_id = {t.id: t for t in tracking.tracks}
     side_of = {t.id: ("near", "far")[t.side] for t in tracking.tracks}
-    hits = [dict(h) for h in hits]
+    hits = sorted((dict(h) for h in hits), key=lambda h: h["frame"])
     for h in hits:
         h["_row"] = int(row_of[min(h["frame"], n_frames - 1)])
         if not h.get("side") and h.get("player_id") in side_of:
@@ -291,19 +326,37 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
 
     out = []
     for i, (h, c, opp) in enumerate(zip(hits, clips, meta)):
-        by_doubles = bool(np.isfinite(coarse[i]).all())
-        if by_doubles:
-            rank = np.argsort(-coarse[i])
+        serve = serve_rule(hits, i, fps, by_id)
+        no_serve = serve is None  # serve -1: a rally's first hit, but where it was hit from is not known
+        serve = None if serve == -1 else serve
+        unknown_ahead = False
+        if serve is not None:  # first hit of a rally, from the front: a serve, long or short by the return
+            k = SERVES[serve]
+            by_doubles, prob = False, 1.0
+            alts = [{"type": type_names(SERVES[1 - serve])[0], "prob": 0.0}]
+        elif np.isfinite(coarse[i]).all():
+            by_doubles = True
+            p = coarse[i].copy()
+            if no_serve:
+                p[[SM.CLASSES.index("short serve"), SM.CLASSES.index("long serve")]] = 0
+                p /= max(p.sum(), 1e-9)
+            rank = np.argsort(-p)
             inside = [SHUTTLESET_TYPES.index(s) for s in SM.NAMES[SM.CLASSES[rank[0]]][2]]
             k = max(inside, key=lambda j: mine[i, j])
-            prob = float(coarse[i, rank[0]])
-            alts = [{"type": SM.NAMES[SM.CLASSES[r]][0], "prob": round(float(coarse[i, r]), 3)} for r in rank[1:3]]
+            prob = float(p[rank[0]])
+            alts = [{"type": SM.NAMES[SM.CLASSES[r]][0], "prob": round(float(p[r]), 3)} for r in rank[1:3]]
         else:
-            order = np.argsort(-mine[i])
-            k = int(order[0])
-            prob = float(mine[i, k])
-            alts = [{"type": type_names(UNKNOWN if kk == N_TYPES else int(kk))[0], "prob": round(float(mine[i, kk]), 3)}
-                    for kk in order[1:3]]
+            by_doubles = False
+            p = mine[i].copy()
+            if no_serve:
+                p[SERVES] = 0
+                p /= max(p.sum(), 1e-9)
+            # never "unknown": the best real type, marked unsure when "unknown" was ahead of it
+            order = [int(j) for j in np.argsort(-p) if j != N_TYPES]
+            k = order[0]
+            prob = float(p[k])
+            alts = [{"type": type_names(kk)[0], "prob": round(float(p[kk]), 3)} for kk in order[1:3]]
+            unknown_ahead = bool(p[N_TYPES] > prob)
         cls = UNKNOWN if k == N_TYPES else k + (0 if h.get("side") == "far" else N_TYPES)
         name, group, en = type_names(cls)
         attrs = attributes(hits, i, fps, by_id, name)
@@ -314,8 +367,10 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
             "player_id": h.get("player_id"), "side": h.get("side"), "opponent_id": opp,
             "type": name, "group": group, "type_en": en, "shuttleset_type": None if k == N_TYPES else SHUTTLESET_TYPES[k],
             "prob": round(prob, 3), "alternatives": alts, "attributes": attrs,
-            "ok_share": round(c.ok_share, 2), "model": "dshuttlenet" if by_doubles else "bst",
-            "needs_review": bool(prob < REVIEW_PROB or k == N_TYPES or (not by_doubles and c.ok_share < REVIEW_OK)),
+            "ok_share": round(c.ok_share, 2),
+            "model": "rule" if serve is not None else "dshuttlenet" if by_doubles else "bst",
+            "needs_review": bool(serve is None and (prob < REVIEW_PROB or unknown_ahead
+                                                    or (not by_doubles and c.ok_share < REVIEW_OK))),
         })
     return out
 
