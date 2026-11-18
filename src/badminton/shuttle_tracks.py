@@ -56,6 +56,7 @@ CHAIN_OWN_POINTS = 10  # a stretch of the path with fewer points of flights abov
 AWAY_RUN = 30          # points of flights surely above another court between two of this court's (drop_away_chains)
 FAR_FROM_HANDS = 1.5   # body heights: a flight never this close to a wrist of this court's players is elsewhere
 HAND_WINDOW = 3        # video frames around each point to look for a wrist
+TELEPORT_PIECE = 15    # frames: shorter pieces of the path cut off by a jump faster than a shuttle flies go
 AWAY_ANCHOR = 6        # points a flight above this court must give the path to count as one of this court's
 G = 9.81
 TERMINAL = 6.8         # m/s, a feather shuttle's terminal speed
@@ -378,7 +379,39 @@ def rows_from_peaks(weak: list, frame_size: tuple[int, int], calib=None, start_f
     if CHAIN_OWN_POINTS > 0 and calib is not None:
         rows = drop_away_chains(rows, tracks, weights, frame_step, measured,
                                 surely_away(tracks, weights, frame_size) | far)
+    if TELEPORT_PIECE > 0:
+        rows = drop_teleports(rows, sp.MAX_SPEED * sp.speed_unit(w, fps, 1), measured)
     return [(f + start_frame, v, x, y) for f, v, x, y in rows]
+
+
+def drop_teleports(rows: list, max_px: float, measured: list | None = None) -> list:
+    """The path may alternate between two objects when a second chain fills the frames the first one
+    skipped (IMG_1064: the shuttle jumped 700-1400 px to the next court and back within a frame). Cut
+    the path wherever it moves faster than `max_px` per video frame and drop the pieces between such
+    cuts that are shorter than TELEPORT_PIECE frames."""
+    rows = list(rows)
+    seen = [i for i, r in enumerate(rows) if r[1]]
+    if len(seen) < 2:
+        return rows
+    pieces, cur, cut_before = [], [seen[0]], [False]
+    for a, b in zip(seen[:-1], seen[1:]):
+        g = rows[b][0] - rows[a][0]
+        jump = g <= (sp.MAX_GAP + 1) * 2 and np.hypot(rows[b][2] - rows[a][2], rows[b][3] - rows[a][3]) > max_px * g
+        if jump or g > (sp.MAX_GAP + 1) * 2:
+            pieces.append((cur, cut_before[-1], jump))
+            cur = [b]
+            cut_before.append(jump)
+        else:
+            cur.append(b)
+    pieces.append((cur, cut_before[-1], False))
+    for idx, before, after in pieces:
+        span = rows[idx[-1]][0] - rows[idx[0]][0] + 1
+        if (before or after) and span < TELEPORT_PIECE:
+            for i in idx:
+                rows[i] = (rows[i][0], 0, 0, 0)
+                if measured is not None:
+                    measured[i] = False
+    return rows
 
 
 def drop_away_chains(rows: list, tracks: list, weights: np.ndarray, frame_step: int = 1,
