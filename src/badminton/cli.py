@@ -247,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--strokes", help="badminton strokes 输出的 strokes.json，默认 <视频名>.strokes.json")
     s.add_argument("--data", help="skeleton 生成的 .npz（逐帧），默认 <视频名>.skeleton.npz")
     s.add_argument("--singles", action="store_true", help="单打：每边 1 人（要和跑 strokes 时一样）")
+    s.add_argument("--shuttle", help="badminton shuttle 输出的 CSV，默认 <视频名>.shuttle.csv；用来认持拍手（离球近的手）")
     s.add_argument("--sides", default="near", choices=["near", "far", "both"],
                    help="分析哪边的球员，默认 near（远端人太小，姿态不准）")
     s.add_argument("--include-review", action="store_true", help="类型没把握的击球也算")
@@ -1060,8 +1061,11 @@ def cmd_technique(a) -> int:
     reference = json.loads(Path(a.reference).read_text()) if a.reference else None
     sides = ("near", "far") if a.sides == "both" else (a.sides,)
     per_side = 1 if a.singles else _players_per_side(data_path)
+    shuttle_path = Path(a.shuttle) if a.shuttle else video.with_suffix(".shuttle.csv")
+    if not shuttle_path.exists():
+        print(f"没有 {shuttle_path}：持拍手只按手腕高度和速度认，低手位可能认错")
     results, fps = TQ.run(data_path, strokes_path, CourtCalibration.load(a.court), per_side, sides,
-                          a.include_review, reference)
+                          a.include_review, reference, shuttle_path)
     doc = TQ.technique_json(results, fps, str(video), {"skeleton": str(data_path), "strokes": str(strokes_path)},
                             a.reference)
     out_dir.mkdir(parents=True, exist_ok=True)

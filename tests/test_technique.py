@@ -228,3 +228,21 @@ def test_contact_is_the_top_of_the_swing():
     r = TQ.stroke_metrics(kp, sc, t - 0.1, FPS, "杀球")  # hit detected 0.1 s late
     assert r["metrics"]["contact_shift_ms"] == pytest.approx(-100, abs=20)
     assert r["metrics"]["contact_height"] == pytest.approx(1.4, abs=0.05)
+
+
+def test_lunge_free_arm_reaching_back_is_not_the_racket_arm():
+    kp, sc, t = swing(turn_px=0)
+    # net shot: racket wrist (R) stays out front and moves a little; free arm (L) flung far back and still
+    kp[:, TQ.R_WR] = kp[:, TQ.R_SH] + np.stack([40 + 20 * np.sin(t * 10), 40 + 0 * t], 1)
+    kp[:, TQ.L_WR] = kp[:, TQ.L_SH] + (-150, 30)
+    r = TQ.stroke_metrics(kp, sc, t, FPS, "放网")
+    assert r["racket_hand"] == "R"  # by speed, not by "farther out"
+    shuttle = kp[len(t) // 2, TQ.L_WR] + (5, 5)  # ... but the shuttle says otherwise and wins
+    assert TQ.stroke_metrics(kp, sc, t, FPS, "放网", shuttle=shuttle)["racket_hand"] == "L"
+
+
+def test_no_clear_top_keeps_the_detected_hit():
+    kp, sc, t = swing(contact=1.4)
+    kp[:, TQ.R_WR, 1] = 500 - 100 - 140 - 200 * t  # still rising through the whole search window
+    m = TQ.stroke_metrics(kp, sc, t, FPS, "杀球")["metrics"]
+    assert m["contact_shift_ms"] == 0 and m["contact_unclear"] is True

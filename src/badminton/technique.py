@@ -60,7 +60,9 @@ GROUPS = OVERHEAD + LOW
 BEFORE_S, AFTER_S = 0.8, 0.4  # window around the hit
 KPT_THR = 0.3  # keypoint score below this counts as not seen
 MIN_SEEN = 0.7  # share of the window the core joints must be seen in
-CHAIN_WIN = (-0.5, 0.15)  # where the speed peaks of the kinetic chain are looked for (s from the contact)
+CHAIN_WIN = (-0.5, 0.05)  # where the speed peaks of the kinetic chain are looked for (s from the contact):
+#   up to the contact only, since after it the body keeps turning and its peak is not part of the swing
+SHUTTLE_CLEAR = 0.75  # the racket wrist is the one nearer the shuttle when it is at most this share of the other's distance
 CONTACT_SEARCH_S = 0.15  # overhead: the contact is the racket wrist's highest point this close to the detected hit
 PREP_WIN = (-0.6, -0.1)  # preparation, for backswing and disguise
 TURN_WIN = (-0.6, 0.3)
@@ -208,11 +210,13 @@ def _track_pair(P: np.ndarray, S: np.ndarray, k0: int, first_is_racket: bool) ->
     return out, outS
 
 
-def assign_arms(kp: np.ndarray, seen: np.ndarray, t: np.ndarray, group: str) -> tuple[np.ndarray, np.ndarray, str]:
+def assign_arms(kp: np.ndarray, seen: np.ndarray, t: np.ndarray, group: str,
+                shuttle: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, str]:
     """The pose model's left / right labels flip when a player turns side- or back-on, so the
     racket arm is not taken from the labels. At the frame nearest the hit where both wrists are
-    seen, the racket wrist is the higher one (overhead strokes) or the one farther from the
-    shoulders (others); from there each joint pair is followed by continuity. Returns copies where
+    seen, the racket wrist is the one clearly nearer the shuttle (pixel position at the hit, if
+    known), else the higher one (overhead strokes) or the one moving faster around the hit
+    (others: in a lunge the free arm reaches back, so "farther out" picks the wrong one); from there each joint pair is followed by continuity. Returns copies where
     R_SH / R_EL / R_WR are the racket arm and L_* the other arm, plus the label ("R" / "L") the
     pose model gave the racket wrist at that frame (for information only)."""
     kp, seen = kp.copy(), seen.copy()
@@ -221,12 +225,21 @@ def assign_arms(kp: np.ndarray, seen: np.ndarray, t: np.ndarray, group: str) -> 
         return kp, seen, "?"
     k0 = int(np.flatnonzero(both)[np.argmin(np.abs(t[both]))])
     wl, wr = kp[k0, L_WR], kp[k0, R_WR]
-    if group in OVERHEAD:
-        r_is_racket = wr[1] <= wl[1]
-    else:
-        ref = np.nanmean(kp[k0, [L_SH, R_SH]], 0)
-        r_is_racket = np.linalg.norm(wr - ref) >= np.linalg.norm(wl - ref) if np.isfinite(ref).all() \
-            else wr[1] <= wl[1]
+    r_is_racket = None
+    if shuttle is not None and np.isfinite(shuttle).all():
+        dl, dr = np.linalg.norm(wl - shuttle), np.linalg.norm(wr - shuttle)
+        if min(dl, dr) <= SHUTTLE_CLEAR * max(dl, dr):
+            r_is_racket = bool(dr < dl)
+    if r_is_racket is None and group in OVERHEAD:
+        r_is_racket = bool(wr[1] <= wl[1])
+    if r_is_racket is None:  # faster wrist around the hit; labels may flip, so speed of the nearer-labelled path
+        near = np.flatnonzero(_between(t, -CONTACT_SEARCH_S, CONTACT_SEARCH_S) & both)
+        if len(near) >= 2:
+            seg = kp[near][:, [L_WR, R_WR]]
+            moved = np.linalg.norm(np.diff(seg, axis=0), axis=-1).sum(0)  # per label, (2,)
+            r_is_racket = bool(moved[1] >= moved[0])
+        else:
+            r_is_racket = bool(wr[1] <= wl[1])
     label = "R" if r_is_racket else "L"
     chain = None  # racket point of the previous joint in the chain, per frame
     for li, ri in ((L_WR, R_WR), (L_EL, R_EL), (L_SH, R_SH)):
@@ -257,14 +270,14 @@ def _between(t: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float, group: str,
-                   wrist: int | None = None) -> dict:
+                   wrist: int | None = None, shuttle: np.ndarray | None = None) -> dict:
     """The numbers of one stroke (see the module doc). `wrist`: force the racket wrist by its
     pose-model label (tests); by default the racket arm is found by assign_arms, since the labels flip.
     Returns {"ok": bool, "reason": str, "racket_hand": "R"/"L", "metrics": {...}, "prep": (k, 17, 2) or None};
     racket_hand is the pose model's label of the racket wrist near the hit, for information only."""
     seen = sc >= KPT_THR
     if wrist is None:
-        kp_raw, seen, hand = assign_arms(kp_raw, seen, t, group)
+        kp_raw, seen, hand = assign_arms(kp_raw, seen, t, group, shuttle)
     else:
         hand = "R" if wrist == R_WR else "L"
         if wrist == L_WR:  # move the racket arm into the R_* slots
@@ -292,9 +305,13 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
     m: dict = {}
     if group in OVERHEAD:  # the detected hit can be a few frames off: take the racket wrist's top
         near = np.flatnonzero(_between(t, -CONTACT_SEARCH_S, CONTACT_SEARCH_S))
-        h = int(near[np.argmin(kp[near, wrist, 1])])
-        m["contact_shift_ms"] = round(float(t[h]) * 1000)
-        t = t - t[h]
+        top = int(near[np.argmin(kp[near, wrist, 1])])
+        if top in (near[0], near[-1]):  # still rising / falling at the edge: no clear top, keep the detected hit
+            m["contact_shift_ms"], m["contact_unclear"] = 0, True
+        else:
+            h = top
+            m["contact_shift_ms"], m["contact_unclear"] = round(float(t[h]) * 1000), False
+            t = t - t[h]
     m["contact_height"] = up * (kp[h, wrist, 1] - msh[h, 1]) / torso
     speed_w = _speed(kp[:, wrist], fps) / torso
     chain = _between(t, *CHAIN_WIN)
@@ -323,8 +340,8 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
             m["jump"] = None
         after = _between(t, 1e-9, FOLLOW_S)
         if t[-1] >= FOLLOW_S - 1 / fps and after.any():
-            # across the body = towards the other shoulder's side, taken before the turn starts
-            across = -(np.sign(kp[0, shoulder, 0] - kp[0, other_sh, 0]) or 1.0)
+            # how far the wrist keeps going, sideways in the picture, the way it was moving into the contact
+            across = np.sign(kp[h, wrist, 0] - kp[max(0, h - 2), wrist, 0]) or 1.0
             m["follow_through"] = float(np.max(across * (kp[after, wrist, 0] - kp[h, wrist, 0])) / torso)
         else:
             m["follow_through"] = None
@@ -423,8 +440,18 @@ def frame_rows(frames: np.ndarray) -> np.ndarray:
     return row_of
 
 
+def shuttle_at(shuttle_px: np.ndarray | None, frame: int, fps: float, half_s: float = 0.05) -> np.ndarray | None:
+    """Median shuttle pixel position within half_s of a frame, None if not seen there."""
+    if shuttle_px is None:
+        return None
+    k = max(1, round(half_s * fps))
+    seg = shuttle_px[max(0, frame - k):frame + k + 1]
+    seg = seg[np.isfinite(seg).all(1)]
+    return np.median(seg, 0) if len(seg) else None
+
+
 def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near",), include_review: bool = False,
-            reference: dict | None = None) -> list[dict]:
+            reference: dict | None = None, shuttle_px: np.ndarray | None = None) -> list[dict]:
     """One result per stroke of the chosen groups and sides."""
     row_of = frame_rows(data["frame"])
     # skeleton run with --stride k: windows hold every k-th frame, so speeds and smoothing use fps / k
@@ -440,7 +467,7 @@ def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near"
         kp, sc, t = stroke_window(data, row_of, tr.det_index, int(s["frame"]), fps)
         windows.append((kp, sc, t))
     for s, (kp, sc, t) in zip(picks, windows):
-        r = stroke_metrics(kp, sc, t, fps_eff, s["group"])
+        r = stroke_metrics(kp, sc, t, fps_eff, s["group"], shuttle=shuttle_at(shuttle_px, int(s["frame"]), fps))
         tr = by_id[s["player_id"]]
         row = int(np.argmin(np.abs(np.asarray(data["frame"]) - int(s["frame"]))))  # nearest processed frame
         airborne = bool(tr.airborne[row]) if row >= 0 and getattr(tr, "airborne", None) is not None else None
@@ -532,12 +559,18 @@ def write_csv(results: list[dict], path: str | Path) -> None:
 
 
 def run(skeleton_npz, strokes_json_path, court, players_per_side: int, sides=("near",),
-        include_review: bool = False, reference: dict | None = None) -> tuple[list[dict], float]:
-    """players_per_side must be what `badminton strokes` used, so the player ids match."""
+        include_review: bool = False, reference: dict | None = None, shuttle_csv=None) -> tuple[list[dict], float]:
+    """players_per_side must be what `badminton strokes` used, so the player ids match.
+    shuttle_csv (optional): picks the racket arm as the one nearer the shuttle at the hit."""
     from .tracking import load_npz, track_players
 
     doc = json.loads(Path(strokes_json_path).read_text())
     data = load_npz(skeleton_npz)
     fps = float(data["fps"])
     tracking = track_players(data, court, players_per_side)
-    return analyse(data, tracking, doc["strokes"], fps, sides, include_review, reference), fps
+    shuttle_px = None
+    if shuttle_csv and Path(shuttle_csv).exists():
+        from .bst import read_shuttle_csv
+
+        shuttle_px = read_shuttle_csv(shuttle_csv, int(data["frame"][-1]) + 1)
+    return analyse(data, tracking, doc["strokes"], fps, sides, include_review, reference, shuttle_px), fps
