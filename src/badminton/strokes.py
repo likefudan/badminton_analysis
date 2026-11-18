@@ -91,6 +91,16 @@ SERVE_MAX_M = 5.3  # ... when the first hitter stands at most this far from the 
 #   on IMG_1069 first hitters stood 0.8–5.0 m or 5.7–6.3 m from the net)
 SHORT_SERVE_REPLY_M = 4.2  # the receiver hits the return this close to the net or closer: 发短球, else 发长球
 SERVES = [SHUTTLESET_TYPES.index("發短球"), SHUTTLESET_TYPES.index("發長球")]
+# physics model: which kind of stroke it was from where it was hit, where the reply was hit, how long the
+# shuttle flew and whether it was hit overhead. None of this depends on the camera or on how the players
+# look, which is where BST and the doubles model (both trained on broadcast footage) lose their footing on
+# phone recordings. Trained on DShuttleNet's labels by scripts/train_stroke_physics.py; weights in the cache.
+PHYSICS_FILE = "stroke_physics.json"
+PHYSICS_FEATURES = ("from_net_m", "reply_from_net_m", "flight_s", "overhead", "across_m")
+PHYSICS_CLASSES = ("net shot", "push", "lift", "drive", "smash", "drop", "clear")  # DShuttleNet's names
+OVERHEAD_BH = 1.05  # shuttle this many body heights above the hitter's feet at the hit, or more: overhead
+#   (agrees with DShuttleNet's labelled contact height on 88% of the hits found in the five matches with video)
+W_PHYSICS = 1.0  # exponent of the physics probability when it is multiplied into a model's (0: not used)
 
 
 def type_names(cls: int) -> tuple[str, str, str]:
@@ -246,6 +256,59 @@ def serve_rule(hits: list[dict], i: int, fps: float, by_id: dict) -> int | None:
     return 1 if r is not None and r > SHORT_SERVE_REPLY_M else 0
 
 
+def upright_heights(data: dict, tracks: list) -> dict:
+    """Track id -> per npz row the player's standing height in pixels (hits._upright_height of the box
+    height): a lunging or crouching player's box is short, which would make a low shuttle look high."""
+    from .hits import _upright_height
+
+    out = {}
+    for t in tracks:
+        bh = np.full(len(t.det_index), np.nan)
+        rows = np.flatnonzero(t.det_index >= 0)
+        b = data["bbox"][rows, t.det_index[rows]]
+        bh[rows] = b[:, 3] - b[:, 1]
+        out[t.id] = _upright_height(bh)
+    return out
+
+
+def physics_features(hits: list[dict], i: int, fps: float, by_id: dict, upright: dict, data: dict,
+                     shuttle_px: np.ndarray) -> np.ndarray:
+    """PHYSICS_FEATURES of hit i, NaN where unknown: the hitter's distance from the net, the distance from
+    the net at which the other side hit the reply, the seconds in between, 1 / 0 for a shuttle hit above /
+    below OVERHEAD_BH, and how far across the court the reply was hit."""
+    h = hits[i]
+    out = np.full(len(PHYSICS_FEATURES), np.nan)
+    t, row = by_id.get(h.get("player_id")), h["_row"]
+    if t is None or row < 0:
+        return out
+    a = _position(t, row)
+    if a is not None:
+        out[0] = abs(a[1] - NET_Y)
+    d = int(t.det_index[row])
+    f = int(h["frame"])
+    seen = shuttle_px[max(0, f - 3):f + 1]
+    seen = seen[np.isfinite(seen[:, 0])]
+    body = upright[t.id][row] if t.id in upright else np.nan
+    if d >= 0 and len(seen) and body > 0:
+        out[3] = float((data["bbox"][row, d][3] - seen[-1, 1]) / body >= OVERHEAD_BH)
+    nxt = next_in_rally(hits, i, fps)
+    if nxt is not None and nxt.get("side") != h.get("side") and nxt.get("player_id") in by_id and nxt["_row"] >= 0:
+        b = _position(by_id[nxt["player_id"]], nxt["_row"])
+        if b is not None:
+            out[1], out[2] = abs(b[1] - NET_Y), (nxt["frame"] - f) / fps
+            if a is not None:
+                out[4] = abs(b[0] - a[0])
+    return out
+
+
+def load_physics(path: str | Path | None = None):
+    """The physics model (hits.HitClassifier: trees evaluated with numpy), None when its file is not there."""
+    from .hits import HitClassifier
+
+    m = HitClassifier.load(path, file=PHYSICS_FILE, features=PHYSICS_FEATURES)
+    return m if m is not None and tuple(m.classes) == PHYSICS_CLASSES else None
+
+
 def attributes(hits: list[dict], i: int, fps: float, by_id: dict, type_name: str) -> dict:
     """直线 / 对角 and 平高 / 高远 from where the reply was hit."""
     out: dict = {}
@@ -270,12 +333,17 @@ def attributes(hits: list[dict], i: int, fps: float, by_id: dict, type_name: str
 
 
 def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray, calib: CourtCalibration,
-                  models: list, fps: float, doubles_model=None) -> list[dict]:
+                  models: list, fps: float, doubles_model=None, physics=None, w_physics: float = W_PHYSICS) -> list[dict]:
     """hits: dicts with frame, player_id, side ("near"/"far"). Returns one result dict per hit.
 
     With `doubles_model` (stroke_model.StrokeClassifier, trained on DShuttleNet's doubles) the
     type comes from it where it has an answer: it picks one of nine coarse types, and BST only
-    chooses among the ShuttleSet types inside that one (杀球 or 点杀, 挑球 or 防守挑球, …)."""
+    chooses among the ShuttleSet types inside that one (杀球 or 点杀, 挑球 or 防守挑球, …).
+
+    With `physics` (load_physics) every type's probability is multiplied by how likely the physics
+    model finds its kind of stroke (PHYSICS_CLASSES) and renormalised: where the two agree the
+    answer gets surer, where the flight plainly says otherwise (a shuttle that took 1.3 s to reach
+    the back of the court was not smashed) the physics wins."""
     frames_np = np.asarray(data["frame"], int)
     n_frames = int(frames_np[-1]) + 1
     row_of = np.full(n_frames, -1)
@@ -324,6 +392,31 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
     if doubles_model is not None and hits:
         coarse = doubles_model.proba(SM.hit_features(SM.Scene(data, tracking, shuttle_px, calib), hits))
 
+    phys = np.full((len(hits), len(PHYSICS_CLASSES)), np.nan)
+    if physics is not None and hits and w_physics > 0:
+        upright = upright_heights(data, tracking.tracks)
+        phys = physics.proba(np.stack([physics_features(hits, i, fps, by_id, upright, data, shuttle_px)
+                                       for i in range(len(hits))]))
+    # per ShuttleSet type / per DShuttleNet class: which physics class it belongs to (-1: a serve)
+    phys_of_type = [PHYSICS_CLASSES.index(SM.CLASSES[SM.SHUTTLESET_TO_CLASS[s]])
+                    if SM.CLASSES[SM.SHUTTLESET_TO_CLASS[s]] in PHYSICS_CLASSES else -1 for s in SHUTTLESET_TYPES]
+    phys_of_class = [PHYSICS_CLASSES.index(c) if c in PHYSICS_CLASSES else -1 for c in SM.CLASSES]
+
+    def with_physics(p: np.ndarray, i: int, which: list) -> np.ndarray:
+        """p times the physics probability of each entry's kind, renormalised. Serves count as the average
+        kind. BST's "unknown" (the entry after `which`, if any) means it has no opinion: its share is
+        first spread evenly over the real types that are still allowed, so that the physics decides."""
+        if not np.isfinite(phys[i]).all():
+            return p
+        q = p[:len(which)].copy()
+        allowed = np.array([k >= 0 or q[j] > 0 for j, k in enumerate(which)])
+        if len(p) > len(which) and allowed.any():
+            q[allowed] += p[len(which):].sum() / allowed.sum()
+        q *= np.array([phys[i][k] if k >= 0 else 1 / len(PHYSICS_CLASSES) for k in which]) ** w_physics
+        if not q.sum() > 0:
+            return p
+        return np.concatenate([q / q.sum(), np.zeros(len(p) - len(which))])
+
     out = []
     for i, (h, c, opp) in enumerate(zip(hits, clips, meta)):
         serve = serve_rule(hits, i, fps, by_id)
@@ -340,6 +433,7 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
             if no_serve:
                 p[[SM.CLASSES.index("short serve"), SM.CLASSES.index("long serve")]] = 0
                 p /= max(p.sum(), 1e-9)
+            p = with_physics(p, i, phys_of_class)
             rank = np.argsort(-p)
             inside = [SHUTTLESET_TYPES.index(s) for s in SM.NAMES[SM.CLASSES[rank[0]]][2]]
             k = max(inside, key=lambda j: mine[i, j])
@@ -351,6 +445,7 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
             if no_serve:
                 p[SERVES] = 0
                 p /= max(p.sum(), 1e-9)
+            p = with_physics(p, i, phys_of_type)
             # never "unknown": the best real type, marked unsure when "unknown" was ahead of it
             order = [int(j) for j in np.argsort(-p) if j != N_TYPES]
             k = order[0]
@@ -368,7 +463,10 @@ def classify_hits(data: dict, tracking, hits: list[dict], shuttle_px: np.ndarray
             "type": name, "group": group, "type_en": en, "shuttleset_type": None if k == N_TYPES else SHUTTLESET_TYPES[k],
             "prob": round(prob, 3), "alternatives": alts, "attributes": attrs,
             "ok_share": round(c.ok_share, 2),
-            "model": "rule" if serve is not None else "dshuttlenet" if by_doubles else "bst",
+            "model": "rule" if serve is not None else ("dshuttlenet" if by_doubles else "bst")
+            + ("+physics" if np.isfinite(phys[i]).all() else ""),
+            "physics": None if serve is not None or not np.isfinite(phys[i]).all() else
+            {"kind": SM.NAMES[PHYSICS_CLASSES[int(phys[i].argmax())]][0], "prob": round(float(phys[i].max()), 3)},
             "needs_review": bool(serve is None and (prob < REVIEW_PROB or unknown_ahead
                                                     or (not by_doubles and c.ok_share < REVIEW_OK))),
         })
@@ -427,9 +525,11 @@ def load_models(weights: list[str | Path]) -> list:
 
 
 def run(shuttle_csv, skeleton_npz, court: CourtCalibration, weights: list, hits_file=None,
-        players_per_side: int = 1, doubles_model=None) -> tuple[list[dict], dict]:
+        players_per_side: int = 1, doubles_model=None, physics="auto") -> tuple[list[dict], dict]:
     """Files in, one result per hit out. Without hits_file the hits are found here (`badminton hits`).
-    `doubles_model`: see classify_hits; only used with two players a side."""
+    `doubles_model`: see classify_hits; only used with two players a side. `physics`: "auto" loads the
+    physics model from the cache when it is there, None switches it off, or a loaded model; like the
+    doubles model it is only used with two players a side (it was trained on doubles and not tried on singles)."""
     from . import hits as H
     from .tracking import load_npz, track_players
 
@@ -445,7 +545,8 @@ def run(shuttle_csv, skeleton_npz, court: CourtCalibration, weights: list, hits_
         hits = [{"frame": h["frame"], "player_id": h.get("player_id"), "side": h.get("side")} for h in found]
     shuttle_px = bst.read_shuttle_csv(shuttle_csv, n)
     results = classify_hits(data, tracking, hits, shuttle_px, court, load_models(weights), fps,
-                            doubles_model if players_per_side == 2 else None)
+                            doubles_model if players_per_side == 2 else None,
+                            (load_physics() if isinstance(physics, str) else physics) if players_per_side == 2 else None)
     return results, {"fps": fps, "tracking": tracking, "data": data}
 
 

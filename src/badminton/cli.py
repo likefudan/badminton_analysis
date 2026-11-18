@@ -244,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--doubles-model", default="off", help="双打类型模型（DShuttleNet 训练，scripts/train_stroke_classifier.py）："
                    "off（默认，只用 BST）、auto（缓存目录里有就用）或权重路径；单打不用它。"
                    "转播双打上比 BST 准，手机录像上还没看出更好，见 docs/stroke_types.md")
+    s.add_argument("--physics", default="auto", help="按飞行判大类的模型（scripts/train_stroke_physics.py）：auto（默认，"
+                   "缓存目录里有 stroke_physics.json 就用）、off 或权重路径；只用于双打。看的是击球人离网多远、对方在哪里接、"
+                   "飞了多久、是不是头顶击球，不看画面，见 docs/stroke_types.md")
     s.add_argument("--no-video", action="store_true", help="不输出带类型标签的视频")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
@@ -1072,7 +1075,14 @@ def cmd_strokes(a) -> int:
             raise SystemExit(f"读不了双打类型模型 {a.doubles_model}")
         print("双打：类型用 DShuttleNet 训练的模型，BST 只在大类里细分" if doubles else
               f"没有双打类型模型（{STROKE_MODEL_FILE}），只用 BST；训练方法见 scripts/train_stroke_classifier.py")
-    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side, doubles)
+    physics = None
+    if per_side == 2 and a.physics != "off":
+        physics = ST.load_physics(None if a.physics == "auto" else a.physics)
+        if physics is None and a.physics != "auto":
+            raise SystemExit(f"读不了按飞行判大类的模型 {a.physics}")
+        if physics is not None:
+            print("双打：每一拍再按飞行（离网距离、对方接球位置、飞行时间、是否头顶击球）核对大类")
+    results, ctx = ST.run(shuttle_path, data_path, CourtCalibration.load(a.court), weights, a.hits, per_side, doubles, physics)
     doc = ST.strokes_json(results, ctx["fps"], str(video),
                           {"skeleton": str(data_path), "shuttle": str(shuttle_path), "hits": a.hits},
                           names, [str(w) for w in weights])
