@@ -13,7 +13,7 @@ import numpy as np
 from .court import CourtCalibration, detection_roi
 from .players import Players, PlayerSelector
 from .pose import PoseResult
-from .render import draw_court, draw_players, draw_roi, draw_text
+from .render import draw_court, draw_players, draw_region, draw_roi, draw_text
 from .video import VideoWriter, probe, read_frames
 
 
@@ -33,6 +33,7 @@ class SkeletonOptions:
     kpt_thr: float = 0.3
     encoder: str = "libx264"
     max_persons: int = 4  # rows reserved per frame in the saved arrays
+    region: object = None  # region.Region drawn on the web page: people whose feet are outside it are ignored
 
 
 def run_skeleton(
@@ -70,6 +71,10 @@ def run_skeleton(
     last: Players | None = None
     select = PlayerSelector(calib, opts.players_per_side)
     box_filter = select.box_filter() if calib is not None else None
+    if opts.region is not None:
+        from .region import combine_filters
+
+        box_filter = combine_filters(box_filter, opts.region.box_filter((info.width, info.height)))
     t0 = time.perf_counter()
     n = 0
     try:
@@ -82,6 +87,8 @@ def run_skeleton(
                     draw_court(frame, calib, (255, 255, 255), 1)
                 if opts.draw_roi and roi is not None:
                     draw_roi(frame, roi)
+                if opts.region is not None:
+                    draw_region(frame, opts.region)
                 if last is not None:
                     draw_players(frame, last, opts.kpt_thr, scale=info.height / 1080)
                 draw_text(frame, f"{i / fps:7.2f}s")

@@ -265,11 +265,18 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal(st.title, "周六双打第 2 局");
   assert.equal((await call(`/videos/${v.id}`, { method: "PATCH", headers: json, body: "{}" })).status, 400);
 
-  // 重新处理：回到排队，可以改单打/双打
+  // 重新处理：回到排队，可以改单打/双打；旧结果清掉，原始画面的截图（画分析区域用）留着
+  assert.equal((await call(`/videos/${v.id}/results/frame.jpg`, { method: "PUT", body: card })).status, 200);
   st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();
   assert.equal(st.job.status, "queued");
   assert.deepEqual(st.options, { mode: "singles" });
-  assert.deepEqual(st.results, []); // 旧结果清掉
+  assert.deepEqual(st.results.map((r) => r.name), ["frame.jpg"]);
+  // 分析区域：坏点、少于 3 个点的多边形丢掉，坐标夹到 0–1
+  st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles", region: {
+    keep: [[[0.1, 0.2], [1.5, 0.2], [0.9, 0.9], ["x", 1]], [[0, 0], [1, 1]]], drop: "nope" } } })).json();
+  assert.deepEqual(st.options, { mode: "singles", region: { keep: [[[0.1, 0.2], [1, 0.2], [0.9, 0.9]]], drop: [] } });
+  st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles", region: { keep: [], drop: [] } } })).json();
+  assert.deepEqual(st.options, { mode: "singles" });
   assert.equal(st.job.progress, null);
   assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.id, v.id);
   st = await (await post(`/videos/${v.id}/job`, { status: "failed", stage: "自动标定球场", error: "找不到球场线" })).json();

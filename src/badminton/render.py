@@ -65,6 +65,16 @@ def draw_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> None:
     cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (128, 128, 128), 1)
 
 
+def draw_region(frame: np.ndarray, region) -> None:
+    """Outline of the analysis region drawn on the web page: keep parts green, ignored parts red."""
+    h, w = frame.shape[:2]
+    thick = max(1, round(h / 720))
+    for polys, color in ((region.keep, (80, 200, 80)), (region.drop, (60, 60, 230))):
+        for p in polys:
+            pts = np.round(np.asarray(p) * (w, h)).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [pts], True, color, thick, cv2.LINE_AA)
+
+
 def draw_text(frame: np.ndarray, text: str, org=(12, 28)) -> None:
     cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)

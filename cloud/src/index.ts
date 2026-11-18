@@ -347,7 +347,28 @@ function cleanOptions(raw: unknown): Record<string, unknown> {
   const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const out: Record<string, unknown> = { mode: o.mode === "doubles" ? "doubles" : "singles" };
   if (typeof o.names === "string" && o.names.trim()) out.names = o.names.trim().slice(0, 200);
+  const region = cleanRegion(o.region);
+  if (region) out.region = region;
   return out;
+}
+
+// 分析区域：网页上画的多边形，坐标是画面宽高的比例（0–1）。keep = 只看这里，drop = 抹掉这里。
+function cleanRegion(raw: unknown): { keep: number[][][]; drop: number[][][] } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const polys = (v: unknown): number[][][] =>
+    (Array.isArray(v) ? v : [])
+      .slice(0, 12)
+      .map((p) =>
+        (Array.isArray(p) ? p : [])
+          .slice(0, 64)
+          .filter((q) => Array.isArray(q) && q.length === 2 && q.every((n) => typeof n === "number" && Number.isFinite(n)))
+          .map((q) => (q as number[]).map((n) => Math.round(Math.min(1, Math.max(0, n)) * 1e5) / 1e5)),
+      )
+      .filter((p) => p.length >= 3);
+  const r = raw as Record<string, unknown>;
+  const keep = polys(r.keep);
+  const drop = polys(r.drop);
+  return keep.length || drop.length ? { keep, drop } : null;
 }
 
 // 节点每次来问任务或汇报进度都记一笔，网页据此显示“Mac 在线 / 离线”。
@@ -475,7 +496,9 @@ async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const options = body?.options ? JSON.stringify(cleanOptions(body.options)) : v.options;
-  await deleteResults(env, id); // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错
+  // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错。原始画面的截图留着：列表里的封面不空，
+  // 排队时也能接着改分析区域
+  await deleteResults(env, id, ["cover.jpg", "frame.jpg"]);
   await env.DB.prepare(
     "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
   )
@@ -855,11 +878,13 @@ async function deleteResult(env: Env, id: string, name: string): Promise<void> {
   await env.DB.prepare("DELETE FROM results WHERE video_id = ? AND name = ?").bind(id, name).run();
 }
 
-async function deleteResults(env: Env, id: string): Promise<void> {
-  const rows = await env.DB.prepare("SELECT r2_key FROM results WHERE video_id = ?").bind(id).all<{ r2_key: string }>();
-  const keys = rows.results.map((r) => r.r2_key);
+async function deleteResults(env: Env, id: string, keep: string[] = []): Promise<void> {
+  const rows = await env.DB.prepare("SELECT name, r2_key FROM results WHERE video_id = ?").bind(id).all<{ name: string; r2_key: string }>();
+  const gone = rows.results.filter((r) => !keep.includes(r.name));
+  const keys = gone.map((r) => r.r2_key);
   for (let i = 0; i < keys.length; i += 500) await env.BUCKET.delete(keys.slice(i, i + 500));
-  await env.DB.prepare("DELETE FROM results WHERE video_id = ?").bind(id).run();
+  const notKept = keep.length ? ` AND name NOT IN (${keep.map(() => "?").join(", ")})` : "";
+  await env.DB.prepare(`DELETE FROM results WHERE video_id = ?${notKept}`).bind(id, ...keep).run();
 }
 
 // 云端只留最近约 10 GB 的结果：从最新的一局往回数，超出的整局清掉（Mac 上还有）。最新一局总是保留。

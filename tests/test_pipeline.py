@@ -121,3 +121,24 @@ def test_device_selection():
     assert resolve_device("auto") in {"cpu", "cuda", "coreml", "coremlnative"}
     coreml = provider_config("coreml")
     assert coreml[0][0] == "CoreMLExecutionProvider" and coreml[-1] == "CPUExecutionProvider"
+
+
+def test_region_drops_people_whose_feet_are_outside(clip, camera, tmp_path):
+    from badminton.region import Region
+
+    video, calib = clip
+
+    class Filtering(FakeEstimator):
+        def __call__(self, frame, roi=None, box_filter=None):
+            res = super().__call__(frame, roi, box_filter)
+            keep = box_filter(res.bboxes) if box_filter else np.ones(len(res.bboxes), bool)
+            return PoseResult(res.bboxes[keep], res.keypoints[keep], res.scores[keep])
+
+    # the far half (top of the image) is drawn over: only the two near players are left
+    far_y = max(fake_person(camera, 4.5, 11.0)[0][3], fake_person(camera, 1.5, 9.0)[0][3]) / H + 0.01
+    region = Region.from_dict({"drop": [[[0, 0], [1, 0], [1, far_y], [0, far_y]]]})
+    run_skeleton(video, Filtering(camera), tmp_path / "r.mp4", tmp_path / "r.npz", calib,
+                 SkeletonOptions(stride=2, region=region))
+    d = np.load(tmp_path / "r.npz")
+    assert d["valid"].sum(1).tolist() == [2] * (N_FRAMES // 2)
+    assert np.nanmax(d["court_xy"][:, :, 1]) < 6.7  # nobody beyond the net
