@@ -63,7 +63,10 @@ MIN_SEEN = 0.7  # share of the window the core joints must be seen in
 CHAIN_WIN = (-0.5, 0.05)  # where the speed peaks of the kinetic chain are looked for (s from the contact):
 #   up to the contact only, since after it the body keeps turning and its peak is not part of the swing
 SHUTTLE_CLEAR = 0.75  # the racket wrist is the one nearer the shuttle when it is at most this share of the other's distance
-CONTACT_SEARCH_S = 0.15  # overhead: the contact is the racket wrist's highest point this close to the detected hit
+CONTACT_SEARCH_S = 0.25  # overhead: the contact is the racket wrist's highest point this close to the detected hit
+ARM_SPEED_S = 0.15  # low strokes without the shuttle: the racket wrist moves more this close to the hit
+SHUTTLE_NEAR_T = 1.2  # ... and the shuttle rule is only used when the nearer wrist is within this many torso lengths
+WRIST_PEAK_WIN = (-0.15, 0.05)  # the wrist's own peak is looked for this close to the contact
 PREP_WIN = (-0.6, -0.1)  # preparation, for backswing and disguise
 TURN_WIN = (-0.6, 0.3)
 JUMP_BASE = (-0.8, -0.5)  # ankles before the take-off
@@ -228,12 +231,14 @@ def assign_arms(kp: np.ndarray, seen: np.ndarray, t: np.ndarray, group: str,
     r_is_racket = None
     if shuttle is not None and np.isfinite(shuttle).all():
         dl, dr = np.linalg.norm(wl - shuttle), np.linalg.norm(wr - shuttle)
-        if min(dl, dr) <= SHUTTLE_CLEAR * max(dl, dr):
+        torso = np.linalg.norm(_mid(kp[k0], L_SH, R_SH) - _mid(kp[k0], L_HIP, R_HIP))
+        near_enough = np.isfinite(torso) and min(dl, dr) <= SHUTTLE_NEAR_T * torso  # not a point across the net
+        if near_enough and min(dl, dr) <= SHUTTLE_CLEAR * max(dl, dr):
             r_is_racket = bool(dr < dl)
     if r_is_racket is None and group in OVERHEAD:
         r_is_racket = bool(wr[1] <= wl[1])
     if r_is_racket is None:  # faster wrist around the hit; labels may flip, so speed of the nearer-labelled path
-        near = np.flatnonzero(_between(t, -CONTACT_SEARCH_S, CONTACT_SEARCH_S) & both)
+        near = np.flatnonzero(_between(t, -ARM_SPEED_S, ARM_SPEED_S) & both)
         if len(near) >= 2:
             seg = kp[near][:, [L_WR, R_WR]]
             moved = np.linalg.norm(np.diff(seg, axis=0), axis=-1).sum(0)  # per label, (2,)
@@ -312,22 +317,38 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
             h = top
             m["contact_shift_ms"], m["contact_unclear"] = round(float(t[h]) * 1000), False
             t = t - t[h]
-    m["contact_height"] = up * (kp[h, wrist, 1] - msh[h, 1]) / torso
+        if up * (kp[h, wrist, 1] - msh[h, 1]) < 0 and not m["contact_unclear"]:
+            return {"ok": False, "reason": "最高点时持拍手还在肩下面：多半不是高手位球，类型可能判错", "racket_hand": hand,
+                    "metrics": {}, "seen_share": round(seen_share, 2)}
+    unclear = bool(m.get("contact_unclear"))  # then numbers taken at the contact are left out
+    m["contact_height"] = None if unclear else up * (kp[h, wrist, 1] - msh[h, 1]) / torso
     speed_w = _speed(kp[:, wrist], fps) / torso
     chain = _between(t, *CHAIN_WIN)
     m["wrist_speed"] = float(np.max(speed_w[chain]))
 
     if group in OVERHEAD:
-        m["elbow_deg"] = _angle(kp[h, shoulder], kp[h, elbow], kp[h, wrist])
+        m["elbow_deg"] = None if unclear else _angle(kp[h, shoulder], kp[h, elbow], kp[h, wrist])
         prep = _between(t, *PREP_WIN)
         m["backswing_elbow"] = float(np.max(up * (kp[prep, elbow, 1] - msh[prep, 1]))) / torso if prep.any() else None
         parts = {"hip": mhip, "shoulder": kp[:, shoulder], "elbow": kp[:, elbow], "wrist": kp[:, wrist]}
         idx = np.flatnonzero(chain)
-        peaks = {k: float(t[idx[np.argmax(_speed(v, fps)[idx])]]) for k, v in parts.items()}
+        widx = np.flatnonzero(_between(t, *WRIST_PEAK_WIN)) if not unclear else np.array([], int)
+        peaks = {k: float(t[idx[np.argmax(_speed(v, fps)[idx])]]) for k, v in parts.items() if k != "wrist"}
+        if len(widx):
+            sw = _speed(kp[:, wrist], fps)
+            peaks["wrist"] = float(t[widx[np.argmax(sw[widx])]])
+            # the fastest wrist moment of the whole swing came well before the contact (dropping the racket
+            # in the backswing, or jitter): the order cannot be read from this stroke
+            m["wrist_peak_early"] = bool(np.max(sw[idx]) > 1.2 * np.max(sw[widx]))
         m["chain_ms"] = {k: round(v * 1000) for k, v in peaks.items()}
-        order = [peaks[k] for k in ("hip", "shoulder", "elbow", "wrist")]
-        tol = RULES["chain_tol_ms"] / 1000 + 0.5 / fps
-        m["chain_order_ok"] = bool(all(b >= a - tol for a, b in zip(order, order[1:])))
+        if len(peaks) == 4 and not m.get("wrist_peak_early"):
+            order = [peaks[k] for k in ("hip", "shoulder", "elbow", "wrist")]
+            tol = RULES["chain_tol_ms"] / 1000 + 0.5 / fps
+            # outwards in time, and the wrist clearly after the hip (all four at once is not a chain)
+            m["chain_order_ok"] = bool(all(b >= a - tol for a, b in zip(order, order[1:]))
+                                       and order[3] - order[0] >= 1.5 / fps)
+        else:
+            m["chain_order_ok"] = None
         turn = _between(t, *TURN_WIN)
         sx = (kp[turn, shoulder, 0] - kp[turn, other_sh, 0]) / torso
         m["turn"] = float(np.ptp(sx)) if turn.any() else None
@@ -339,7 +360,7 @@ def stroke_metrics(kp_raw: np.ndarray, sc: np.ndarray, t: np.ndarray, fps: float
         else:
             m["jump"] = None
         after = _between(t, 1e-9, FOLLOW_S)
-        if t[-1] >= FOLLOW_S - 1 / fps and after.any():
+        if t[-1] >= FOLLOW_S - 1 / fps and after.any() and not unclear:
             # how far the wrist keeps going, sideways in the picture, the way it was moving into the contact
             across = np.sign(kp[h, wrist, 0] - kp[max(0, h - 2), wrist, 0]) or 1.0
             m["follow_through"] = float(np.max(across * (kp[after, wrist, 0] - kp[h, wrist, 0])) / torso)
@@ -500,7 +521,10 @@ def summary(results: list[dict]) -> dict:
                 if len(v):
                     pd[k] = {"mean": round(float(v.mean()), 3), "std": round(float(v.std()), 3), "n": len(v)}
             if g in OVERHEAD:
-                pd["chain_order_ok_share"] = round(float(np.mean([bool(r["metrics"].get("chain_order_ok")) for r in mine])), 2)
+                known = [r["metrics"]["chain_order_ok"] for r in mine if r["metrics"].get("chain_order_ok") is not None]
+                if known:
+                    pd["chain_order_ok_share"] = round(float(np.mean(known)), 2)
+                    pd["chain_order_known"] = len(known)
             gd["players"][str(pid)] = pd
         for k in keys:
             allv = np.array([r["metrics"][k] for r in rs if isinstance(r["metrics"].get(k), (int, float))], float)

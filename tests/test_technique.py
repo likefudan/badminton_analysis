@@ -246,3 +246,30 @@ def test_no_clear_top_keeps_the_detected_hit():
     kp[:, TQ.R_WR, 1] = 500 - 100 - 140 - 200 * t  # still rising through the whole search window
     m = TQ.stroke_metrics(kp, sc, t, FPS, "杀球")["metrics"]
     assert m["contact_shift_ms"] == 0 and m["contact_unclear"] is True
+
+
+def test_all_joints_peaking_together_is_not_a_chain():
+    kp, sc, t = swing(peaks_s=(-0.05, -0.05, -0.05, -0.05))
+    assert TQ.stroke_metrics(kp, sc, t, FPS, "杀球")["metrics"]["chain_order_ok"] is False
+
+
+def test_early_wrist_peak_leaves_the_order_unknown():
+    kp, sc, t = swing()
+    drop = np.exp(-((t + 0.35) / 0.03) ** 2)  # racket dropped fast in the backswing
+    kp[:, TQ.R_WR, 1] += 400 * (1 - np.cumsum(drop) / drop.sum())  # down at first, raised fast at -0.35 s
+    m = TQ.stroke_metrics(kp, sc, t, FPS, "杀球")["metrics"]
+    assert m["wrist_peak_early"] is True and m["chain_order_ok"] is None
+
+
+def test_shuttle_far_away_is_ignored():
+    kp, sc, t = swing(turn_px=0)
+    kp[:, TQ.R_WR] = kp[:, TQ.R_SH] + np.stack([40 + 20 * np.sin(t * 10), 40 + 0 * t], 1)
+    kp[:, TQ.L_WR] = kp[:, TQ.L_SH] + (-150, 30)
+    across_net = kp[len(t) // 2, TQ.L_WR] + (-400, -300)  # nearer the free hand, but far from both
+    assert TQ.stroke_metrics(kp, sc, t, FPS, "放网", shuttle=across_net)["racket_hand"] == "R"
+
+
+def test_overhead_type_with_hand_below_shoulder_is_skipped():
+    kp, sc, t = swing(contact=-0.5)  # BST said drop, but it was hit below the shoulders
+    r = TQ.stroke_metrics(kp, sc, t, FPS, "吊球")
+    assert not r["ok"] and "类型可能判错" in r["reason"]
