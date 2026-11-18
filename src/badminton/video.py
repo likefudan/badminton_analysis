@@ -29,6 +29,28 @@ class VideoInfo:
         return self.color_transfer in HDR_TRANSFERS
 
 
+def _rotation(stream: dict) -> int:
+    """Display rotation of an ffprobe video stream in degrees (ffprobe's sign: -90 = shown turned clockwise)."""
+    rot = 0
+    for sd in stream.get("side_data_list", []):
+        rot = int(sd.get("rotation", rot) or 0)
+    return int(stream.get("tags", {}).get("rotate", rot) or 0)
+
+
+def upright_filter(src) -> str:
+    """ffmpeg filter that turns the stored frames of `src` the way a player shows them ("" if none).
+    Needed where ffmpeg cannot do it itself: frames decoded on the VideoToolbox (to_sdr on a Mac) skip
+    autorotate, so an iPhone clip filmed upside down (IMG_1064, rotation 180) came out upside down."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", str(src)],
+                         capture_output=True, text=True).stdout
+    try:
+        stream = json.loads(out)["streams"][0]
+    except (ValueError, KeyError, IndexError):
+        return ""
+    theta = (-_rotation(stream)) % 360  # how far to turn clockwise
+    return {90: "transpose=clock", 180: "hflip,vflip", 270: "transpose=cclock"}.get(theta, "")
+
+
 def probe(path: str | Path) -> VideoInfo:
     """Video properties via ffprobe, falling back to OpenCV when ffprobe is missing."""
     path = str(path)
@@ -44,10 +66,7 @@ def probe(path: str | Path) -> VideoInfo:
         frames = int(v.get("nb_frames") or 0)
         w, h = int(v["width"]), int(v["height"])
         # iPhone stores portrait/landscape as rotation metadata; OpenCV applies it.
-        rot = 0
-        for sd in v.get("side_data_list", []):
-            rot = int(sd.get("rotation", rot) or 0)
-        rot = int(v.get("tags", {}).get("rotate", rot) or 0)
+        rot = _rotation(v)
         if abs(rot) % 180 == 90:
             w, h = h, w
         return VideoInfo(
@@ -110,8 +129,14 @@ def to_sdr(src: str | Path, dst: str | Path, height: int | None = None) -> None:
         pre = ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
     else:
         raise RuntimeError("这个 ffmpeg 既没有 zscale 也没有 scale_vt，无法把 HDR 转成 SDR")
+    turn = upright_filter(src)  # turned here, the same way on both paths; the output carries no rotation
+    if turn:
+        vf += "," + turn
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", *pre, "-i", str(src), "-map", "0:v:0", *_audio_map(src), "-vf", vf,
+        # -display_rotation 0 drops the input's rotation, so the output does not carry it on (OpenCV would
+        # turn the already turned frames again)
+        ["ffmpeg", "-y", "-v", "error", *pre, "-noautorotate", *(["-display_rotation:v:0", "0"] if turn else []),
+         "-i", str(src), "-map", "0:v:0", *_audio_map(src), "-vf", vf,
          "-c:v", "libx264", "-crf", "18", "-preset", "fast",
          "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
          "-c:a", "aac", "-b:a", "160k", str(dst)],
@@ -169,8 +194,11 @@ class VideoWriter:
         if shutil.which("ffmpeg"):
             cmd = ["ffmpeg", "-y", "-v", "error",
                    "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", f"{fps}", "-i", "-"]
-            if audio_from:
-                cmd += ["-ss", f"{audio_start_s}", "-i", str(audio_from), "-map", "0:v", "-map", "1:a?",
+            # only one audio stream, one ffmpeg can decode: "1:a?" took them all, and an iPhone clip's
+            # spatial audio (apple_apac) made ffmpeg fail (IMG_1069, an SDR clip that skips `sdr`)
+            k = first_decodable_audio(audio_from) if audio_from else None
+            if k is not None:
+                cmd += ["-ss", f"{audio_start_s}", "-i", str(audio_from), "-map", "0:v", "-map", f"1:a:{k}",
                         "-c:a", "aac", "-shortest"]
             if encoder == "libx264":
                 cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf)]
