@@ -152,3 +152,32 @@ def test_shuttle_out_in_the_last_hitters_own_half_is_doubtful(camera, monkeypatc
     strokes = [_stroke(0.0, 1, "near", "发球"), _stroke(1.0, 2, "far"), _stroke(2.0, 1, "near"), _stroke(3.0, 2, "far")]
     (r,) = _Scene(camera, 400, [(1, 150, 160, (3.0, 15.0))], monkeypatch).judge(strokes)
     assert r["winner_side"] == "far" and r["confidence"] == "low"
+
+
+def test_labels_override_the_program_and_count(camera, monkeypatch, tmp_path):
+    strokes = (
+        [_stroke(0.0, 2, "far", "发球"), _stroke(1.0, 1, "near"), _stroke(2.0, 2, "far", "高远/平高"), _stroke(3.2, 1, "near")]
+        + [_stroke(9.0, 1, "near", "高远/平高"), _stroke(10.0, 2, "far", "抽挡")]
+        + [_stroke(15.0, 1, "near", "发球"), _stroke(16.0, 2, "far", "挑球"), _stroke(17.0, 1, "near"), _stroke(18.0, 2, "far", "杀球")]
+    )
+    rallies = _Scene(camera, 700, [(0, 150, 160, (3.0, 5.5))], monkeypatch).judge(strokes)
+    assert [r["n"] for r in rallies] == [1, 0, 2] and rallies[2]["winner_side"] is None
+    path = tmp_path / "v.points.labels.csv"
+    # frames as the page showed them, one or two frames off after a re-run; 9999 matches nothing
+    path.write_text("frame,winner,note\n301,far,\n541,near,接得好\n96,none,\n9999,far,\n")
+    labels = P.load_labels(path)
+    assert P.apply_labels(rallies, labels, FPS) == 3
+    r1, knock, r2 = rallies
+    assert r1["dead_ball"] and r1["n"] == 0 and r1["confidence"] == "manual" and r1["program"]["winner_side"] == "far"
+    # a person says the two-hit run was a rally, won by far's last shot
+    assert (knock["n"], knock["winner_side"], knock["ending"], knock["confidence"]) == (1, "far", "winner", "manual")
+    # and that near won the one the program could not call: far's smash was the error
+    assert (r2["n"], r2["winner_side"], r2["ending"]) == (2, "near", "error")
+    assert r2["error"] == {"kind": "unforced", "how": None}
+    doc = P.points_json(strokes, rallies, FPS)
+    assert (doc["rallies_total"], doc["rallies_judged"], doc["rallies_labelled"]) == (2, 2, 3)
+    assert doc["sides"]["far"]["points"] == 1 and doc["sides"]["near"]["points"] == 1
+    far = doc["players"][1]
+    assert far["winners"] == 1 and far["errors"] == 1 and far["errors_by_type"] == {"杀球": 1}
+    text = "\n".join(P.digest_text(P.digest(doc)))
+    assert "3 个是球友在结果页上自己标的" in text and "近端得分（人标的）" in text

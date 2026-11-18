@@ -221,24 +221,77 @@ def judge_rallies(strokes: list[dict], shuttle_xy: np.ndarray, calib: CourtCalib
             "clues": {"pickup": pick, "track_end": track, "shuttle_lay": where,
                       "next_first_hit_side": nxt[0].get("side") if nxt else None},
             "winner_side": winner, "confidence": conf, "ending": None, "error": None,
+            "error_kind_if_lost": error_kind(g, fps),
         }
         if row["dead_ball"]:
             row.update(winner_side=None, confidence=None)
-        elif winner and side:
+        row["program"] = {k: row[k] for k in ("winner_side", "confidence", "dead_ball")}
+        out.append(row)
+    settle(out)
+    return out
+
+
+def settle(rallies: list[dict]) -> None:
+    """How each rally ended (from its winner and last hit), and the rally numbers (dead balls get 0)."""
+    n = 0
+    for row in rallies:
+        row["ending"] = row["error"] = None
+        winner, side = row["winner_side"], row["last_hit"]["side"]
+        if not row["dead_ball"] and winner and side:
             if winner == side:
                 row["ending"] = "winner"
             else:
-                spot = pick or track
-                how = "出界" if where == "出界" else "没过网" if spot["half"] == side else None
                 row["ending"] = "error"
-                row["error"] = {"kind": error_kind(g, fps), "how": how}
-        out.append(row)
-    n = 0
-    for row in out:
-        if not row["dead_ball"]:
-            n += 1
-            row["n"] = n
-    return out
+                row["error"] = {"kind": row["error_kind_if_lost"], "how": _how(row)}
+        n += not row["dead_ball"]
+        row["n"] = 0 if row["dead_ball"] else n
+
+
+def _how(row: dict) -> str | None:
+    """没过网 / 出界, from where the shuttle lay; only when that spot agrees with who lost."""
+    clues = row["clues"]
+    spot = clues["pickup"] or clues["track_end"]
+    by_spot, where = spot_vote(spot)
+    if not spot or by_spot != row["winner_side"]:
+        return None
+    return "出界" if where == "出界" else "没过网" if spot["half"] == row["last_hit"]["side"] else None
+
+
+# ---------------------------------------------------------------- calls a person made on the result page
+
+LABEL_MATCH_S = 1.5  # a label belongs to the rally whose last hit is this close to the one it was made on
+LABEL_WINNERS = ("near", "far", "none")  # none: not a rally (the shuttle passed back, a warm-up)
+
+
+def load_labels(path: str | Path) -> list[dict]:
+    """<video>.points.labels.csv (frame,winner,note): frame = the last hit of the rally as the page showed it."""
+    import csv
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = [r for r in csv.DictReader(f) if (r.get("frame") or "").strip()]
+    return [{"frame": int(float(r["frame"])), "winner": r["winner"].strip(), "note": (r.get("note") or "").strip()}
+            for r in rows if r.get("winner", "").strip() in LABEL_WINNERS]
+
+
+def apply_labels(rallies: list[dict], labels: list[dict], fps: float) -> int:
+    """Put a person's calls over the program's: each label goes to the rally whose last hit is nearest
+    (within LABEL_MATCH_S). "none" takes the run out like a dead ball; near / far make it a rally with
+    that winner, even one the program had taken for a dead ball. Returns how many labels found a rally."""
+    used = 0
+    for lab in labels:
+        best = min(rallies, key=lambda r: abs(r["last_hit"]["frame"] - lab["frame"]), default=None)
+        if best is None or abs(best["last_hit"]["frame"] - lab["frame"]) > LABEL_MATCH_S * fps:
+            continue
+        used += 1
+        if lab["winner"] == "none":
+            best.update(dead_ball=True, winner_side=None, confidence="manual")
+        else:
+            best.update(dead_ball=False, winner_side=lab["winner"], confidence="manual")
+    settle(rallies)
+    return used
+
+
+COUNTED = ("high", "manual")  # calls that go into the scores: a pick-up seen, or a person's
 
 
 def player_table(strokes: list[dict], rallies: list[dict], names: dict | None = None) -> list[dict]:
@@ -262,7 +315,7 @@ def player_table(strokes: list[dict], rallies: list[dict], names: dict | None = 
             p["strokes"][s["group"]] = p["strokes"].get(s["group"], 0) + 1
     for r in rallies:
         p = table.get(r["last_hit"]["player_id"])
-        if p is None or not r["ending"] or r["confidence"] != "high":
+        if p is None or not r["ending"] or r["confidence"] not in COUNTED:
             continue
         group = "没把握" if r["last_hit"]["needs_review"] else r["last_hit"]["group"]
         if r["ending"] == "winner":
@@ -280,7 +333,7 @@ def side_table(rallies: list[dict]) -> dict:
     out = {s: {"points": 0, "winners": 0, "opponent_errors": 0, "opponent_unforced_errors": 0} for s in SIDES}
     for r in rallies:
         w = r["winner_side"]
-        if not w or r["confidence"] != "high":
+        if not w or r["confidence"] not in COUNTED:
             continue
         out[w]["points"] += 1
         if r["ending"] == "winner":
@@ -300,13 +353,14 @@ def points_json(strokes: list[dict], rallies: list[dict], fps: float, video: str
                   "in_m": IN_M, "out_m": OUT_M, "pick_hand_bh": PICK_HAND_BH},
         "how_to_read": [
             "谁赢这一分是推出来的，不是看见的：看死球后是谁弯腰把球捡起来、在哪捡（站着用拍子把球挑起来的认不出）。球躺在界内，它所在的半场丢分；明显在界外，它所在的半场得分。",
-            "confidence：high = 看到了捡球；low = 没看到捡球，只按最后一拍之后球轨迹的终点猜（不可靠，不计入得分和失误）；都没有就不判。",
+            "confidence：manual = 人在结果页上点的；high = 看到了捡球；low = 没看到捡球，只按最后一拍之后球轨迹的终点猜（不可靠，不计入得分和失误）；都没有就不判。program 是程序自己的判断。",
             "最后一拍漏掉时，得分的一边通常还对，但制胜球或失误会记到错的人头上。",
             "主动失误 = 丢分的最后一拍，而且它接的那一拍不是杀球/推扑，来球间隔也不短于 forced_s 秒；否则算受迫失误。",
             "dead_ball 的不是回合：一两拍之后没人捡球，是把球打回给发球的人。这些拍不计入统计。",
             "hits_unsure 是类型没把握的击球，不计入 strokes 的分类次数。",
         ],
-        "rallies_total": len(real), "rallies_judged": sum(1 for r in real if r["confidence"] == "high"),
+        "rallies_total": len(real), "rallies_judged": sum(1 for r in real if r["confidence"] in COUNTED),
+        "rallies_labelled": sum(1 for r in rallies if r["confidence"] == "manual"),
         "rallies_guessed": sum(1 for r in real if r["confidence"] == "low"),
         "dead_ball_runs": len(rallies) - len(real),
         "sides": side_table(real), "players": player_table(strokes, rallies, names), "rallies": rallies,
@@ -315,8 +369,9 @@ def points_json(strokes: list[dict], rallies: list[dict], fps: float, video: str
 
 def summary_lines(doc: dict) -> list[str]:
     """What the command prints: the score by side, then one line per player."""
-    lines = [f"{doc['rallies_total']} 个回合，看到捡球、判出胜负的 {doc['rallies_judged']} 个"
-             f"（另有 {doc['rallies_guessed']} 个只能按球轨迹猜，不计分；{doc['dead_ball_runs']} 段是把球打回给对方，不算回合）"]
+    lab = doc.get("rallies_labelled", 0)
+    lines = [f"{doc['rallies_total']} 个回合，判出胜负的 {doc['rallies_judged']} 个" + (f"（其中 {lab} 个是人标的）" if lab else "")
+             + f"（另有 {doc['rallies_guessed']} 个只能按球轨迹猜，不计分；{doc['dead_ball_runs']} 段是把球打回给对方，不算回合）"]
     for side, s in doc["sides"].items():
         lines.append(f"  {SIDE_ZH[side]}：得 {s['points']} 分（制胜球 {s['winners']}，对方失误 {s['opponent_errors']}，"
                      f"其中主动失误 {s['opponent_unforced_errors']}）")
@@ -335,19 +390,23 @@ def digest(doc: dict) -> dict:
         if r["dead_ball"]:
             continue
         rows.append({"n": r["n"], "start_s": r["start_s"], "end_s": r["end_s"], "hits": r["hits"],
-                     "winner_side": r["winner_side"] if r["confidence"] == "high" else None,
-                     "ending": r["ending"] if r["confidence"] == "high" else None,
-                     "error": r["error"] if r["confidence"] == "high" else None,
-                     "shuttle_lay": r["clues"]["shuttle_lay"] if r["confidence"] == "high" else None,
+                     "winner_side": r["winner_side"] if r["confidence"] in COUNTED else None,
+                     "ending": r["ending"] if r["confidence"] in COUNTED else None,
+                     "error": r["error"] if r["confidence"] in COUNTED else None,
+                     "shuttle_lay": r["clues"]["shuttle_lay"] if r["confidence"] in COUNTED else None,
+                     "by_person": r["confidence"] == "manual",
                      "last_hit": {k: r["last_hit"][k] for k in ("player_id", "side", "type", "needs_review")}})
     return {"format": doc["format"], "rallies_total": doc["rallies_total"], "rallies_judged": doc["rallies_judged"],
+            "rallies_labelled": doc.get("rallies_labelled", 0),
             "sides": doc["sides"], "players": doc["players"], "rallies": rows}
 
 
 def digest_text(d: dict) -> list[str]:
     """【回合和得失分】 for the review prompt."""
+    lab = d.get("rallies_labelled", 0)
     lines = [f"【回合和得失分】按击球切出 {d['rallies_total']} 个回合，其中 {d['rallies_judged']} 个判出了谁赢"
-             "（办法：死球后谁弯腰捡球、在哪捡；球在界内，它所在半场丢分；明显界外，它所在半场得分。没看到捡球的不判）。"
+             + (f"，{lab} 个是球友在结果页上自己标的谁赢" if lab else "")
+             + "（程序的办法：死球后谁弯腰捡球、在哪捡；球在界内，它所在半场丢分；明显界外，它所在半场得分。没看到捡球的不判）。"
              "没判出的回合不能当成平分，也不能据此说谁赢了这场。击球类型是模型认的，「没把握」的不计入分类次数。"]
     for side, s in d["sides"].items():
         lines.append(f"- {SIDE_ZH[side]}：判出的回合里得 {s['points']} 分（自己打出制胜球 {s['winners']}，"
@@ -363,14 +422,15 @@ def digest_text(d: dict) -> list[str]:
         last = r["last_hit"]
         how = "制胜球" if r["ending"] == "winner" else \
             {"unforced": "主动失误", "forced": "受迫失误"}[r["error"]["kind"]] + (f"（{r['error']['how']}）" if r["error"]["how"] else "")
-        lines.append(f"- 回合 {r['n']}（{r['start_s']:.0f}–{r['end_s']:.0f} 秒，{r['hits']} 拍）：{SIDE_ZH[r['winner_side']]}得分，"
+        lines.append(f"- 回合 {r['n']}（{r['start_s']:.0f}–{r['end_s']:.0f} 秒，{r['hits']} 拍）：{SIDE_ZH[r['winner_side']]}得分"
+                     + ("（人标的）" if r.get("by_person") else "") + "，"
                      f"最后一拍 {last['player_id']} 号 {last['type']}{'（类型没把握）' if last['needs_review'] else ''}，{how}")
     return lines
 
 
 def run(strokes_json_path, shuttle_csv, skeleton_npz, court: CourtCalibration, players_per_side: int,
-        names: dict | None = None) -> dict:
-    """Files in, the points document out."""
+        names: dict | None = None, labels_csv=None) -> dict:
+    """Files in, the points document out. labels_csv: the winners a person set on the result page."""
     from .bst import read_shuttle_csv
     from .tracking import load_npz, track_players
 
@@ -380,6 +440,8 @@ def run(strokes_json_path, shuttle_csv, skeleton_npz, court: CourtCalibration, p
     tracking = track_players(data, court, players_per_side)
     xy = read_shuttle_csv(shuttle_csv, int(data["frame"][-1]) + 1)
     rallies = judge_rallies(strokes, xy, court, fps, players_per_side == 1, data, tracking)
-    return points_json(strokes, rallies, fps, doc.get("video", ""),
-                       {"strokes": str(strokes_json_path), "shuttle": str(shuttle_csv),
-                        "skeleton": str(skeleton_npz)}, names, players_per_side == 1)
+    inputs = {"strokes": str(strokes_json_path), "shuttle": str(shuttle_csv), "skeleton": str(skeleton_npz)}
+    if labels_csv and Path(labels_csv).exists():
+        apply_labels(rallies, load_labels(labels_csv), fps)
+        inputs["labels"] = str(labels_csv)
+    return points_json(strokes, rallies, fps, doc.get("video", ""), inputs, names, players_per_side == 1)

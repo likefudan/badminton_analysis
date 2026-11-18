@@ -78,6 +78,8 @@ type VideoRow = {
   strokes_updated_at: string | null;
   stroke_labels_changed_at: string | null;
   stroke_labels_synced_at: string | null;
+  rally_labels_changed_at: string | null;
+  rally_labels_synced_at: string | null;
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -158,7 +160,9 @@ async function describe(env: Env, v: VideoRow) {
     .bind(v.id)
     .all<{ status: string; n: number }>();
   const strokeCount = await env.DB.prepare("SELECT COUNT(*) AS n FROM stroke_labels WHERE video_id = ?").bind(v.id).first<{ n: number }>();
+  const rallyCount = await env.DB.prepare("SELECT COUNT(*) AS n FROM rally_labels WHERE video_id = ?").bind(v.id).first<{ n: number }>();
   return {
+    rallyLabels: { count: rallyCount?.n ?? 0, changedAt: v.rally_labels_changed_at, syncedAt: v.rally_labels_synced_at },
     strokes: {
       status: v.strokes_status,
       stage: v.strokes_stage,
@@ -305,6 +309,7 @@ async function deleteVideo(env: Env, id: string): Promise<Response> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM tasks WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM stroke_labels WHERE video_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM rally_labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM labels WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM video_parts WHERE video_id = ?").bind(id),
     env.DB.prepare("DELETE FROM videos WHERE id = ?").bind(id),
@@ -412,6 +417,17 @@ async function claimJob(req: Request, env: Env): Promise<Response> {
       .bind(USER_ID, new Date(now.getTime() - labelSyncDelay(env)).toISOString())
       .first<VideoRow>();
     if (l) return json({ video: await describe(env, l), task: "stroke-labels" });
+  }
+  if (tasks.includes("rally-labels")) {
+    // 和击球类型标注一样，停手一会儿再同步：一个个点回合时不用每一下都重算
+    const l = await env.DB.prepare(
+      `SELECT * FROM videos WHERE user_id = ? AND rally_labels_changed_at IS NOT NULL
+         AND (rally_labels_synced_at IS NULL OR rally_labels_synced_at < rally_labels_changed_at) AND rally_labels_changed_at < ?
+       ORDER BY rally_labels_changed_at LIMIT 1`,
+    )
+      .bind(USER_ID, new Date(now.getTime() - labelSyncDelay(env)).toISOString())
+      .first<VideoRow>();
+    if (l) return json({ video: await describe(env, l), task: "rally-labels" });
   }
   if (tasks.includes("labels")) {
     // 停手一分钟后再同步，标注过程中不用每一下都同步
@@ -1143,6 +1159,60 @@ async function strokeLabelsSynced(req: Request, env: Env, id: string): Promise<R
   return json({ ok: true });
 }
 
+// ---------- 回合谁赢（结果页「回合和得失分」里点的） ----------
+// 以回合最后一拍的帧号为键；节点把它对到重算时最近的回合上（击球识别重跑后帧号可能差一两帧）。
+
+const RALLY_WINNERS = new Set(["near", "far", "none"]);
+
+async function getRallyLabels(env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  const rows = await env.DB.prepare("SELECT frame, winner, note, updated_at FROM rally_labels WHERE video_id = ? ORDER BY frame")
+    .bind(id)
+    .all<{ frame: number; winner: string; note: string; updated_at: string }>();
+  return json({
+    labels: Object.fromEntries(rows.results.map((r) => [r.frame, { winner: r.winner, note: r.note, updatedAt: r.updated_at }])),
+    changedAt: v.rally_labels_changed_at,
+  });
+}
+
+// items: [{frame, winner: near|far|none, note}] 或 [{frame, delete: true}]（回到程序的判断）
+async function putRallyLabels(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { items?: unknown } | null;
+  const items = Array.isArray(body?.items) ? (body.items as Record<string, unknown>[]) : null;
+  if (!items || !items.length || items.length > MAX_LABEL_ITEMS) throw new HttpError(400, "标注列表不对");
+  const now = new Date().toISOString();
+  const stmts: D1PreparedStatement[] = [];
+  for (const it of items) {
+    const frame = Number(it?.frame);
+    if (!Number.isInteger(frame) || frame < 0 || frame > 10_000_000) throw new HttpError(400, "帧号不对");
+    if (it.delete === true) {
+      stmts.push(env.DB.prepare("DELETE FROM rally_labels WHERE video_id = ? AND frame = ?").bind(id, frame));
+      continue;
+    }
+    const winner = String(it.winner ?? "");
+    if (!RALLY_WINNERS.has(winner)) throw new HttpError(400, "谁赢只能是 near、far 或 none");
+    const note = typeof it.note === "string" ? it.note.trim().slice(0, 300) : "";
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO rally_labels (video_id, frame, winner, note, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (video_id, frame) DO UPDATE SET winner = excluded.winner, note = excluded.note, updated_at = excluded.updated_at`,
+      ).bind(id, frame, winner, note, now),
+    );
+  }
+  stmts.push(env.DB.prepare("UPDATE videos SET rally_labels_changed_at = ? WHERE id = ?").bind(now, id));
+  for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));
+  return json({ ok: true, changedAt: now });
+}
+
+async function rallyLabelsSynced(req: Request, env: Env, id: string): Promise<Response> {
+  await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { changedAt?: unknown } | null;
+  const at = typeof body?.changedAt === "string" ? body.changedAt : new Date(0).toISOString();
+  await env.DB.prepare("UPDATE videos SET rally_labels_synced_at = ? WHERE id = ?").bind(at, id).run();
+  return json({ ok: true });
+}
+
 async function listVideos(env: Env): Promise<Response> {
   const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .bind(USER_ID)
@@ -1347,6 +1417,11 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (match && m === "PUT") return putStrokeLabels(req, env, match[1], who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/stroke-labels\/synced$/);
   if (match && m === "POST") return strokeLabelsSynced(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/rally-labels$/);
+  if (match && m === "GET") return getRallyLabels(env, match[1]);
+  if (match && m === "PUT") return putRallyLabels(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/rally-labels\/synced$/);
+  if (match && m === "POST") return rallyLabelsSynced(req, env, match[1]);
   throw new HttpError(404, "没有这个接口");
 }
 
