@@ -604,7 +604,10 @@ def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, prog
         doc = json.loads(technique.read_text())
         n_ok = sum(1 for r in doc.get("strokes", []) if r.get("ok"))
         n_notes = sum(len(r.get("notes") or []) for r in doc.get("strokes", []))
-        progress.done("technique", f"{n_ok} 拍算出了动作，{n_notes} 条提示")
+        if n_ok:
+            progress.done("technique", f"{n_ok} 拍算出了动作，{n_notes} 条提示")
+        else:
+            progress.done("technique", "近端没有类型有把握的击球，没有算动作")
     except (OSError, ValueError):
         progress.done("technique")
     return technique

@@ -1226,6 +1226,8 @@ function techniqueCard(doc, names) {
       for (const k of keys) {
         const vals = gs.map((r) => r.metrics[k]).filter((x) => typeof x === "number");
         if (!vals.length) continue;
+        // 参考里有这个类型却没有这项（例如推扑的击球点：推球和扑球混在一起），就不显示
+        if (ref[g] && !ref[g][k]) continue;
         const [label, unit, d] = TECH_LABEL[k];
         const pro = ref[g] && ref[g][k] ? ref[g][k].p50 : null;
         const off = gs.filter((r) => r.percentiles && r.percentiles[k] != null && (r.percentiles[k] <= 10 || r.percentiles[k] >= 90)).length;
