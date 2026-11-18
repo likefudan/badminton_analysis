@@ -204,6 +204,7 @@ STEPS = [
     ("stats", "跑动和站位统计"),
     ("cut", "剪辑回合视频"),
     ("shuttle", "羽毛球追踪"),
+    ("technique", "击球类型和动作"),
     ("upload", "转码并上传结果"),
     ("review", "AI 报告"),
 ]
@@ -558,6 +559,57 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     return combined
 
 
+TECHNIQUE_VERSION = "1"  # raise when strokes / technique change, so recordings on this Mac are redone
+
+
+def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, progress: Progress, log: list[str],
+                     run=None) -> Path | None:
+    """Stroke types (`badminton strokes`) and then how each stroke was played compared with the pros
+    (`badminton technique`). Needs the shuttle track and the BST weights; like the shuttle, a failure
+    here only skips this step."""
+    run = run or run_step
+    npz, csv = out_dir / f"{work.stem}.skeleton.npz", out_dir / f"{work.stem}.shuttle.csv"
+    strokes, technique = out_dir / f"{work.stem}.strokes.json", out_dir / f"{work.stem}.technique.json"
+    if not npz.exists() or not csv.exists():
+        progress.skip("technique", "没有骨架数据或羽毛球轨迹，找不到击球")
+        return None
+    from .strokes import DEFAULT_WEIGHTS
+
+    if not DEFAULT_WEIGHTS.exists():
+        progress.skip("technique", "这台 Mac 上没有击球类型模型（BST 权重，见 docs/stroke_types.md）")
+        return None
+    stamp = out_dir / f"{work.stem}.technique.version"
+    newest_input = max(npz.stat().st_mtime, csv.stat().st_mtime)
+    if (stamp.exists() and stamp.read_text().strip() == TECHNIQUE_VERSION and technique.exists()
+            and technique.stat().st_mtime >= newest_input):
+        progress.skip("technique", "沿用上次的结果")
+        return technique
+    common = ["--court", str(court), "--data", str(npz), "-o", str(out_dir)] + (["--singles"] if singles else [])
+    progress.start("technique", "认每一拍的类型")
+    mark = len(log)
+    players = out_dir / f"{work.stem}.players.json"
+    ok = run(["strokes", str(work), *common, "--shuttle", str(csv), "--no-video"]
+             + (["--players", str(players)] if players.exists() else []), log, None, None) == 0 and strokes.exists()
+    if ok:
+        progress.update("technique", percent=60, detail="量每一拍的动作，和职业比")
+        ok = run(["technique", str(work), *common, "--strokes", str(strokes), "--shuttle", str(csv)],
+                 log, None, None) == 0 and technique.exists()
+    if not ok:
+        reason = log[-1] if len(log) > mark else "没有输出"
+        print(f"  击球类型和动作没有成功：{reason}")
+        progress.skip("technique", f"这次没有成功，其它结果不受影响（{reason[:120]}）")
+        return None
+    stamp.write_text(TECHNIQUE_VERSION)
+    try:
+        doc = json.loads(technique.read_text())
+        n_ok = sum(1 for r in doc.get("strokes", []) if r.get("ok"))
+        n_notes = sum(len(r.get("notes") or []) for r in doc.get("strokes", []))
+        progress.done("technique", f"{n_ok} 拍算出了动作，{n_notes} 条提示")
+    except (OSError, ValueError):
+        progress.done("technique")
+    return technique
+
+
 def review_inputs(work: Path, court: Path, out_dir: Path, log: list[str], run=None) -> bool:
     """Write <stem>.review.request.json: the statistics as text plus the prompt. No model is called here;
     the web site asks the model with its own key once the file is uploaded."""
@@ -572,6 +624,9 @@ def review_inputs(work: Path, court: Path, out_dir: Path, log: list[str], run=No
     csv = out_dir / f"{work.stem}.shuttle.csv"
     if csv.exists():
         args += ["--shuttle", str(csv), "--video", str(work)]
+    technique = out_dir / f"{work.stem}.technique.json"
+    if technique.exists():
+        args += ["--technique", str(technique)]
     mine: list[str] = []  # its chatter (how to paste the prompt) is of no use in the job's error log
     if (run or run_step)(args, mine, None, None) != 0:
         print("  生成 AI 报告的统计摘要失败：" + (mine[-1] if mine else ""))
@@ -653,6 +708,7 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
         if progress.steps[key]["status"] == "pending":
             progress.skip(key, "这次没有运行")
     combined = track_shuttle(work, court, out_dir, progress, log)
+    stroke_technique(work, court, out_dir, options.get("mode") != "doubles", progress, log)
     review_inputs(work, court, out_dir, log)
     files = sorted(p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in RESULT_SUFFIXES)
     if combined:  # the combined video is the skeleton video plus the shuttle: no need to send both

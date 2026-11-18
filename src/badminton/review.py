@@ -128,12 +128,14 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
 
 
 def build_summary(movement: dict, *, source: str = "", extras: dict | None = None, calib=None,
-                  shuttle: dict | None = None, shuttle_accuracy_pct: float | None = None) -> dict:
+                  shuttle: dict | None = None, shuttle_accuracy_pct: float | None = None,
+                  technique: dict | None = None) -> dict:
     """Compact, deterministic match summary from a movement JSON.
 
     extras: other analysis JSONs by name (e.g. positioning), passed through compacted.
     calib: CourtCalibration, for camera height and per-player position precision.
     shuttle: shuttle_stats() output. shuttle_accuracy_pct: hand-audited accuracy, if known.
+    technique: technique.digest() of the stroke technique (types and how each stroke compares with the pros).
     """
     in_play = float(movement.get("in_play_s", 0.0))
     duration = float(movement.get("duration_s", 0.0))
@@ -217,6 +219,8 @@ def build_summary(movement: dict, *, source: str = "", extras: dict | None = Non
         summary["shuttle"] = {"audited_accuracy_pct": round(float(shuttle_accuracy_pct), 1)}
     if extras:
         summary["extras"] = {k: compact(v) for k, v in extras.items()}
+    if technique and technique.get("players"):
+        summary["technique"] = technique
     summary["caveats"] = _caveats(summary)
     return summary
 
@@ -250,7 +254,8 @@ def _caveats(s: dict) -> list[str]:
     """Data-quality notes worked out from the numbers themselves (Chinese, for the prompt and the report)."""
     m, d = s["match"], s["definitions"]
     out = [
-        "数据里只有跑动和站位：没有比分、没有每一拍的击球类型和落点、不知道每个回合谁赢。",
+        ("击球类型是模型认的，只有近端球员有动作数字；没有比分、没有落点、不知道每个回合谁赢。" if s.get("technique") else
+         "数据里只有跑动和站位：没有比分、没有每一拍的击球类型和落点、不知道每个回合谁赢。"),
         f"回合是按球员动作切的（有人超过 {d['rally_active_speed_mps']:g} 米/秒算回合中，都慢于它超过 "
         f"{d['rally_pause_min_s']:g} 秒算死球）：回合开头常漏 1–2 秒，慢节奏的相持可能被切成两段，"
         "捡球时跑动快也可能被算进回合。回合数和回合长度是估计值。",
@@ -363,6 +368,8 @@ def summary_text(s: dict) -> str:
             else:
                 t += "；相同"
             lines.append(t)
+    if s.get("technique"):
+        lines += technique_text(s["technique"])
     for name, extra in (s.get("extras") or {}).items():
         lines.append(f"【其他分析：{name}】")
         lines.append(json.dumps(extra, ensure_ascii=False, sort_keys=True))
@@ -404,7 +411,7 @@ def previous_text(prev: dict, cur: dict) -> str:
 SYSTEM_PROMPT = """你是一位羽毛球教练，帮业余球友复盘比赛。你看不到视频，手里只有程序从视频里算出来的数字（跑动、速度、站位、回合时间）。请只根据这些数字写点评，用简体中文，语气像球友之间说话，直接、具体。
 
 必须遵守：
-1. 只用给出的数字。数据里没有比分、没有每一拍的击球类型和落点、不知道回合谁赢，所以不要写出任何一次具体的击球（杀球、吊球、挑球等）、比分或胜负，也不要猜。可以说「这组数字常见于某种打法」，但要明说这是推测。
+1. 只用给出的数字。数据里没有比分、没有落点、不知道回合谁赢，不要写比分或胜负，也不要猜。只有数据里有「【击球动作】」时才可以谈具体的击球，而且只谈那里列出的类型、时间和数字；没有这一部分就不要写出任何一次具体的击球（杀球、吊球、挑球等）。可以说「这组数字常见于某种打法」，但要明说这是推测。
 2. 每个判断都带上它依据的数字和单位；提到回合时写编号和时间，例如「第 2 回合（40.1–52.3 秒）」。
 3. 「数据质量」里列出的问题要当真：受影响的数字要么不用，要么用的时候在同一句里说明不确定。差别小于误差的不要解读。
 4. 不要重新计算或改动给出的数字，不要补出数据里没有的数字。
@@ -429,9 +436,40 @@ REPORT_REQUEST = """请按下面的结构写点评，用 Markdown，五个二级
 
 COMPARE_REQUEST = """另外数据里有上一次的摘要。在「比赛概况」之后加一个二级标题「## 和上一次比较」：说清哪些指标变了、变了多少，哪些变化小于误差不能算进步或退步。两次的对手、时长、机位可能不同，要提醒这一点。"""
 
+TECHNIQUE_REQUEST = """数据里有「【击球动作】」。在「三个练习建议」之前加一个二级标题「## 击球动作」：每位有数据的球员两三句，只谈超出职业范围的拍数多的那几项（击球点、两脚间距、膝角、躯干前倾、吊球像不像杀球），引用一两个例子的时间，说这在动作上可能意味着什么。要说明击球类型是模型认的、业余和职业单打转播的机位不同，所以这些只是提示，不是定论；拍数少于 3 的组不要下结论。"""
+
 ASK_REQUEST = """下面是球友的追问。根据上面的数据（以及你之前写的点评，如果有）回答，规则不变：只用给出的数字，带单位，引用回合编号和时间；数据答不了的就直说答不了，并说明需要什么数据。
 
 追问：{question}"""
+
+
+def technique_text(t: dict) -> list[str]:
+    """【击球动作】: per player and stroke group, the noted numbers next to the pros, plus example notes."""
+    names = t.get("metric_names", {})
+    lines = ["【击球动作】程序认出的击球类型（模型判断，可能有错）和每一拍的动作数字。只分析近端球员；"
+             "长度单位是「躯干长」（两肩中点到两髋中点），角度是画面里看到的角度。"
+             + ("「职业」是 FineBadminton 14 场职业单打转播里近端球员的中位数；「超出职业范围」= 低于职业第 10 或高于第 90 百分位。"
+                if t.get("has_reference") else "没有职业参考。")]
+    for p in t["players"]:
+        who = p["name"] or f"{p['id']} 号"
+        lines.append(f"- {who}：")
+        for g, gd in p["groups"].items():
+            parts = []
+            for k, m in gd["metrics"].items():
+                if m["median"] is None:
+                    continue
+                txt = f"{names.get(k, k)} 中位数 {_g(m['median'], 2)}"
+                if m["pro_median"] is not None:
+                    txt += f"（职业 {_g(m['pro_median'], 2)}）"
+                if m["outside_pro_range"]:
+                    txt += f"，{m['outside_pro_range']} 拍超出职业范围"
+                parts.append(txt)
+            lines.append(f"  - {g} {gd['n']} 拍" + ("：" + "；".join(parts) if parts else ""))
+        for e in p["examples"]:
+            lines.append(f"  - 例：{_g(e['time_s'])} 秒 {e['type']}：" + "；".join(e["notes"]))
+    if t.get("skipped"):
+        lines.append(f"- 另有 {t['skipped']} 拍关节看不清或类型可能判错，没有算。")
+    return lines
 
 
 def build_prompt(summary: dict, previous: dict | None = None) -> tuple[str, str]:
@@ -442,6 +480,8 @@ def build_prompt(summary: dict, previous: dict | None = None) -> tuple[str, str]
     parts += ["", REPORT_REQUEST]
     if previous:
         parts += ["", COMPARE_REQUEST]
+    if summary.get("technique"):
+        parts += ["", TECHNIQUE_REQUEST]
     return SYSTEM_PROMPT, "\n".join(parts)
 
 
