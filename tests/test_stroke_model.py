@@ -122,12 +122,13 @@ def test_doubles_model_picks_the_class_and_bst_the_type_inside_it():
     model = bst.build_model(n_class=ST.N_CLASSES_FULL).eval()
     hits = [{"frame": 20, "player_id": 1}, {"frame": 50, "player_id": 2}, {"frame": 70, "player_id": None}]
     res = ST.classify_hits(skel, tracking, hits, shuttle, _calib(), [model], 30.0, Fixed())
-    assert [r["model"] for r in res] == ["dshuttlenet", "dshuttlenet", "bst"]
-    for r in res[:2]:
-        assert r["type"] in ("挑球", "防守挑球") and r["prob"] == pytest.approx(0.84) and not r["needs_review"]
+    assert [r["model"] for r in res] == ["rule", "dshuttlenet", "bst"]  # the rally's first hit: a serve by rule
+    for r in res[1:2]:
+        # serves are ruled out mid-rally, so lift gets their share: 0.84 / 0.96
+        assert r["type"] in ("挑球", "防守挑球") and r["prob"] == pytest.approx(0.875) and not r["needs_review"]
         assert len(r["alternatives"]) == 2
     plain = ST.classify_hits(skel, tracking, hits, shuttle, _calib(), [model], 30.0)
-    assert {r["model"] for r in plain} == {"bst"}
+    assert [r["model"] for r in plain] == ["rule", "bst", "bst"]
 
 
 def test_a_file_that_is_not_weights_loads_as_none(tmp_path):

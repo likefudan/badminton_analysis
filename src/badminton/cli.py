@@ -1086,7 +1086,7 @@ def cmd_strokes(a) -> int:
         who = names.get(str(pid), f"球员 {pid}")
         print(f"  {who}：{len(mine)} 拍，有把握的 " + ("、".join(f"{k} {v}" for k, v in kinds.most_common()) or "无"))
     n_review = sum(r["needs_review"] for r in results)
-    print(f"{len(results)} 次击球，其中 {n_review} 次没把握（概率低于 {ST.REVIEW_PROB:.0%}、判成未知、"
+    print(f"{len(results)} 次击球，其中 {n_review} 次没把握（概率低于 {ST.REVIEW_PROB:.0%}、更像未知、"
           f"或击球前后球员数据不全），需要人工看")
     print(f"已写入 {out}、{out.with_suffix('.csv').name}")
     if not a.no_video:

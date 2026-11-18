@@ -1253,9 +1253,14 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
     `${d.total} 个回合，判出谁赢的 ${d.judged} 个` + (d.labelled ? `（${d.labelled} 个是你标的）` : "") +
     (d.judged ? `：${sideName("near")} ${d.sides.near.points} 分，${sideName("far")} ${d.sides.far.points} 分` : "") +
     "。程序是看死球后谁弯腰捡球、在哪捡推出来的，没看到捡球的回合不判" +
-    (onLabel ? "；下面每个回合可以自己点谁赢。" : "。") + "击球类型是模型认的。"));
-  const groups = [...new Set(d.players.flatMap((p) => Object.keys(p.strokes || {})))]
-    .sort((a, b) => d.players.reduce((n, p) => n + (p.strokes[b] || 0) - (p.strokes[a] || 0), 0));
+    (onLabel ? "；下面每个回合可以自己点谁赢。" : "。") + "击球类型是模型认的，每回合第一拍按规则算发球" +
+    (d.players.some((p) => Object.keys(p.strokes_guess || {}).length) ? "；「+n?」是模型没把握、按最可能的大类猜的次数。" : "。")));
+  // 有把握的次数，后面「+n?」是没把握、按最可能的大类猜的次数（旧结果没有 strokes_guess）
+  const sure = (p, g) => (p.strokes || {})[g] || 0;
+  const guess = (p, g) => (p.strokes_guess || {})[g] || 0;
+  const groups = [...new Set(d.players.flatMap((p) => [...Object.keys(p.strokes || {}), ...Object.keys(p.strokes_guess || {})]))]
+    .sort((a, b) => d.players.reduce((n, p) => n + sure(p, b) + guess(p, b) - sure(p, a) - guess(p, a), 0));
+  const hasGuess = d.players.some((p) => Object.keys(p.strokes_guess || {}).length);
   const table = document.createElement("table");
   const head = table.insertRow();
   head.append(el("th", "", ""));
@@ -1270,8 +1275,8 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
     }
   };
   line("击球", (p) => p.hits);
-  for (const g of groups) line(g, (p) => p.strokes[g] || "");
-  line("类型没把握", (p) => p.hits_unsure || "");
+  for (const g of groups) line(g, (p) => (sure(p, g) || "") + (guess(p, g) ? ` +${guess(p, g)}?` : ""));
+  line(hasGuess ? "其中没把握（+?）" : "类型没把握", (p) => p.hits_unsure || "");
   line("制胜球", (p) => p.winners || "");
   line("主动失误", (p) => p.unforced_errors || "", "warn");
   line("受迫失误", (p) => p.forced_errors || "");

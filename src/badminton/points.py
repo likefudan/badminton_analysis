@@ -295,7 +295,8 @@ COUNTED = ("high", "manual")  # calls that go into the scores: a pick-up seen, o
 
 
 def player_table(strokes: list[dict], rallies: list[dict], names: dict | None = None) -> list[dict]:
-    """Per player: strokes by group (the sure ones), rally-ending winners and errors (only of
+    """Per player: strokes by group (the sure ones in `strokes`, the unsure ones by their likeliest
+    group in `strokes_guess`), rally-ending winners and errors (only of
     rallies called with a pick-up seen). Hits of runs marked dead_ball are left out."""
     names = names or {}
     skip = [(r["start_s"], r["end_s"]) for r in rallies if r["dead_ball"]]
@@ -305,19 +306,19 @@ def player_table(strokes: list[dict], rallies: list[dict], names: dict | None = 
         if pid is None or any(a <= s["time_s"] <= b for a, b in skip):
             continue
         p = table.setdefault(pid, {"id": pid, "name": names.get(str(pid), "") or s.get("player_name", ""),
-                                   "side": s.get("side"), "hits": 0, "hits_unsure": 0, "strokes": {},
+                                   "side": s.get("side"), "hits": 0, "hits_unsure": 0, "strokes": {}, "strokes_guess": {},
                                    "winners": 0, "errors": 0, "unforced_errors": 0, "forced_errors": 0,
                                    "winners_by_type": {}, "errors_by_type": {}})
         p["hits"] += 1
         if s.get("needs_review"):
             p["hits_unsure"] += 1
-        else:
-            p["strokes"][s["group"]] = p["strokes"].get(s["group"], 0) + 1
+        into = p["strokes_guess"] if s.get("needs_review") else p["strokes"]
+        into[s["group"]] = into.get(s["group"], 0) + 1
     for r in rallies:
         p = table.get(r["last_hit"]["player_id"])
         if p is None or not r["ending"] or r["confidence"] not in COUNTED:
             continue
-        group = "没把握" if r["last_hit"]["needs_review"] else r["last_hit"]["group"]
+        group = r["last_hit"]["group"] + ("?" if r["last_hit"]["needs_review"] else "")
         if r["ending"] == "winner":
             p["winners"] += 1
             p["winners_by_type"][group] = p["winners_by_type"].get(group, 0) + 1
@@ -357,7 +358,8 @@ def points_json(strokes: list[dict], rallies: list[dict], fps: float, video: str
             "最后一拍漏掉时，得分的一边通常还对，但制胜球或失误会记到错的人头上。",
             "主动失误 = 丢分的最后一拍，而且它接的那一拍不是杀球/推扑，来球间隔也不短于 forced_s 秒；否则算受迫失误。",
             "dead_ball 的不是回合：一两拍之后没人捡球，是把球打回给发球的人。这些拍不计入统计。",
-            "hits_unsure 是类型没把握的击球，不计入 strokes 的分类次数。",
+            "hits_unsure 是类型没把握的击球：不计入 strokes，按最可能的大类计入 strokes_guess（是猜的）。winners_by_type / errors_by_type 里带 ? 的大类也是猜的。",
+            "每个回合的第一拍按规则算发球（击球人离网不超过 5.3 米时；长短看接发球的人站在哪），其余拍不会被认成发球。"
         ],
         "rallies_total": len(real), "rallies_judged": sum(1 for r in real if r["confidence"] in COUNTED),
         "rallies_labelled": sum(1 for r in rallies if r["confidence"] == "manual"),
@@ -365,6 +367,10 @@ def points_json(strokes: list[dict], rallies: list[dict], fps: float, video: str
         "dead_ball_runs": len(rallies) - len(real),
         "sides": side_table(real), "players": player_table(strokes, rallies, names), "rallies": rallies,
     }
+
+
+def _kinds(counts: dict | None) -> str:
+    return "、".join(f"{k} {v}" for k, v in sorted((counts or {}).items(), key=lambda kv: -kv[1])) or "无"
 
 
 def summary_lines(doc: dict) -> list[str]:
@@ -376,9 +382,9 @@ def summary_lines(doc: dict) -> list[str]:
         lines.append(f"  {SIDE_ZH[side]}：得 {s['points']} 分（制胜球 {s['winners']}，对方失误 {s['opponent_errors']}，"
                      f"其中主动失误 {s['opponent_unforced_errors']}）")
     for p in doc["players"]:
-        kinds = "、".join(f"{k} {v}" for k, v in sorted(p["strokes"].items(), key=lambda kv: -kv[1])) or "无"
+        kinds, guess = _kinds(p.get("strokes")), _kinds(p.get("strokes_guess"))
         lines.append(f"  {p['name'] or '球员 ' + str(p['id'])}（{SIDE_ZH.get(p['side'], '?')}）：{p['hits']} 拍"
-                     f"（{p['hits_unsure']} 拍类型没把握），{kinds}；制胜球 {p['winners']}，"
+                     f"，有把握的：{kinds}；没把握的 {p['hits_unsure']} 拍猜是：{guess}；制胜球 {p['winners']}，"
                      f"失误 {p['errors']}（主动 {p['unforced_errors']}，受迫 {p['forced_errors']}）")
     return lines
 
@@ -407,14 +413,14 @@ def digest_text(d: dict) -> list[str]:
     lines = [f"【回合和得失分】按击球切出 {d['rallies_total']} 个回合，其中 {d['rallies_judged']} 个判出了谁赢"
              + (f"，{lab} 个是球友在结果页上自己标的谁赢" if lab else "")
              + "（程序的办法：死球后谁弯腰捡球、在哪捡；球在界内，它所在半场丢分；明显界外，它所在半场得分。没看到捡球的不判）。"
-             "没判出的回合不能当成平分，也不能据此说谁赢了这场。击球类型是模型认的，「没把握」的不计入分类次数。"]
+             "没判出的回合不能当成平分，也不能据此说谁赢了这场。击球类型是模型认的（每回合第一拍按规则算发球），「没把握」的单独列出、只是猜的大类，说的时候要和有把握的分开。"]
     for side, s in d["sides"].items():
         lines.append(f"- {SIDE_ZH[side]}：判出的回合里得 {s['points']} 分（自己打出制胜球 {s['winners']}，"
                      f"对方失误 {s['opponent_errors']}，其中主动失误 {s['opponent_unforced_errors']}）")
     for p in d["players"]:
-        kinds = "、".join(f"{k} {v}" for k, v in sorted(p["strokes"].items(), key=lambda kv: -kv[1])) or "无"
+        kinds, guess = _kinds(p.get("strokes")), _kinds(p.get("strokes_guess"))
         lines.append(f"- {p['name'] or str(p['id']) + ' 号'}（{SIDE_ZH.get(p['side'], '?')}）：{p['hits']} 拍，"
-                     f"其中 {p['hits_unsure']} 拍类型没把握；有把握的：{kinds}。制胜球 {p['winners']}，"
+                     f"有把握的：{kinds}；另有 {p['hits_unsure']} 拍类型没把握，按最可能的大类猜是：{guess}。制胜球 {p['winners']}，"
                      f"失误 {p['errors']}（主动 {p['unforced_errors']}，受迫 {p['forced_errors']}）")
     for r in d["rallies"]:
         if not r["winner_side"]:
@@ -424,7 +430,7 @@ def digest_text(d: dict) -> list[str]:
             {"unforced": "主动失误", "forced": "受迫失误"}[r["error"]["kind"]] + (f"（{r['error']['how']}）" if r["error"]["how"] else "")
         lines.append(f"- 回合 {r['n']}（{r['start_s']:.0f}–{r['end_s']:.0f} 秒，{r['hits']} 拍）：{SIDE_ZH[r['winner_side']]}得分"
                      + ("（人标的）" if r.get("by_person") else "") + "，"
-                     f"最后一拍 {last['player_id']} 号 {last['type']}{'（类型没把握）' if last['needs_review'] else ''}，{how}")
+                     f"最后一拍 {last['player_id']} 号 {last['type']}{'（类型没把握，是猜的）' if last['needs_review'] else ''}，{how}")
     return lines
 
 

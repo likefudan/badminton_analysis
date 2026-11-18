@@ -562,7 +562,7 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     return combined
 
 
-TECHNIQUE_VERSION = "1"  # raise when strokes / technique change, so recordings on this Mac are redone
+TECHNIQUE_VERSION = "2"  # raise when strokes / technique change, so recordings on this Mac are redone
 
 
 def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, progress: Progress, log: list[str],
