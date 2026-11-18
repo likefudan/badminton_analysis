@@ -252,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--sides", default="near", choices=["near", "far", "both"],
                    help="分析哪边的球员，默认 near（远端人太小，姿态不准）")
     s.add_argument("--include-review", action="store_true", help="类型没把握的击球也算")
-    s.add_argument("--reference", help="technique-ref 生成的参考分布（比如职业比赛）；给了就标出偏离参考的数")
+    s.add_argument("--reference", default="auto", help="参考分布：auto（默认，自带的职业近端参考，FineBadminton 14 场）、"
+                   "none（不比）或 technique-ref 生成的 JSON；偏离参考 10%%/90%% 的数写进提示")
     s.add_argument("-o", "--out-dir", help="输出目录，默认和视频同目录")
 
     s = sub.add_parser("technique-ref", help="把多个 technique.json 合成参考分布（每种球每个指标的百分位）")
@@ -1064,7 +1065,8 @@ def cmd_technique(a) -> int:
     for path, how in ((data_path, "badminton skeleton --stride 1"), (strokes_path, "badminton strokes")):
         if not path.exists():
             raise SystemExit(f"找不到 {path}：先运行 {how}")
-    reference = json.loads(Path(a.reference).read_text()) if a.reference else None
+    reference, ref_path = TQ.load_reference(a.reference)
+    print(f"参考分布：{ref_path}" if ref_path else "没有参考分布：只用几条草稿规则提示")
     sides = ("near", "far") if a.sides == "both" else (a.sides,)
     per_side = 1 if a.singles else _players_per_side(data_path)
     shuttle_path = Path(a.shuttle) if a.shuttle else video.with_suffix(".shuttle.csv")
@@ -1073,7 +1075,7 @@ def cmd_technique(a) -> int:
     results, fps = TQ.run(data_path, strokes_path, CourtCalibration.load(a.court), per_side, sides,
                           a.include_review, reference, shuttle_path)
     doc = TQ.technique_json(results, fps, str(video), {"skeleton": str(data_path), "strokes": str(strokes_path)},
-                            a.reference)
+                            ref_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{video.stem}.technique.json"
     out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
