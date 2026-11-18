@@ -103,6 +103,15 @@ METRIC_NAMES = {
 # high behind, where the forward swing is mostly depth and shows up small, while a phone at the side sees it
 # across the picture. They stay in the JSON.
 FLAG_METRICS = ("contact_height", "stance", "knee_deg", "trunk_lean", "disguise")
+# (group, metric) pairs never noted: 推扑 mixes pushes (below the shoulder) with net kills (above it), so
+# its contact height says more about which of the two it was than about the stroke being done well.
+UNNOTED = {("推扑", "contact_height")}
+
+
+def is_noted(group: str, metric: str) -> bool:
+    return metric in FLAG_METRICS and (group, metric) not in UNNOTED
+
+
 DEFAULT_REFERENCE = Path(__file__).with_name("technique_ref_pro_near.json")
 # metric -> True if larger is the "more" direction worth a flag text (for reference flags both ends are reported)
 NUMERIC = list(METRIC_NAMES)
@@ -445,12 +454,12 @@ def flags_for(group: str, m: dict, reference: dict | None) -> tuple[list[str], d
                 notes.append("转体很少：肩线几乎没转过来")
     ref = (reference or {}).get("groups", {}).get(group, {})
     for k, v in m.items():
-        if k in ref and isinstance(v, (int, float)) and not isinstance(v, bool):
+        if k in ref and isinstance(v, (int, float)) and not isinstance(v, bool) and (group, k) not in UNNOTED:
             p = percentile_of(v, ref[k])
             if p is None:
                 continue
             pct[k] = round(p)
-            if k in FLAG_METRICS and (p <= 10 or p >= 90):
+            if is_noted(group, k) and (p <= 10 or p >= 90):
                 where = "偏低" if p <= 10 else "偏高"
                 notes.append(f"{METRIC_NAMES.get(k, k)} {v} {where}（参考的第 {round(p)} 百分位，中位数 {ref[k]['p50']}）")
     return notes, pct
@@ -581,7 +590,7 @@ def reference_summary(reference: dict | None) -> dict:
     """p10 / p50 / p90 of the noted numbers only, per group: what the web page and the review show."""
     out: dict = {}
     for g, ms in ((reference or {}).get("groups") or {}).items():
-        keep = {k: {q: v[q] for q in ("p10", "p50", "p90", "n") if q in v} for k, v in ms.items() if k in FLAG_METRICS}
+        keep = {k: {q: v[q] for q in ("p10", "p50", "p90", "n") if q in v} for k, v in ms.items() if is_noted(g, k)}
         if keep:
             out[g] = keep
     return out
@@ -616,6 +625,8 @@ def digest(doc: dict, max_examples: int = 4) -> dict:
         g = p["groups"].setdefault(r["group"], {"n": 0, "values": {}, "outside": {}})
         g["n"] += 1
         for k in FLAG_METRICS:
+            if not is_noted(r["group"], k):
+                continue
             v = r["metrics"].get(k)
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 g["values"].setdefault(k, []).append(v)

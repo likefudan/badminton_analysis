@@ -286,3 +286,15 @@ def test_unreliable_metrics_get_percentiles_but_no_notes(tmp_path):
     p = tmp_path / "r.json"
     p.write_text('{"groups": {}}')
     assert TQ.load_reference(p)[0] == {"groups": {}}
+
+
+def test_push_kill_contact_height_is_never_noted():
+    q = {"p10": -0.6, "p25": -0.5, "p50": -0.3, "p75": -0.1, "p90": 0.0, "n": 50}
+    ref = {"groups": {"推扑": {"contact_height": q, "stance": q}}}
+    notes, pct = TQ.flags_for("推扑", {"contact_height": 0.9, "stance": 1.2}, ref)
+    assert "contact_height" not in pct and len(notes) == 1 and "击球点" not in notes[0]
+    assert list(TQ.reference_summary(ref)["推扑"]) == ["stance"]
+    doc = {"reference_summary": TQ.reference_summary(ref),
+           "strokes": [{"ok": True, "player_id": 2, "group": "推扑", "type": "推球", "time_s": 1.0,
+                        "metrics": {"contact_height": 0.9, "stance": 1.2}, "percentiles": pct, "notes": notes}]}
+    assert set(TQ.digest(doc)["players"][0]["groups"]["推扑"]["metrics"]) == {"stance"}
