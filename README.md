@@ -516,6 +516,9 @@ badminton strokes match.mp4 --court match.court.json --hits match.hits.json
 `badminton technique VIDEO --court VIDEO.court.json` 在击球类型的基础上，给近端球员每一拍量击球点高度、发力顺序、转体、起跳、随挥、步幅等，
 写成 `VIDEO.technique.json` 和 `.csv`；`badminton technique-ref` 把多段视频合成参考分布。详见 [docs/technique.md](docs/technique.md)。
 
+`badminton points VIDEO --court VIDEO.court.json` 按回合统计：每个回合谁赢、怎么结束（制胜球 / 主动失误 / 受迫失误），每人各类击球的次数。
+谁赢是按死球后谁在哪弯腰捡球推的，看不到捡球的回合不判，目前在手机录像上只能判出不到两成的回合。详见 [docs/points.md](docs/points.md)。
+
 ## 代码结构
 
 | 文件 | 内容 |

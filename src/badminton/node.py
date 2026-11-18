@@ -613,6 +613,26 @@ def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, prog
     return technique
 
 
+def rally_points(work: Path, court: Path, out_dir: Path, singles: bool, run=None) -> Path | None:
+    """Who won each rally and each player's strokes and errors (`badminton points`), from the strokes
+    the step before wrote. Quick, so it runs every time; a failure only leaves the file out."""
+    npz, csv = out_dir / f"{work.stem}.skeleton.npz", out_dir / f"{work.stem}.shuttle.csv"
+    strokes, points = out_dir / f"{work.stem}.strokes.json", out_dir / f"{work.stem}.points.json"
+    if not (npz.exists() and csv.exists() and strokes.exists()):
+        return None
+    args = ["points", str(work), "--court", str(court), "--data", str(npz), "--shuttle", str(csv),
+            "--strokes", str(strokes), "-o", str(out_dir)] + (["--singles"] if singles else [])
+    players = out_dir / f"{work.stem}.players.json"
+    if players.exists():
+        args += ["--players", str(players)]
+    mine: list[str] = []
+    points.unlink(missing_ok=True)  # never upload one made from older strokes
+    if (run or run_step)(args, mine, None, None) != 0 or not points.exists():
+        print("  回合得失分没有成功：" + (mine[-1] if mine else "没有输出"))
+        return None
+    return points
+
+
 def review_inputs(work: Path, court: Path, out_dir: Path, log: list[str], run=None) -> bool:
     """Write <stem>.review.request.json: the statistics as text plus the prompt. No model is called here;
     the web site asks the model with its own key once the file is uploaded."""
@@ -630,6 +650,9 @@ def review_inputs(work: Path, court: Path, out_dir: Path, log: list[str], run=No
     technique = out_dir / f"{work.stem}.technique.json"
     if technique.exists():
         args += ["--technique", str(technique)]
+    points = out_dir / f"{work.stem}.points.json"
+    if points.exists():
+        args += ["--points", str(points)]
     mine: list[str] = []  # its chatter (how to paste the prompt) is of no use in the job's error log
     if (run or run_step)(args, mine, None, None) != 0:
         print("  生成 AI 报告的统计摘要失败：" + (mine[-1] if mine else ""))
@@ -712,6 +735,7 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
             progress.skip(key, "这次没有运行")
     combined = track_shuttle(work, court, out_dir, progress, log)
     stroke_technique(work, court, out_dir, options.get("mode") != "doubles", progress, log)
+    rally_points(work, court, out_dir, options.get("mode") != "doubles")
     review_inputs(work, court, out_dir, log)
     files = sorted(p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in RESULT_SUFFIXES)
     if combined:  # the combined video is the skeleton video plus the shuttle: no need to send both

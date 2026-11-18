@@ -419,6 +419,28 @@ def test_review_inputs_use_what_the_analysis_produced(tmp_path):
     assert calls[0][-2:] == ["--technique", str(tmp_path / "v.technique.json")]
 
 
+def test_rally_points_runs_after_strokes_and_feeds_the_review(tmp_path):
+    calls = []
+
+    def run(args, log, on_line=None, on_frames=None):
+        calls.append(args)
+        if args[0] == "points":
+            (Path(args[args.index("-o") + 1]) / "v.points.json").write_text("{}")
+        return 0
+
+    work, court = tmp_path / "v.mp4", tmp_path / "v.court.json"
+    assert node.rally_points(work, court, tmp_path, True, run=run) is None and not calls  # no strokes yet
+    for name in ("v.skeleton.npz", "v.shuttle.csv", "v.strokes.json", "v.movement.json", "v.points.json"):
+        (tmp_path / name).write_text("{}")
+    assert node.rally_points(work, court, tmp_path, True, run=run) == tmp_path / "v.points.json"
+    assert calls[0][0] == "points" and "--singles" in calls[0] and "--players" not in calls[0]
+    assert node.review_inputs(work, court, tmp_path, [], run=run)
+    assert calls[1][-2:] == ["--points", str(tmp_path / "v.points.json")]
+    # a failure leaves no stale file behind
+    assert node.rally_points(work, court, tmp_path, False, run=lambda *a, **k: 1) is None
+    assert not (tmp_path / "v.points.json").exists()
+
+
 def technique_runner(fail=None, notes=2):
     calls = []
 
