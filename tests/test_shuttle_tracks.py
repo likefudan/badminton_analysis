@@ -129,3 +129,18 @@ def test_flight_never_near_our_players_hands_is_dropped():
     none = (np.full((n, 2, 2), np.nan), np.full((n, 2), np.nan))           # nobody seen: no judgement
     seen = np.array([r[1] for r in rows_from_peaks(peaks, size, calib, fps=fps, hands=none)])
     assert seen[3:len(ours) - 3].mean() > 0.9
+
+
+def test_short_pieces_after_a_teleport_are_dropped():
+    """A path that alternates between this court's shuttle and one 800 px away (IMG_1064): the short
+    pieces over there go, the long flight stays, and a jump after a real gap is not a teleport."""
+    from badminton.shuttle_tracks import TELEPORT_PIECE, drop_teleports
+
+    rows = [(f, 1, 100 + 5 * f, 300) for f in range(60)]
+    rows[20:24] = [(f, 1, 900, 300) for f in range(20, 24)]          # 4 frames on the next court
+    rows += [(f, 0, 0, 0) for f in range(60, 80)] + [(f, 1, 1500, 200) for f in range(80, 120)]
+    out = drop_teleports(rows, max_px=60)
+    seen = np.array([r[1] for r in out])
+    assert not seen[20:24].any()
+    assert seen[:20].all() and seen[24:60].all() and seen[80:].all()
+    assert TELEPORT_PIECE > 4
