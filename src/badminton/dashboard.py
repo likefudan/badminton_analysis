@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -66,6 +67,22 @@ def alive(pid) -> bool:
         return True
 
 
+_NODE_CMD = re.compile(r"badminton(\.cli)?\s+node(\s+(--\S+(\s+[^-]\S*)?))*\s*$")
+
+
+def find_node(run=subprocess.run) -> int | None:
+    """A node that runs without a state file: one started by hand from a version that did not write it yet."""
+    try:
+        out = run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if _NODE_CMD.search(cmd) and pid.isdigit() and int(pid) != os.getpid():
+            return int(pid)
+    return None
+
+
 def is_node(pid: int, run=subprocess.run) -> bool:
     """A pid from an old state file may belong to something else by now."""
     try:
@@ -91,6 +108,7 @@ class Dashboard:
         self.tasks = Cached(self._tasks, 10.0, [])
         self.system = Cached(lambda: node_status.system_info(self.work_dir()), 10.0, {})
         self.log = Cached(self._log, 1.0, {"lines": [], "file": ""})
+        self.stray = Cached(find_node, 3.0, None)
         self._node_pid: int | None = None
 
     # -- where things are --
@@ -121,6 +139,9 @@ class Dashboard:
         pid = svc.get("pid")
         if not pid and alive(local.get("pid")) and not local.get("stopped") and is_node(local["pid"]):
             pid = local["pid"]              # started by hand in a terminal, not by launchd
+        if not pid:
+            found = self.stray.get()
+            pid = found if isinstance(found, int) else None
         running = bool(pid)
         self._node_pid = pid if running else None
         out = {"running": running, "pid": pid, "managed": bool(svc.get("pid")), "installed": bool(svc.get("installed")),
@@ -189,6 +210,7 @@ class Dashboard:
             finally:
                 self.busy = ""
                 self.service.expire()
+                self.stray.expire()
                 self.cloud.expire()
 
         threading.Thread(target=work, daemon=True).start()

@@ -148,6 +148,7 @@ function renderJob() {
   const box = $("job"), n = S.node;
   box.textContent = "";
   if (!n.running) return box.append(el("p", "quiet", "处理程序没有在运行。"));
+  if (n.starting && !n.managed) return box.append(el("p", "quiet", "这个处理程序是旧版本手动启动的，不会把进度写给面板。它在做什么看右边的队列和下面的日志；重启一次之后这里就有进度了。"));
   if (n.starting) return box.append(el("p", "quiet", "刚启动，正在连接网站…"));
   const job = n.job;
   if (!job) return box.append(el("p", "quiet", "空闲，每 15 秒向网站问一次有没有新任务。"));

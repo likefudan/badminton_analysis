@@ -20,3 +20,4 @@ outputs/
 *.players.png
 *.movement.json
 *.movement.*.png
+.worktrees/

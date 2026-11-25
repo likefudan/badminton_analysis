@@ -42,6 +42,7 @@ def dash(tmp_path):
     d = dashboard.Dashboard(cfg_fn=lambda: None, work_dir=tmp_path, sampler=metrics.Sampler(), svc=FakeService(tmp_path))
     d.tasks = dashboard.Cached(lambda: [], 60, [])
     d.system = dashboard.Cached(lambda: {"diskFreeGb": 100.0}, 60, {})
+    d.stray = dashboard.Cached(lambda: None, 60, None)
     d.service = dashboard.Cached(lambda: d.svc.state("node"), 0, {})
     return d
 
@@ -134,3 +135,19 @@ def test_only_this_machine_and_only_the_page_may_command(dash):
         assert call("/api/control/nonsense", {"x-ba-dashboard": "1"}, b"{}")[0] == 400
     finally:
         server.shutdown()
+
+
+def test_a_node_started_by_hand_from_an_older_version_is_found_by_its_command(dash):
+    from types import SimpleNamespace
+
+    ps = "  501 /sbin/launchd\n99765 /Users/kel/codebase/badminton_analysis/.venv/bin/python /Users/kel/x/.venv/bin/badminton node\n" \
+         " 1677 /x/python -m badminton.cli shuttle /Users/kel/node/IMG_1191.mov\n 3319 /x/python -m badminton.cli dashboard --port 8787\n"
+    assert dashboard.find_node(lambda *a, **k: SimpleNamespace(stdout=ps)) == 99765
+    assert dashboard.find_node(lambda *a, **k: SimpleNamespace(stdout="77 python -m badminton.cli node --work-dir /tmp/w --once\n")) == 77
+    assert dashboard.find_node(lambda *a, **k: SimpleNamespace(stdout="78 python -m badminton.cli node install\n")) is None
+    dash.stray = dashboard.Cached(lambda: 99765, 60, None)
+    n = dash.state()["node"]
+    assert n["running"] and n["pid"] == 99765 and not n["managed"] and n["starting"]
+    dash.command("start", {})                     # must not start a second node next to it
+    wait(dash)
+    assert dash.svc.calls == []
