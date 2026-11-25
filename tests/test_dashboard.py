@@ -151,3 +151,56 @@ def test_a_node_started_by_hand_from_an_older_version_is_found_by_its_command(da
     dash.command("start", {})                     # must not start a second node next to it
     wait(dash)
     assert dash.svc.calls == []
+
+
+class FakeSite:
+    def __init__(self, commands=()):
+        self.commands = list(commands)
+        self.posts = []
+        self.down = False
+
+    def json(self, method, path, data=None, timeout=0):
+        if self.down:
+            raise ConnectionError("offline")
+        self.posts.append(data)
+        out, self.commands = self.commands, []
+        return {"commands": out}
+
+
+def test_commands_from_the_phone_are_the_pages_buttons_and_nothing_else(dash, tmp_path):
+    dash.svc.s.update(installed=True, loaded=True, pid=os.getpid())
+    site = FakeSite([{"id": 7, "action": "stop-after"}, {"id": 8, "action": "retry"}, {"id": 9, "action": "rm -rf"}])
+    remote = dashboard.Remote(dash, api=site, name="mac")
+    assert remote.sync() == 3
+    assert (tmp_path / "stop_after_job").exists()
+    state = site.posts[0]["state"]
+    assert site.posts[0]["node"] == "mac" and state["node"]["running"] and "history" in state["metrics"]
+    site.down = True                                   # the answer must survive a failed request
+    with pytest.raises(ConnectionError):
+        remote.sync()
+    site.down = False
+    remote.sync()
+    results = {r["id"]: r for r in site.posts[-1]["results"]}
+    assert results[7]["ok"] is True
+    assert results[8]["ok"] is False and results[9]["ok"] is False
+    assert site.posts[-1]["state"]["node"]["stopAfter"] is True
+    remote.sync()
+    assert site.posts[-1]["results"] == []
+
+
+def test_a_stopped_node_can_be_started_from_the_phone(dash):
+    site = FakeSite([{"id": 1, "action": "start"}])
+    remote = dashboard.Remote(dash, api=site, name="mac")
+    remote.sync()
+    wait(dash)
+    assert dash.svc.calls == [("install", ["node"])]
+    remote.sync()
+    assert site.posts[-1]["state"]["node"]["running"] is True
+
+
+def test_curves_are_thinned_for_the_phone_and_end_with_the_newest():
+    h = {"t": list(range(300)), "cpu": list(range(300))}
+    out = dashboard.thin(h, 60)
+    assert len(out["t"]) == 60 and out["t"][-1] == 299 and out["cpu"] == out["t"]
+    assert dashboard.thin({"t": [1, 2], "cpu": [5, 6]}) == {"t": [1, 2], "cpu": [5, 6]}
+    assert dashboard.thin({"t": [], "cpu": []}) == {"t": [], "cpu": []}

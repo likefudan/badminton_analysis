@@ -596,3 +596,44 @@ test("Mac 状态：节点上报，网页读到状态、排队和失败的作业"
   // 状态页的脚本能打开
   assert.equal((await fetch(`http://127.0.0.1:${PORT}/status.js`)).status, 200);
 });
+
+test("远程启停：网页下指令，Mac 上的面板服务上报状态时取走，回报结果；面板服务不在线时下不了指令", async () => {
+  const post = (path, body, headers = auth) => fetch(BASE + path, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
+  const nodeAuth = { authorization: "Bearer node-key" };
+  // 没见过的机器、面板服务没上报过的机器都送不到
+  assert.equal((await post("/node/commands", { node: "nobody", action: "stop" })).status, 404);
+  await post("/node/status", { node: "remote-mac", status: { name: "remote-mac", at: new Date().toISOString() } }, nodeAuth);
+  assert.equal((await post("/node/commands", { node: "remote-mac", action: "stop" })).status, 409);
+
+  const state = { node: { running: true, stage: "骨架识别 40%" }, metrics: { now: { cpu: 42, gpu: 80, anePowerW: 2.5 }, history: { t: [1, 2], cpu: [40, 42] } } };
+  let got = await (await post("/node/agent", { node: "remote-mac", state, results: [] }, nodeAuth)).json();
+  assert.deepEqual(got.commands, []);
+  assert.equal((await post("/node/commands", { node: "remote-mac", action: "rm -rf /" })).status, 400);
+  const made = await post("/node/commands", { node: "remote-mac", action: "stop-after" });
+  assert.equal(made.status, 201);
+  const id = (await made.json()).id;
+
+  let status = await (await call("/status")).json();
+  const mac = status.nodes.find((n) => n.name === "remote-mac");
+  assert.equal(mac.agent.node.stage, "骨架识别 40%");
+  assert.equal(mac.agent.metrics.now.anePowerW, 2.5);
+  assert.ok(mac.status, "处理程序自己的上报还在");
+  assert.equal(status.commands[0].status, "pending");
+
+  got = await (await post("/node/agent", { node: "remote-mac", state, results: [] }, nodeAuth)).json();
+  assert.deepEqual(got.commands, [{ id, action: "stop-after" }]);
+  got = await (await post("/node/agent", { node: "remote-mac", state, results: [] }, nodeAuth)).json();
+  assert.deepEqual(got.commands, [], "一条指令只交出去一次");
+  status = await (await call("/status")).json();
+  assert.equal(status.commands[0].status, "taken");
+  await post("/node/agent", { node: "remote-mac", state, results: [{ id, ok: true, message: "Mac 已收到，开始执行" }] }, nodeAuth);
+  status = await (await call("/status")).json();
+  assert.equal(status.commands[0].status, "done");
+  assert.equal(status.commands[0].message, "Mac 已收到，开始执行");
+  // 别的机器报的结果不算
+  const other = await (await post("/node/commands", { node: "remote-mac", action: "stop" })).json();
+  await post("/node/agent", { node: "other-mac", state, results: [{ id: other.id, ok: true, message: "x" }] }, nodeAuth);
+  status = await (await call("/status")).json();
+  assert.equal(status.commands[0].status, "pending");
+  assert.equal((await fetch(BASE + "/node/commands", { method: "POST", body: "{}" })).status, 401);
+});

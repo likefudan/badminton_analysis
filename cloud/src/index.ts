@@ -372,6 +372,75 @@ function cleanRegion(raw: unknown): { keep: number[][][]; drop: number[][][] } |
 }
 
 // 节点每次来问任务或汇报进度都记一笔，网页据此显示“Mac 在线 / 离线”。
+// ---------- 远程启停：网页下指令，Mac 上的面板服务来取 ----------
+
+const NODE_ACTIONS = ["start", "stop", "stop-after", "cancel-stop-after", "restart", "update"];
+const COMMAND_WAIT_MS = 90 * 1000;   // 这么久没人来取，就算 Mac 上的面板服务不在
+const AGENT_ONLINE_MS = 45 * 1000;
+
+type CommandRow = { id: number; node: string; action: string; status: string; message: string; created_at: string; updated_at: string };
+
+async function expireCommands(env: Env, now: Date): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE node_commands SET status = 'failed', message = 'Mac 上的面板服务没有来取这条指令', updated_at = ? WHERE user_id = ? AND status = 'pending' AND created_at < ?",
+  )
+    .bind(now.toISOString(), USER_ID, new Date(now.getTime() - COMMAND_WAIT_MS).toISOString())
+    .run();
+}
+
+// 面板服务每 10 秒来一次：交上状态和上一批指令的结果，带走新的指令
+async function agentSync(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const node = typeof body?.node === "string" && body.node ? body.node.slice(0, 80) : "node";
+  const now = new Date();
+  if (body?.state && typeof body.state === "object") {
+    const text = JSON.stringify(body.state);
+    if (text.length > 100_000) throw new HttpError(413, "状态太大");
+    await env.DB.prepare(
+      `INSERT INTO nodes (user_id, name, seen_at, agent, agent_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, name) DO UPDATE SET agent = excluded.agent, agent_at = excluded.agent_at`,
+    )
+      .bind(USER_ID, node, now.toISOString(), text, now.toISOString())
+      .run();
+  }
+  for (const r of Array.isArray(body?.results) ? (body.results as Record<string, unknown>[]).slice(0, 20) : []) {
+    if (!Number.isInteger(r?.id)) continue;
+    await env.DB.prepare("UPDATE node_commands SET status = ?, message = ?, updated_at = ? WHERE id = ? AND user_id = ? AND node = ? AND status = 'taken'")
+      .bind(r.ok ? "done" : "failed", typeof r.message === "string" ? r.message.slice(0, 500) : "", now.toISOString(), r.id, USER_ID, node)
+      .run();
+  }
+  await expireCommands(env, now);
+  const taken = await env.DB.prepare(
+    "UPDATE node_commands SET status = 'taken', updated_at = ? WHERE user_id = ? AND node = ? AND status = 'pending' RETURNING id, action",
+  )
+    .bind(now.toISOString(), USER_ID, node)
+    .all<{ id: number; action: string }>();
+  return json({ commands: taken.results.sort((a, b) => a.id - b.id) });
+}
+
+async function createCommand(req: Request, env: Env, who: Who): Promise<Response> {
+  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const node = typeof body?.node === "string" ? body.node.slice(0, 80) : "";
+  const action = typeof body?.action === "string" ? body.action : "";
+  if (!NODE_ACTIONS.includes(action)) throw new HttpError(400, "不认识的指令");
+  const now = new Date();
+  const row = await env.DB.prepare("SELECT agent_at FROM nodes WHERE user_id = ? AND name = ?").bind(USER_ID, node).first<{ agent_at: string | null }>();
+  if (!row) throw new HttpError(404, "没有这台 Mac");
+  if (!row.agent_at || now.getTime() - new Date(row.agent_at).getTime() > AGENT_ONLINE_MS)
+    throw new HttpError(409, "Mac 上的面板服务不在线（关机、睡眠或断网），指令送不到");
+  await expireCommands(env, now);
+  const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM node_commands WHERE user_id = ? AND node = ? AND status = 'pending'")
+    .bind(USER_ID, node)
+    .first<{ n: number }>();
+  if ((waiting?.n ?? 0) >= 3) throw new HttpError(429, "前面的指令还没被取走，稍等几秒");
+  const made = await env.DB.prepare(
+    "INSERT INTO node_commands (user_id, node, action, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+  )
+    .bind(USER_ID, node, action, who.email || who.via, now.toISOString(), now.toISOString())
+    .first<{ id: number }>();
+  return json({ id: made?.id, action, status: "pending" }, 201);
+}
+
 async function nodeSeen(env: Env, name: string, now: Date): Promise<void> {
   await env.DB.prepare(
     "INSERT INTO nodes (user_id, name, seen_at) VALUES (?, ?, ?) ON CONFLICT (user_id, name) DO UPDATE SET seen_at = excluded.seen_at",
@@ -1337,9 +1406,17 @@ async function putNodeStatus(req: Request, env: Env): Promise<Response> {
 
 // 「Mac 状态」页要的全部内容：节点上报的状态，加上云端自己知道的作业（正在做的、排队的、最近失败的）。
 async function macStatus(env: Env): Promise<Response> {
-  const nodes = await env.DB.prepare("SELECT name, seen_at, status, status_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 5")
+  // 面板服务在处理程序停着的时候也上报，所以按两者里较新的那个时间排
+  const nodes = await env.DB.prepare(
+    "SELECT name, seen_at, status, status_at, agent, agent_at FROM nodes WHERE user_id = ? ORDER BY MAX(seen_at, COALESCE(agent_at, '')) DESC LIMIT 5",
+  )
     .bind(USER_ID)
-    .all<{ name: string; seen_at: string; status: string; status_at: string | null }>();
+    .all<{ name: string; seen_at: string; status: string; status_at: string | null; agent: string; agent_at: string | null }>();
+  const commands = await env.DB.prepare(
+    "SELECT id, node, action, status, message, created_at, updated_at FROM node_commands WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+  )
+    .bind(USER_ID)
+    .all<CommandRow>();
   const rows = await env.DB.prepare(
     `SELECT * FROM videos WHERE user_id = ? AND status = 'uploaded' AND (
        job_status IN ('queued', 'processing', 'failed') OR annot_status IN ('queued', 'preparing', 'failed')
@@ -1382,8 +1459,13 @@ async function macStatus(env: Env): Promise<Response> {
       try {
         status = n.status ? JSON.parse(n.status) : null;
       } catch {}
-      return { name: n.name, seenAt: n.seen_at, statusAt: n.status_at, status };
+      let agent: unknown = null;
+      try {
+        agent = n.agent ? JSON.parse(n.agent) : null;
+      } catch {}
+      return { name: n.name, seenAt: n.seen_at, statusAt: n.status_at, status, agentAt: n.agent_at, agent };
     }),
+    commands: commands.results.map((c) => ({ id: c.id, node: c.node, action: c.action, status: c.status, message: c.message, createdAt: c.created_at, updatedAt: c.updated_at })),
     active,
     queued,
     failed: failed.slice(0, 10),
@@ -1451,6 +1533,8 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (path === "/node/claim" && m === "POST") return claimJob(req, env);
   if (path === "/node/status" && m === "POST") return putNodeStatus(req, env);
   if (path === "/status" && m === "GET") return macStatus(env);
+  if (path === "/node/agent" && m === "POST") return agentSync(req, env);
+  if (path === "/node/commands" && m === "POST") return createCommand(req, env, who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job$/);
   if (match && m === "POST") return updateJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job\/retry$/);
