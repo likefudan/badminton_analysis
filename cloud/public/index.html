@@ -98,9 +98,10 @@
   .tech p.small { font-size: 12px; }
   .points ul.rallies li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; }
   .points .by { color: var(--quiet); font-size: 12px; }
-  .points .pick { display: flex; gap: 6px; width: 100%; margin-top: 4px; }
-  .points .pick button { flex: 1; width: auto; padding: 5px 0; font-size: 13px; }
-  .points .pick button.on { border-color: var(--accent); font-weight: 600; }
+  /* 不能叫 .pick：那是整块蓝底的大按钮样式，套在这一行上会把三个按钮的字盖成蓝底蓝字 */
+  .points .winpick { display: flex; gap: 6px; width: 100%; margin-top: 4px; }
+  .points .winpick button { flex: 1; width: auto; padding: 6px 0; font-size: 14px; border-radius: 8px; }
+  .points .winpick button.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   th, td { text-align: right; padding: 5px 4px; border-top: 1px solid var(--line); }
   th { color: var(--quiet); font-weight: 400; border-top: 0; }
   th:first-child, td:first-child { text-align: left; }

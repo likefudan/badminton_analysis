@@ -1472,7 +1472,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
     if (r.label) li.append(el("span", "by", " · 你标的"));
     else if (r.confidence === "high") li.append(el("span", "by", " · 程序看到捡球"));
     if (onLabel) {
-      const pick = el("span", "pick");
+      const pick = el("span", "winpick");
       const now = r.label ? r.label.winner : null;
       for (const [w, t] of [["near", "近端赢"], ["far", "远端赢"], ["none", "不算"]]) {
         const btn = el("button", "plain" + (now === w ? " on" : ""), t);
