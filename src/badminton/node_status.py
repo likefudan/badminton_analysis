@@ -79,6 +79,42 @@ class Tee:
         return getattr(self.stream, name)
 
 
+# ---------- the state file the local dashboard reads ----------
+
+STATE_FILE = "node_state.json"
+_LOCAL: dict = {"path": None, "data": {}}
+
+
+def local_start(work_dir: Path, **base) -> None:
+    """From now on local_update() writes work_dir/node_state.json; ``base`` are the fields that do not change."""
+    with _LOCK:
+        _LOCAL["path"] = Path(work_dir) / STATE_FILE
+        _LOCAL["data"] = {"pid": os.getpid(), **base}
+    local_update()
+
+
+def local_update(**fields) -> None:
+    """Merge the fields into the state file. Does nothing before local_start (tests, a single pass)."""
+    with _LOCK:
+        path = _LOCAL["path"]
+        if path is None:
+            return
+        _LOCAL["data"].update(fields, at=_iso(time.time()))
+        text = json.dumps(_LOCAL["data"], ensure_ascii=False)
+        try:  # written whole, then moved: a reader never sees half a file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def local_stop() -> None:
+    with _LOCK:
+        _LOCAL["path"] = None
+
+
 # ---------- reading a log ----------
 
 def screen_lines(text: str) -> list[str]:
@@ -207,6 +243,7 @@ def open_files(pids: list[int], run=subprocess.run) -> dict[int, dict]:
 
 _PYTHON = re.compile(r"(?i)^(\S*/)?python[\d.]*(\s|$)")   # the program itself, not a shell whose command line mentions one
 _WORKER = re.compile(r"multiprocessing\.(spawn|resource_tracker|forkserver)|joblib|loky")
+_OURS = re.compile(r"badminton(\.cli)?\s+(node|dashboard)\b")   # the node and the dashboard are not background tasks
 
 
 def short_command(command: str) -> str:
@@ -235,7 +272,8 @@ def find_tasks(watch: list[Path], own_pid: int, processes: list[dict] | None = N
         return False
 
     wanted = [p for p in processes
-              if _PYTHON.search(p["command"]) and not _WORKER.search(p["command"]) and p["age"] >= MIN_AGE
+              if _PYTHON.search(p["command"]) and not _WORKER.search(p["command"]) and not _OURS.search(p["command"])
+              and p["age"] >= MIN_AGE
               and p["pid"] != own_pid and not descends(p["pid"], own_pid)]
     info = (files or open_files)([p["pid"] for p in wanted])
     roots = [str(w) for w in watch]
@@ -281,6 +319,14 @@ def system_info(work_dir: Path, run=subprocess.run) -> dict:
                 + pages.get("Pages occupied by compressor", 0)) * page
         out["memTotalGb"] = round(total / 2**30, 1)
         out["memUsedGb"] = round(used / 2**30, 1)
+    except Exception:
+        pass
+    try:  # CPU / GPU utilisation and the neural engine's power, where they can be read
+        from . import metrics
+
+        usage = metrics.sample_once(run)
+        if usage:
+            out["usage"] = usage
     except Exception:
         pass
     return out
@@ -329,6 +375,7 @@ class Reporter:
         self.job = None if task is None else {
             "task": task, "videoId": (video or {}).get("id", ""),
             "name": (video or {}).get("title") or (video or {}).get("filename", ""), "since": _iso(self.clock())}
+        local_update(job=self.job, stage="", progress=None)
 
     def tasks(self) -> list[dict]:
         now = self.clock()
@@ -391,6 +438,9 @@ class Reporter:
             self.last_error = str(e)
 
     def start(self, interval: float = INTERVAL) -> None:
+        local_start(self.work_dir, name=self.name, startedAt=_iso(self.started), version=self.version, job=self.job,
+                    stage="", progress=None, stopped=False)
+
         def loop() -> None:
             while True:
                 self.report()

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>处理节点面板</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --ink: #16181d; --quiet: #6a7180; --line: #e3e6eb;
+    --ok: #18794e; --bad: #c62828; --warn: #9a6700; --accent: #2563eb; --track: #e8ebf0;
+    --cpu: #2563eb; --gpu: #c2410c; --npu: #7c3aed; --mem: #0f766e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216; --card: #1a1d23; --ink: #e8eaee; --quiet: #9aa2b1; --line: #2a2e37;
+      --ok: #4cc38a; --bad: #ff6b6b; --warn: #e2b93b; --accent: #6ea0ff; --track: #2a2e37;
+      --cpu: #6ea0ff; --gpu: #ff9a62; --npu: #b99aff; --mem: #4fd1c5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "PingFang SC", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; grid-column: span 12; min-width: 0; }
+  @media (min-width: 900px) { .half { grid-column: span 6; } }
+  h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--quiet); }
+  .quiet { color: var(--quiet); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .num { font-variant-numeric: tabular-nums; }
+  #head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+  #state { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--quiet); flex: none; }
+  .dot.on { background: var(--ok); } .dot.off { background: var(--bad); } .dot.wait { background: var(--warn); }
+  #meta { flex: 1; min-width: 200px; }
+  #buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button.main { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  #msg:empty { display: none; } #msg { grid-column: span 12; padding: 8px 14px; }
+  .bar { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: var(--accent); border-radius: 4px; transition: width .6s; }
+  ol.steps { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 3px; }
+  ol.steps li { display: grid; grid-template-columns: 18px 1fr auto; gap: 6px; }
+  ol.steps li.pending { color: var(--quiet); } ol.steps li.running { font-weight: 600; }
+  ul.jobs { list-style: none; margin: 0; padding: 0; }
+  ul.jobs li { padding: 6px 0; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: baseline; }
+  ul.jobs li:first-child { border-top: 0; } ul.jobs li > div { flex: 1; min-width: 0; }
+  ul.jobs a { color: inherit; font-weight: 600; text-decoration: none; } ul.jobs a:hover { text-decoration: underline; }
+  .gauges { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .gauge .v { font-size: 26px; font-weight: 600; } .gauge .u { font-size: 13px; color: var(--quiet); margin-left: 3px; }
+  .gauge svg { width: 100%; height: 54px; display: block; margin-top: 4px; }
+  .gauge .name { font-weight: 600; } .gauge .name i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+  pre { margin: 6px 0 0; padding: 10px; background: var(--bg); border-radius: 7px; max-height: 320px; overflow: auto; font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .task { padding: 8px 0; border-top: 1px solid var(--line); } .task:first-of-type { border-top: 0; }
+  .cmd { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
+  details summary { cursor: pointer; color: var(--quiet); }
+</style>
+</head>
+<body>
+<main>
+  <section id="head">
+    <div id="state"><span class="dot" id="dot"></span><span id="stateText">读取中</span></div>
+    <div id="meta" class="quiet"></div>
+    <div id="buttons"></div>
+  </section>
+  <section id="msg" class="bad"></section>
+  <section class="half"><h2>正在做</h2><div id="job"></div></section>
+  <section class="half"><h2 id="queueTitle">任务队列</h2><div id="queue"></div></section>
+  <section><h2 id="resTitle">资源</h2><div class="gauges" id="gauges"></div><p class="quiet" id="resNote" style="margin:10px 0 0"></p></section>
+  <section class="half"><h2 id="tasksTitle">后台任务</h2><div id="tasks"></div></section>
+  <section class="half"><h2 id="logTitle">处理程序的日志</h2><pre id="log"></pre></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KIND = { process: "分析录像", annotate: "准备球位置标注", strokes: "准备击球类型标注", labels: "同步球位置标注", "stroke-labels": "同步击球类型标注", "rally-labels": "同步回合胜负" };
+let S = null, failures = 0, skew = 0, notice = "", noticeUntil = 0;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function dur(s) {
+  if (s == null || isNaN(s)) return "—";
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + " 秒";
+  if (s < 3600) return Math.floor(s / 60) + " 分 " + (s % 60) + " 秒";
+  return Math.floor(s / 3600) + " 小时 " + Math.floor((s % 3600) / 60) + " 分";
+}
+const ago = (iso) => (iso ? (Date.now() + skew - new Date(iso)) / 1000 : NaN);
+const clock = (iso) => new Date(iso).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+async function send(action, body, confirmText) {
+  if (confirmText && !window.confirm(confirmText)) return;
+  try {
+    const r = await fetch("/api/control/" + action, { method: "POST", headers: { "content-type": "application/json", "x-ba-dashboard": "1" }, body: JSON.stringify(body || {}) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+  } catch (e) {
+    notice = "没成功：" + e.message;
+    noticeUntil = Date.now() + 15000;
+  }
+  refresh();
+}
+
+function button(label, cls, onclick, disabled) {
+  const b = el("button", cls, label);
+  b.disabled = Boolean(disabled);
+  b.onclick = onclick;
+  return b;
+}
+
+function renderHead() {
+  const n = S.node, busy = S.busy;
+  const dot = $("dot");
+  let text;
+  if (busy) { dot.className = "dot wait"; text = "正在" + busy + "…"; }
+  else if (n.running && n.stopAfter) { dot.className = "dot wait"; text = "运行中，做完手上这个就停"; }
+  else if (n.running) { dot.className = "dot on"; text = n.job ? "运行中" : "运行中，空闲"; }
+  else if (n.loaded && n.lastExit) { dot.className = "dot off"; text = "出错退出了，系统会自动重启它"; }
+  else { dot.className = "dot off"; text = "已停止"; }
+  $("stateText").textContent = text;
+  const meta = [];
+  if (n.running) {
+    if (n.startedAt) meta.push("已运行 " + dur(ago(n.startedAt)));
+    if (n.version) meta.push("代码 " + n.version);
+    meta.push(n.managed ? "由系统服务管理，登录后自动启动" : "手动启动的（进程 " + n.pid + "），不会自动重启");
+  } else {
+    meta.push(n.installed ? "登录后会自动启动" : "还没有安装成系统服务，点「启动」会自动安装");
+  }
+  $("meta").textContent = meta.join(" · ");
+  const b = $("buttons");
+  b.textContent = "";
+  const lock = Boolean(busy);
+  if (!n.running) {
+    b.append(button("启动", "main", () => send("start"), lock));
+  } else {
+    if (n.stopAfter) b.append(button("取消「做完再停」", "", () => send("cancel-stop-after"), lock));
+    else b.append(button("做完这个再停", "", () => send("stop-after"), lock));
+    b.append(button("立即停", "danger", () => send("stop", null, n.job ? "立即停止？正在做的这个会退回队列，下次启动从头重做。" : ""), lock));
+    b.append(button("重启", "", () => send("restart", null, n.job ? "重启会打断正在做的这个，它会退回队列从头重做。继续？" : ""), lock));
+  }
+  b.append(button("更新代码并重启", "", () => send("update", null, "从 GitHub 拉取最新代码（git pull），然后重启处理程序。" + (n.job ? "正在做的这个会退回队列从头重做。" : "") + "继续？"), lock));
+}
+
+function renderJob() {
+  const box = $("job"), n = S.node;
+  box.textContent = "";
+  if (!n.running) return box.append(el("p", "quiet", "处理程序没有在运行。"));
+  if (n.starting) return box.append(el("p", "quiet", "刚启动，正在连接网站…"));
+  const job = n.job;
+  if (!job) return box.append(el("p", "quiet", "空闲，每 15 秒向网站问一次有没有新任务。"));
+  const p = n.progress, steps = (p && p.steps) || [];
+  const title = el("div");
+  title.append(el("strong", "", job.name || job.videoId), el("span", "quiet", " · " + (KIND[job.task] || job.task)));
+  box.append(title);
+  const line = [];
+  if (n.stage) line.push(n.stage);
+  line.push("已用 " + dur(p ? p.elapsedSeconds + Math.max(0, ago(n.at)) : ago(job.since)));
+  if (p && p.etaSeconds != null) line.push("预计还要 " + dur(Math.max(0, p.etaSeconds - ago(n.at))));
+  box.append(el("div", "num", line.join(" · ")));
+  if (steps.length) {
+    const total = steps.filter((s) => s.status !== "skipped");
+    const done = total.reduce((a, s) => a + (s.status === "done" ? 1 : s.status === "running" ? (s.percent || 0) / 100 : 0), 0);
+    const bar = el("div", "bar"), fill = el("div");
+    fill.style.width = (total.length ? (done * 100) / total.length : 0) + "%";
+    bar.append(fill);
+    box.append(bar);
+    const ol = el("ol", "steps");
+    for (const s of steps) {
+      const li = el("li", s.status);
+      const mark = { done: "✓", running: "▸", failed: "✕", skipped: "–", pending: "·" }[s.status] || "";
+      let right = "";
+      if (s.status === "running") right = (s.percent != null ? s.percent + "% · " : "") + dur(s.seconds) + (s.etaSeconds != null ? "，还要约 " + dur(s.etaSeconds) : "");
+      else if (s.status === "done") right = dur(s.seconds);
+      else if (s.status === "pending" && s.estimateSeconds != null) right = "约 " + dur(s.estimateSeconds);
+      else if (s.status === "skipped") right = "跳过";
+      const mid = el("span", "", s.label);
+      if (s.detail && s.status !== "pending") mid.append(el("span", "quiet", "  " + s.detail));
+      li.append(el("span", s.status === "failed" ? "bad" : "", mark), mid, el("span", "num quiet", right));
+      ol.append(li);
+    }
+    box.append(ol);
+  }
+}
+
+function jobRow(c, j, note, cls) {
+  const li = el("li"), d = el("div");
+  const a = el("a", "", j.name);
+  a.href = c.url + "/#/v/" + j.videoId;
+  a.target = "_blank";
+  d.append(a, el("span", "quiet", " · " + (KIND[j.kind] || j.kind)), el("div", cls || "quiet", note));
+  li.append(d);
+  return li;
+}
+
+function renderQueue() {
+  const box = $("queue"), c = S.cloud || {};
+  box.textContent = "";
+  if (c.error) return box.append(el("p", "bad", "读不到网站上的队列：" + c.error));
+  if (!c.queued) return box.append(el("p", "quiet", "读取中"));
+  $("queueTitle").textContent = `任务队列（排队 ${c.queued.length} 个` + (c.failed.length ? `，失败 ${c.failed.length} 个）` : "）");
+  const ul = el("ul", "jobs");
+  for (const j of c.active) ul.append(jobRow(c, j, j.stale ? "处理程序领了之后失联了，启动后会重新做" : "正在做：" + (j.stage || "已领取")));
+  c.queued.forEach((j, i) => ul.append(jobRow(c, j, "排队中，第 " + (i + 1) + " 个")));
+  for (const j of c.failed) {
+    const li = jobRow(c, j, "失败" + (j.updatedAt ? "，" + clock(j.updatedAt) : "") + "，停在：" + (j.stage || "—") + (j.error ? "。" + j.error.split("\n")[0].slice(0, 120) : ""), "bad");
+    if (j.kind === "process") li.append(button("重试", "", () => send("retry", { videoId: j.videoId }, "重新排队分析「" + j.name + "」？")));
+    ul.append(li);
+  }
+  if (!ul.children.length) box.append(el("p", "quiet", "没有正在做、排队或失败的任务。"));
+  else box.append(ul);
+}
+
+function spark(values, max, color) {
+  const W = 300, H = 54, NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  const base = document.createElementNS(NS, "line");
+  base.setAttribute("x1", 0); base.setAttribute("x2", W); base.setAttribute("y1", H - 0.5); base.setAttribute("y2", H - 0.5);
+  base.setAttribute("stroke", "var(--line)");
+  svg.append(base);
+  const n = S.metrics.history.t.length, slots = Math.max(n, 300), pts = [];
+  values.forEach((v, i) => {
+    if (v == null) return;
+    pts.push(((slots - n + i) * W / (slots - 1)).toFixed(1) + "," + (H - 2 - Math.min(1, v / max) * (H - 6)).toFixed(1));
+  });
+  if (pts.length > 1) {
+    const area = document.createElementNS(NS, "polygon");
+    area.setAttribute("points", pts[0].split(",")[0] + "," + H + " " + pts.join(" ") + " " + pts[pts.length - 1].split(",")[0] + "," + H);
+    area.setAttribute("fill", color); area.setAttribute("opacity", "0.12");
+    const line = document.createElementNS(NS, "polyline");
+    line.setAttribute("points", pts.join(" "));
+    line.setAttribute("fill", "none"); line.setAttribute("stroke", color); line.setAttribute("stroke-width", "1.6");
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.append(area, line);
+  }
+  return svg;
+}
+
+function gauge(name, color, value, unit, sub, values, max) {
+  const g = el("div", "gauge");
+  const head = el("div", "name");
+  const sw = el("i"); sw.style.background = color;
+  head.append(sw, name);
+  const v = el("div", "num");
+  v.append(el("span", "v", value == null ? "—" : String(value)), el("span", "u", value == null ? "" : unit));
+  g.append(head, v, el("div", "quiet num", sub || " "), spark(values || [], max, color));
+  return g;
+}
+
+function renderMetrics() {
+  const m = S.metrics, now = m.now || {}, h = m.history, sys = S.system || {};
+  const box = $("gauges");
+  box.textContent = "";
+  const peak = (a, floor) => Math.max(floor, ...a.filter((v) => v != null));
+  const cpuSub = now.pcpu != null ? `性能核 ${now.pcpu}% · 能效核 ${now.ecpu}%` + (now.cpuTemp ? ` · ${now.cpuTemp}°C` : "") : sys.load ? `负载 ${sys.load[0]}（${sys.cpus} 核）` : "";
+  box.append(gauge("CPU", "var(--cpu)", now.cpu == null ? null : Math.round(now.cpu), "%", cpuSub, h.cpu, 100));
+  box.append(gauge("GPU", "var(--gpu)", now.gpu == null ? null : Math.round(now.gpu), "%", now.gpuPowerW != null ? `功耗 ${now.gpuPowerW.toFixed(1)} W` + (now.gpuTemp ? ` · ${now.gpuTemp}°C` : "") : "", h.gpu, 100));
+  const aneMax = peak(h.anePowerW, 2);
+  box.append(gauge("NPU（神经引擎）", "var(--npu)", now.anePowerW != null ? now.anePowerW.toFixed(2) : null, "W", now.anePowerW != null ? "系统只公开功耗，没有利用率" : "需要 macmon", h.anePowerW, aneMax));
+  const memTotal = now.memTotalGb || sys.memTotalGb, memUsed = now.memUsedGb != null ? now.memUsedGb : sys.memUsedGb;
+  box.append(gauge("内存", "var(--mem)", memUsed == null ? null : memUsed.toFixed(1), "GB", memTotal ? `共 ${memTotal} GB` : "", h.memUsedGb, memTotal || peak(h.memUsedGb, 8)));
+  const notes = [];
+  if (now.allPowerW != null) notes.push(`整机功耗 ${now.allPowerW.toFixed(1)} W`);
+  if (sys.diskTotalGb) notes.push(`磁盘剩余 ${sys.diskFreeGb} GB`);
+  notes.push("曲线是最近 10 分钟");
+  if (m.source) notes.push("数据来自 " + m.source);
+  const note = $("resNote");
+  note.textContent = notes.join(" · ");
+  note.className = sys.diskFreeGb != null && sys.diskFreeGb < 20 ? "bad" : "quiet";
+  if (m.note) note.append(el("div", "warn", m.note));
+}
+
+const openLogs = new Set();
+function renderTasks() {
+  const box = $("tasks"), tasks = Array.isArray(S.tasks) ? S.tasks : [];
+  $("tasksTitle").textContent = `后台任务（${tasks.length} 个在跑）`;
+  box.textContent = "";
+  if (S.tasks && S.tasks.error) return box.append(el("p", "bad", "读取失败：" + S.tasks.error));
+  if (!tasks.length) return box.append(el("p", "quiet", `没有训练或其它后台任务。自动发现在 ${S.repo} 下运行的 Python 程序。`));
+  for (const t of tasks) {
+    const d = el("div", "task");
+    d.append(el("div", "cmd", t.command));
+    const p = t.progress;
+    d.append(el("div", "num", (p && p.label ? p.label + " · " : "") + "已经跑了 " + dur(t.ageSeconds) + (p && p.etaSeconds != null ? " · 这一段还要约 " + dur(p.etaSeconds) : "")));
+    if (p && p.percent != null) { const bar = el("div", "bar"), f = el("div"); f.style.width = p.percent + "%"; bar.append(f); d.append(bar); }
+    d.append(el("div", "quiet num", `CPU ${t.cpu}% · 内存 ${t.rssMb >= 1024 ? (t.rssMb / 1024).toFixed(1) + " GB" : t.rssMb + " MB"} · 进程号 ${t.pid}`));
+    if (t.log && t.log.length) {
+      const det = el("details");
+      det.open = openLogs.has(t.pid);
+      det.ontoggle = () => (det.open ? openLogs.add(t.pid) : openLogs.delete(t.pid));
+      det.append(el("summary", "", "最近的输出 " + t.logFile), el("pre", "", t.log.join("\n")));
+      d.append(det);
+    }
+    box.append(d);
+  }
+}
+
+function renderLog() {
+  const pre = $("log"), log = S.log || {};
+  $("logTitle").textContent = "处理程序的日志" + (log.file ? "（" + log.file + "）" : "");
+  const text = (log.lines || []).join("\n") || "还没有输出。";
+  if (pre.textContent === text) return;
+  const pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;  // 在看前面的内容时不抢滚动位置
+  pre.textContent = text;
+  if (pinned) pre.scrollTop = pre.scrollHeight;
+}
+
+function render() {
+  $("msg").textContent = S.error || (Date.now() < noticeUntil ? notice : "");
+  renderHead(); renderJob(); renderQueue(); renderMetrics(); renderTasks(); renderLog();
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    S = await r.json();
+    skew = new Date(S.now) - Date.now();
+    failures = 0;
+    render();
+  } catch (e) {
+    if (++failures >= 3) {
+      $("dot").className = "dot off";
+      $("stateText").textContent = "面板服务没有响应";
+      $("msg").textContent = "连不上面板服务（badminton dashboard）。它可能正在重启，会自动重试。";
+    }
+  }
+}
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

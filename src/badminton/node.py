@@ -45,6 +45,10 @@ class ApiError(RuntimeError):
         self.status = status
 
 
+class StopNow(BaseException):
+    """The node was told to stop at once (SIGTERM). Not an Exception: a job must not report it as its own failure."""
+
+
 class StepFailed(RuntimeError):
     """An analysis step failed; the message is shown to the user on the web page."""
 
@@ -386,6 +390,18 @@ def run_step(args: list[str], log: list[str], on_line=None, on_frames=None) -> i
     cmd = [sys.executable, "-m", "badminton.cli", *args]
     print("  $ badminton " + " ".join(args))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    try:
+        return _follow(proc, log, on_line, on_frames)
+    finally:
+        if proc.poll() is None:  # the node is stopping in the middle of a step: the step must not outlive it
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def _follow(proc: subprocess.Popen, log: list[str], on_line, on_frames) -> int:
     buf = b""
     while True:
         block = proc.stdout.read1(4096)
@@ -829,6 +845,7 @@ def prepare_annotation(api: Api, cfg: Config, video: dict, pack_fn=None) -> None
     stage = {"text": "开始"}
 
     def send(status: str, **extra) -> None:
+        node_status.local_update(stage=stage["text"])
         api.json("POST", f"/videos/{vid}/annot/job", {"status": status, "stage": stage["text"], **extra})
 
     def heartbeat() -> None:
@@ -935,6 +952,7 @@ def prepare_strokes(api: Api, cfg: Config, video: dict, strokes_fn=None) -> None
     stage = {"text": "开始"}
 
     def send(status: str, **extra) -> None:
+        node_status.local_update(stage=stage["text"])
         api.json("POST", f"/videos/{vid}/strokes/job", {"status": status, "stage": stage["text"], **extra})
 
     def heartbeat() -> None:
@@ -1079,6 +1097,7 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
     stop = threading.Event()
 
     def send(stage: str, data: dict) -> None:
+        node_status.local_update(stage=stage, progress=data)  # the dashboard on this Mac reads it from a file
         try:
             api.json("POST", f"/videos/{vid}/job", {"status": "processing", "stage": stage, "progress": data})
         except Exception as e:  # a missed progress report is not worth failing the job for
@@ -1183,20 +1202,68 @@ def run(cfg: Config, once: bool = False, interval: float = 15.0, analyse_fn=anal
     plain_stdout = sys.stdout
     sys.stdout = node_status.Tee(plain_stdout)  # the status page shows the last lines the node printed
     print(f"处理节点 {cfg.name} 已连接 {cfg.url}，原片和结果放在 {cfg.work_dir}。Ctrl+C 退出。")
+    restore = _stop_on_sigterm()
+    stop_after_path(cfg).unlink(missing_ok=True)  # a request left over from the last run does not stop this one
     status = node_status.Reporter(lambda data: api.json("POST", "/node/status", {"node": cfg.name, "status": data}, timeout=30),
                                   cfg.name, cfg.work_dir, [Path(w) for w in cfg.watch] or None)
     if not once:  # a single pass (tests, a manual run) has nothing to keep reporting
         status.start(node_status.INTERVAL)
     try:
         return _loop(api, cfg, status, once, interval, analyse_fn, pack_fn, strokes_fn)
+    except (StopNow, KeyboardInterrupt):
+        print(f"{time.strftime('%H:%M:%S')} 收到停止信号，处理节点退出")
+        return 0
     finally:
         status.stop()
+        node_status.local_update(stopped=True, job=None, stage="", progress=None)
+        node_status.local_stop()
+        restore()
         sys.stdout = plain_stdout
+
+
+def stop_after_path(cfg: Config) -> Path:
+    """When this file exists the node exits before taking another job (the dashboard's 「做完这个再停」)."""
+    return cfg.work_dir / "stop_after_job"
+
+
+def _stop_on_sigterm():
+    """SIGTERM (launchd stopping the service, the dashboard's 「立即停」) raises StopNow in the main thread,
+    wherever it is. Returns a function that puts the old handler back."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    def handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # once is enough: the clean-up must not be interrupted again
+        raise StopNow()
+
+    old = signal.signal(signal.SIGTERM, handler)
+    return lambda: signal.signal(signal.SIGTERM, old)
+
+
+RELEASE = {"process": "/videos/{id}/job", "annotate": "/videos/{id}/annot/job", "strokes": "/videos/{id}/strokes/job"}
+
+
+def release(api: Api, task: str, video: dict) -> None:
+    """Hand an interrupted job back to the queue, so the next start takes it again without waiting for the lease."""
+    path = RELEASE.get(task)
+    if not path:
+        return
+    try:
+        api.json("POST", path.format(id=video["id"]), {"status": "queued", "stage": "处理程序停止了，重新排队"}, timeout=20)
+        print(f"  已把 {video.get('filename', video['id'])} 退回队列，下次启动会重新做")
+    except Exception as e:  # an older cloud does not know "queued": the lease runs out in ten minutes anyway
+        print(f"  退回队列失败（租约到期后会自动重新排队）：{e}")
 
 
 def _loop(api: Api, cfg: Config, status: "node_status.Reporter", once: bool, interval: float, analyse_fn, pack_fn,
           strokes_fn) -> int:
     while True:
+        if stop_after_path(cfg).exists():
+            stop_after_path(cfg).unlink(missing_ok=True)
+            print(f"{time.strftime('%H:%M:%S')} 手上的事做完了，按要求停止")
+            return 0
         try:
             got = api.json("POST", "/node/claim", {"node": cfg.name, "tasks": list(TASKS)})
         except (ApiError, urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
@@ -1223,6 +1290,11 @@ def _loop(api: Api, cfg: Config, status: "node_status.Reporter", once: bool, int
                     print(f"{time.strftime('%H:%M:%S')} 开始处理 {video['filename']}（{video['id']}）")
                     process(api, cfg, video, analyse_fn)
                 continue
+        except (StopNow, KeyboardInterrupt):
+            if video:
+                print(f"  停止：{video.get('filename', '')} 做到一半被打断")
+                release(api, task, video)
+            raise
         finally:
             status.set_job(None)
         if once:

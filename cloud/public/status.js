@@ -78,6 +78,10 @@ const Mac = (() => {
     if (s.version) row(dl, "代码版本", s.version);
     const sys = s.system || {};
     if (sys.load) row(dl, "CPU 负载", `${sys.load[0]}（${sys.cpus} 核）`, sys.load[0] > sys.cpus ? "warn" : "");
+    const u = sys.usage || {};
+    if (u.cpu != null) row(dl, "CPU 利用率", `${u.cpu}%` + (u.pcpu != null ? `（性能核 ${u.pcpu}%，能效核 ${u.ecpu}%）` : ""));
+    if (u.gpu != null) row(dl, "GPU 利用率", `${u.gpu}%` + (u.gpuPowerW != null ? `，${u.gpuPowerW.toFixed(1)} W` : ""));
+    if (u.anePowerW != null) row(dl, "NPU 功耗", `${u.anePowerW.toFixed(2)} W（系统不公开利用率）`);
     if (sys.memTotalGb) row(dl, "内存", `用了 ${sys.memUsedGb} / ${sys.memTotalGb} GB`);
     if (sys.diskTotalGb) row(dl, "磁盘剩余", `${sys.diskFreeGb} GB`, sys.diskFreeGb < 20 ? "bad" : "");
     c.append(dl);
