@@ -18,9 +18,11 @@ const isOwner = () => Boolean(isAdmin() && me.owner);
 // 每个请求都带 x-ba（服务器靠它确认请求是本站的网页发的）；有口令再带口令
 const authHeaders = () => (token ? { "x-ba": "1", authorization: "Bearer " + token } : { "x-ba": "1" });
 
-let file = null;
-let meta = {};
-let run = null; // 当前上传：{ video, controller, paused, ... }
+// 这一批要传的录像，按这个顺序一个一个传。每一项：
+// { file, key, meta, probed, state: wait | up | paused | error | done, sent, video, error, row... }
+let queue = [];
+let queueBusy = false; // 正在按顺序上传
+let run = null; // 正在传的那一个：{ item, video, controller, paused, ... }
 let wakeLock = null;
 let hiddenCount = 0;
 let hiddenSince = 0;
@@ -195,51 +197,166 @@ function fileKey(f) {
   return `ba.upload.${f.name}.${f.size}.${f.lastModified}`;
 }
 
-$("file").onchange = async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  if (run && !run.finished) return log("正在上传，先暂停再换文件");
-  file = f;
-  $("info").hidden = false;
-  $("progress").hidden = true;
-  $("upDone").hidden = true;
-  $("upTitle").value = "";
-  $("iName").textContent = f.name;
-  $("iSize").textContent = fmtBytes(f.size);
-  $("iRes").textContent = $("iFps").textContent = $("iDur").textContent = $("iRate").textContent = "读取中";
-  $("verdict").textContent = "";
-  $("startBtn").disabled = true;
-  log(`选了 ${f.name}，${fmtBytes(f.size)}，类型 ${f.type || "未知"}`);
+// ---------- 这一批要传的录像 ----------
 
+let probeChain = Promise.resolve(); // 读参数要播放一小段，一个一个来
+
+async function probeItem(item) {
+  if (!queue.includes(item)) return;
+  const f = item.file;
   const p = await probeVideo(f);
   const perMin = p.duration > 0 ? f.size / (p.duration / 60) : NaN;
-  meta = {
+  item.meta = {
     width: p.width, height: p.height,
     duration: isFinite(p.duration) ? Math.round(p.duration * 100) / 100 : null,
     fps: isFinite(p.fps) ? Math.round(p.fps * 10) / 10 : null,
     lastModified: f.lastModified,
     userAgent: navigator.userAgent,
   };
-  $("iRes").textContent = p.width ? `${p.width} × ${p.height}` : "读不出";
-  $("iFps").textContent = isFinite(p.fps) ? p.fps.toFixed(1) : "读不出";
-  $("iDur").textContent = fmtDur(p.duration);
-  $("iRate").textContent = isFinite(perMin) ? fmtBytes(perMin) + "/分钟" : "—";
-
   const is4k = Math.max(p.width, p.height) >= 3840;
   const is60 = isFinite(p.fps) && p.fps > 50;
-  const v = $("verdict");
-  if (!p.width) { v.className = "warn"; v.textContent = "浏览器读不出这个视频的参数，仍然可以上传。"; }
-  else if (is4k && is60) { v.className = "ok"; v.textContent = "是 4K60 原片，可以上传。"; }
-  else if (is4k && !isFinite(p.fps)) { v.className = "warn"; v.textContent = "是 4K，帧率读不出。看“每分钟大小”：4K60 大约 400 MB/分钟。"; }
-  else { v.className = "bad"; v.textContent = "不是 4K60，可能在选择时被系统压缩了。分析需要原片，建议换一种方式重新选。"; }
-  log(`参数：${p.width}×${p.height}，约 ${isFinite(p.fps) ? p.fps.toFixed(1) : "?"} fps，${fmtDur(p.duration)}，${isFinite(perMin) ? fmtBytes(perMin) : "?"}/分钟`);
+  const parts = [fmtBytes(f.size)];
+  if (p.width) parts.push(`${p.width}×${p.height}`);
+  if (isFinite(p.fps)) parts.push(`${p.fps.toFixed(0)} fps`);
+  if (isFinite(p.duration)) parts.push(fmtDur(p.duration));
+  if (isFinite(perMin)) parts.push(fmtBytes(perMin) + "/分钟");
+  item.info = parts.join(" · ");
+  if (!p.width) item.verdict = ["warn", "浏览器读不出这个视频的参数，仍然可以上传。"];
+  else if (is4k && is60) item.verdict = ["ok", "4K60 原片"];
+  else if (is4k && !isFinite(p.fps)) item.verdict = ["warn", "是 4K，帧率读不出。4K60 大约 400 MB/分钟。"];
+  else item.verdict = ["bad", "不是 4K60，可能在选择时被系统压缩了。分析需要原片，建议换一种方式重新选。"];
+  log(`${f.name}：${p.width}×${p.height}，约 ${isFinite(p.fps) ? p.fps.toFixed(1) : "?"} fps，${fmtDur(p.duration)}，${isFinite(perMin) ? fmtBytes(perMin) : "?"}/分钟`);
+  updateRow(item);
+}
 
-  let saved = null;
-  try { saved = localStorage.getItem(fileKey(f)); } catch {}
-  $("startBtn").textContent = saved ? "继续上传" : "开始上传";
-  $("startBtn").disabled = false;
-  $("startBtn").hidden = false;
-  $("pauseBtn").hidden = true;
+const movable = (item) => item && item.state !== "up" && item.state !== "done";
+
+function buildRow(item) {
+  const row = el("li", "qitem");
+  item.row = row;
+  item.numEl = el("span", "qnum");
+  const main = el("div", "qmain");
+  item.titleEl = document.createElement("input");
+  item.titleEl.type = "text";
+  item.titleEl.maxLength = 80;
+  item.titleEl.placeholder = "标题（可以不填）";
+  item.titleEl.setAttribute("aria-label", "标题");
+  item.infoEl = el("div", "qinfo");
+  item.verdictEl = el("div", "qverdict");
+  item.statusEl = el("div", "qstatus");
+  const bar = el("div", "bar");
+  item.barEl = el("div");
+  bar.append(item.barEl);
+  main.append(el("div", "qname", item.file.name), item.titleEl, item.infoEl, item.verdictEl, bar, item.statusEl);
+  const tools = el("div", "qtools");
+  const btn = (text, label, fn) => {
+    const b = el("button", "plain", text);
+    b.type = "button";
+    b.title = label;
+    b.setAttribute("aria-label", label);
+    b.onclick = fn;
+    tools.append(b);
+    return b;
+  };
+  item.upBtn = btn("↑", "往前挪", () => moveItem(item, -1));
+  item.downBtn = btn("↓", "往后挪", () => moveItem(item, 1));
+  item.delBtn = btn("✕", "不传这个", () => removeItem(item));
+  row.append(item.numEl, main, tools);
+}
+
+function updateRow(item) {
+  if (!item.row) return;
+  const i = queue.indexOf(item);
+  item.numEl.textContent = item.state === "done" ? "✓" : String(i + 1);
+  item.row.dataset.state = item.state;
+  item.infoEl.textContent = item.info || `${fmtBytes(item.file.size)} · 读取参数中`;
+  item.verdictEl.className = "qverdict " + (item.verdict ? item.verdict[0] : "");
+  item.verdictEl.textContent = item.verdict ? item.verdict[1] : "";
+  item.titleEl.disabled = Boolean(item.video); // 开始传之后标题在录像页里改
+  item.titleEl.hidden = Boolean(item.video) && !item.titleEl.value;
+  const pct = item.file.size ? Math.min(100, item.sent / item.file.size * 100) : 0;
+  item.barEl.style.width = (item.state === "done" ? 100 : pct).toFixed(1) + "%";
+  const st = item.statusEl;
+  st.className = "qstatus " + ({ done: "ok", error: "bad", paused: "warn" }[item.state] || "");
+  if (item.state === "done") {
+    st.textContent = "第 " + (i + 1) + " 个，已传完，已经排队等 Mac 处理 ";
+    if (item.video) {
+      const a = el("a", "", "查看");
+      a.href = "#/v/" + item.video.id;
+      st.append(a);
+    }
+  } else if (item.state === "up") st.textContent = item.merging ? "正在合并" : `上传中 ${pct.toFixed(1)}%`;
+  else if (item.state === "paused") st.textContent = `已暂停，传了 ${pct.toFixed(0)}%`;
+  else if (item.state === "error") st.textContent = "出错：" + item.error;
+  else st.textContent = `第 ${i + 1} 个，等待上传`;
+  item.upBtn.disabled = !(movable(item) && movable(queue[i - 1]));
+  item.downBtn.disabled = !(movable(item) && movable(queue[i + 1]));
+  item.delBtn.hidden = item.state === "up" || item.state === "done";
+  item.upBtn.hidden = item.downBtn.hidden = item.state === "done";
+}
+
+function renderQueue() {
+  const list = $("queue");
+  const rows = queue.map((x) => x.row);
+  // 顺序没变就不动节点，不然正在填的标题会失去焦点
+  if (rows.length !== list.children.length || rows.some((r, i) => list.children[i] !== r)) list.replaceChildren(...rows);
+  queue.forEach(updateRow);
+  $("info").hidden = !queue.length;
+  const left = queue.filter((x) => x.state !== "done").length;
+  $("qTitle").textContent = `要上传的录像（${queue.length} 个${left && left !== queue.length ? "，还剩 " + left + " 个" : ""}）`;
+  $("qHint").hidden = queue.length < 2;
+  if (!queueBusy) {
+    $("startBtn").hidden = !left;
+    $("startBtn").textContent = queue.some((x) => x.state === "paused" || x.state === "error" || x.state === "done" || x.resumable) ? "继续上传" : left > 1 ? `按顺序上传 ${left} 个` : "开始上传";
+  }
+}
+
+function moveItem(item, d) {
+  const i = queue.indexOf(item), j = i + d;
+  if (i < 0 || !movable(item) || !movable(queue[j])) return;
+  [queue[i], queue[j]] = [queue[j], queue[i]];
+  renderQueue();
+}
+
+function removeItem(item) {
+  if (item.state === "up" || item.state === "done") return;
+  queue = queue.filter((x) => x !== item);
+  renderQueue();
+  if (!queue.length) $("progress").hidden = true;
+}
+
+function addFiles(files) {
+  // 上一批已经全部传完：新选的另起一批
+  if (!queueBusy && queue.length && queue.every((x) => x.state === "done")) resetQueue();
+  let added = 0;
+  for (const f of files) {
+    const key = fileKey(f);
+    if (queue.some((x) => x.key === key)) { log(`${f.name} 已经在列表里`); continue; }
+    const item = { file: f, key, meta: {}, state: "wait", sent: 0, video: null, error: "", info: "", verdict: null, merging: false, resumable: false };
+    try { item.resumable = Boolean(localStorage.getItem(key)); } catch {}
+    buildRow(item);
+    queue.push(item);
+    added++;
+    log(`选了 ${f.name}，${fmtBytes(f.size)}，类型 ${f.type || "未知"}`);
+    item.probed = probeChain = probeChain.then(() => probeItem(item)).catch(() => {});
+  }
+  if (added) $("upDone").hidden = true;
+  renderQueue();
+  // 正在传的时候加进来的，排在后面接着传
+}
+
+function resetQueue() {
+  queue = [];
+  $("file").value = "";
+  $("info").hidden = $("progress").hidden = $("upDone").hidden = true;
+  $("queue").replaceChildren();
+}
+
+$("file").onchange = (e) => {
+  // 手机相册多选时，文件按点选的先后排列
+  const files = Array.from(e.target.files || []);
+  e.target.value = ""; // 之后还能再选同一个文件
+  if (files.length) addFiles(files);
 };
 
 // ---------- 上传 ----------
@@ -281,7 +398,7 @@ function kick(reason) {
 window.addEventListener("online", () => { if (run && !run.finished) { log("网络恢复"); kick("网络恢复"); } });
 window.addEventListener("offline", () => { if (run && !run.finished) log("网络断开，等恢复后自动继续"); });
 
-function putPart(video, n, signal, onProgress) {
+function putPart(file, video, n, signal, onProgress) {
   // 用 XMLHttpRequest 而不是 fetch，是为了拿到上传进度
   return new Promise((resolve, reject) => {
     const start = (n - 1) * video.partSize;
@@ -335,9 +452,11 @@ const untilOnline = (signal) => new Promise((resolve) => {
   signal.addEventListener("abort", done, { once: true });
 });
 
-async function startUpload() {
-  if (!file) return;
-  const key = fileKey(file);
+// 传一个文件。传完返回 true，被暂停返回 false，出错就抛出。
+async function uploadItem(item) {
+  const file = item.file;
+  const key = item.key;
+  await item.probed; // 新建上传时要带上分辨率、帧率这些参数
   let video = null;
   let savedId = null;
   try { savedId = localStorage.getItem(key); } catch {}
@@ -346,51 +465,49 @@ async function startUpload() {
       video = await api("/videos/" + savedId);
       if (video.size !== file.size) video = null;
     } catch (e) {
-      if (e.status !== 404) return log("读不到上次的进度：" + e.message);
+      if (e.status !== 404) throw new Error("读不到上次的进度：" + e.message);
     }
   }
   if (video && video.status === "uploaded") {
-    log("这个文件之前已经传完了");
+    log(`${file.name} 之前已经传完了`);
     try { localStorage.removeItem(key); } catch {}
-    return refreshList();
+    item.video = video;
+    item.sent = file.size;
+    return true;
   }
   if (!video) {
     video = await api("/videos", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        filename: file.name, size: file.size, contentType: file.type, meta, title: $("upTitle").value.trim(),
+        filename: file.name, size: file.size, contentType: file.type, meta: item.meta, title: item.titleEl.value.trim(),
         options: { mode: document.querySelector('input[name="mode"]:checked').value },
       }),
     });
     try { localStorage.setItem(key, video.id); } catch {}
-    log(`新建上传，共 ${video.partCount} 片，每片 ${fmtBytes(video.partSize)}`);
+    log(`${file.name}：新建上传，共 ${video.partCount} 片，每片 ${fmtBytes(video.partSize)}`);
   } else {
-    log(`继续上传，已有 ${video.uploadedParts.length}/${video.partCount} 片`);
+    log(`${file.name}：继续上传，已有 ${video.uploadedParts.length}/${video.partCount} 片`);
   }
+  item.video = video;
 
   const done = new Set(video.uploadedParts);
   const todo = [];
   for (let n = 1; n <= video.partCount; n++) if (!done.has(n)) todo.push(n);
 
   const controller = new AbortController();
-  run = {
-    video, controller, paused: false, finished: false,
+  const r = run = {
+    item, video, controller, paused: false, finished: false,
     confirmed: video.uploadedBytes, // 服务器已确认的字节
     inflight: new Map(),            // 正在传的片 -> 已发送字节
     xhrs: new Set(),                // 在途的请求，卡住时用来断开
     sentThisRun: 0, startedAt: Date.now(), retries: 0, samples: [],
   };
-  hiddenCount = 0; hiddenTotalMs = 0; hiddenSince = 0;
-  $("pHidden").textContent = "0 次";
+  if (pauseAsked) { r.paused = true; controller.abort(); } // 在新建上传的那一下点了暂停
   $("pRetries").textContent = "0";
   $("progress").hidden = false;
-  $("pTitle").textContent = "上传中";
-  $("startBtn").hidden = true;
-  $("pauseBtn").hidden = false;
-  requestWakeLock();
   const timer = setInterval(render, 500);
-  const r = run;
+  render();
 
   async function worker() {
     while (todo.length && !controller.signal.aborted) {
@@ -398,7 +515,7 @@ async function startUpload() {
       for (let attempt = 1, httpFails = 0; ; attempt++) {
         try {
           r.inflight.set(n, 0);
-          const size = await putPart(video, n, controller.signal, (loaded) => r.inflight.set(n, loaded));
+          const size = await putPart(file, video, n, controller.signal, (loaded) => r.inflight.set(n, loaded));
           r.inflight.delete(n);
           r.confirmed += size;
           r.sentThisRun += size;
@@ -427,34 +544,78 @@ async function startUpload() {
 
   try {
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    if (controller.signal.aborted) {
-      log("已暂停");
-      $("pTitle").textContent = "已暂停";
-      return;
-    }
-    $("pTitle").textContent = "正在合并";
+    if (controller.signal.aborted) return false;
+    item.merging = true;
+    render();
     const result = await api(`/videos/${video.id}/complete`, { method: "POST" });
     const secs = (Date.now() - r.startedAt) / 1000;
-    r.finished = true;
     try { localStorage.removeItem(key); } catch {}
-    $("pTitle").textContent = "上传完成，已经排队等 Mac 处理";
-    $("upDone").hidden = false;
-    log(`完成：${fmtBytes(result.size)}，本次用时 ${fmtDur(secs)}，平均 ${fmtSpeed(r.sentThisRun / Math.max(secs, 1))}，重试 ${r.retries} 次，进入后台 ${hiddenCount} 次`);
-    refreshList();
+    item.sent = file.size;
+    log(`${file.name} 传完：${fmtBytes(result.size)}，用时 ${fmtDur(secs)}，平均 ${fmtSpeed(r.sentThisRun / Math.max(secs, 1))}，重试 ${r.retries} 次。已经排队等 Mac 处理`);
+    return true;
   } catch (e) {
     controller.abort();
-    $("pTitle").textContent = "上传出错";
-    log("上传出错：" + e.message + "。可以点“继续上传”。");
+    throw e;
   } finally {
     clearInterval(timer);
+    item.merging = false;
+    r.finished = true;
     render();
+  }
+}
+
+let pauseAsked = false;
+
+// 按列表顺序一个一个传；传完一个它就进了处理队列，Mac 不用等后面的
+async function runQueue() {
+  if (queueBusy) return;
+  queueBusy = true;
+  pauseAsked = false;
+  hiddenCount = 0; hiddenTotalMs = 0; hiddenSince = 0;
+  $("pHidden").textContent = "0 次";
+  $("startBtn").hidden = true;
+  $("pauseBtn").hidden = false;
+  $("upDone").hidden = true;
+  requestWakeLock();
+  let stopped = "";
+  try {
+    for (;;) {
+      const item = queue.find((x) => x.state !== "done");
+      if (!item || pauseAsked) { if (item) stopped = "paused"; break; }
+      item.state = "up";
+      item.error = "";
+      renderQueue();
+      $("progress").hidden = false;
+      $("pTitle").textContent = `正在传第 ${queue.indexOf(item) + 1} 个，共 ${queue.length} 个`;
+      try {
+        if (await uploadItem(item)) {
+          item.state = "done";
+          refreshList();
+        } else {
+          item.state = "paused";
+          stopped = "paused";
+          log("已暂停");
+        }
+      } catch (e) {
+        item.state = "error";
+        item.error = e.message;
+        stopped = "error";
+        log(`${item.file.name} 上传出错：${e.message}。可以点“继续上传”，或者去掉这一个。`);
+      }
+      renderQueue();
+      if (stopped) break;
+    }
+  } finally {
+    queueBusy = false;
     if (wakeLock) wakeLock.release().catch(() => {});
     $("pauseBtn").hidden = true;
-    if (!r.finished) {
-      r.finished = true;
-      $("startBtn").textContent = "继续上传";
-      $("startBtn").hidden = false;
+    const n = queue.length;
+    if (stopped) $("pTitle").textContent = stopped === "paused" ? "已暂停" : "上传出错";
+    else if (n) {
+      $("pTitle").textContent = n > 1 ? `${n} 个都传完了，已经按顺序排队等 Mac 处理` : "上传完成，已经排队等 Mac 处理";
+      $("upDone").hidden = false;
     }
+    renderQueue();
   }
 }
 
@@ -464,6 +625,8 @@ function render() {
   let flying = 0;
   for (const v of r.inflight.values()) flying += v;
   const sent = Math.min(r.video.size, r.confirmed + flying);
+  r.item.sent = sent;
+  updateRow(r.item);
   const now = Date.now();
   r.samples.push([now, r.sentThisRun + flying]);
   while (r.samples.length > 2 && now - r.samples[0][0] > 10000) r.samples.shift();
@@ -471,16 +634,23 @@ function render() {
   const speed = now > t0 ? Math.max(0, (r.sentThisRun + flying - b0) / ((now - t0) / 1000)) : 0;
   const elapsed = (now - r.startedAt) / 1000;
   const avg = (r.sentThisRun + flying) / Math.max(elapsed, 1);
+  let leftAll = 0;
+  for (const x of queue) if (x.state !== "done") leftAll += Math.max(0, x.file.size - x.sent);
+  $("pName").textContent = r.item.file.name;
   $("pBar").style.width = (sent / r.video.size * 100).toFixed(1) + "%";
   $("pBytes").textContent = `${fmtBytes(sent)} / ${fmtBytes(r.video.size)}（${(sent / r.video.size * 100).toFixed(1)}%）`;
   $("pSpeed").textContent = fmtSpeed(speed);
   $("pAvg").textContent = fmtSpeed(avg);
   $("pEta").textContent = speed > 0 ? fmtDur((r.video.size - sent) / speed) : "—";
+  $("pEtaAll").textContent = speed > 0 ? fmtDur(leftAll / speed) : "—";
   $("pElapsed").textContent = fmtDur(elapsed);
 }
 
-$("startBtn").onclick = () => startUpload().catch((e) => log("出错：" + e.message));
-$("pauseBtn").onclick = () => { if (run) { run.paused = true; run.controller.abort(); } };
+$("startBtn").onclick = () => runQueue().catch((e) => log("出错：" + e.message));
+$("pauseBtn").onclick = () => {
+  pauseAsked = true;
+  if (run && !run.finished) { run.paused = true; run.controller.abort(); }
+};
 
 // ---------- 录像列表和结果 ----------
 
@@ -766,12 +936,8 @@ function route() {
   }
   Team.show(name === "vTasks" ? "tasks" : name === "vReview" ? "review" : name === "vMaterials" ? "materials" : null);
   if (name === "vTeam") Team.openTeam();
-  if (name === "vUpload" && !$("upDone").hidden) {
-    // 上一段已经传完：回到空白的上传页，方便接着传下一段
-    file = null;
-    $("file").value = "";
-    $("info").hidden = $("progress").hidden = $("upDone").hidden = true;
-  }
+  // 上一批已经传完：回到空白的上传页，方便接着传下一批
+  if (name === "vUpload" && !$("upDone").hidden) resetQueue();
   if (name === "vSettings") loadAi();
   if (name === "vMac") Mac.open();
   else Mac.close();
