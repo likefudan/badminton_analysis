@@ -1,4 +1,6 @@
 // 多人标注：Google 登录、成员（白名单）、领任务。
+// 角色一层包一层：viewer（普通用户，只能看分析结果，什么都不能改）< annotator（标注员，另外能领标注任务）
+// < admin（管理员，另外能管成员和审核标注）。上传、重跑、删除、AI 追问只有超级管理员能做。
 // 登录后浏览器拿到一个随机的会话 cookie（库里只存它的 SHA-256）。没被邀请的账号登录后是 pending，
 // 管理员在「成员」页点一下就能放行。口令（ACCESS_TOKEN）仍然有效：Mac 节点用它，管理员也可以用它登录，
 // 第一个管理员就是用 Google 登录后再输一次口令认领的。
@@ -9,7 +11,7 @@ export type Who = {
   email: string;                 // 用口令登录时是空的
   name: string;
   picture: string;
-  role: "admin" | "annotator";
+  role: "admin" | "annotator" | "viewer";
   status: "active" | "pending" | "disabled";
   via: "token" | "google";
   owner: boolean;                // 超级管理员：只有它能上传和分析录像、让 Mac 准备标注材料（用口令的也算）
@@ -65,6 +67,7 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
 }
 
 export const isAdmin = (who: Who) => who.role === "admin" && who.status === "active";
+export const isViewer = (who: Who) => who.role === "viewer";
 
 export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture: who.picture, role: who.role, status: who.status, via: who.via, owner: who.owner });
 
@@ -156,7 +159,7 @@ async function googleCallback(req: Request, env: Env, url: URL): Promise<Respons
   } else {
     const pending = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE status = 'pending'").first<{ n: number }>();
     if ((pending?.n ?? 0) >= MAX_PENDING) return loginError("full", clear);
-    await env.DB.prepare("INSERT OR IGNORE INTO users (email, name, picture, role, status, created_at, last_login_at) VALUES (?, ?, ?, 'annotator', 'pending', ?, ?)")
+    await env.DB.prepare("INSERT OR IGNORE INTO users (email, name, picture, role, status, created_at, last_login_at) VALUES (?, ?, ?, 'viewer', 'pending', ?, ?)")
       .bind(email, name, picture, now.toISOString(), now.toISOString())
       .run();
   }
@@ -461,7 +464,7 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
   const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
   if (!EMAIL.test(email)) throw new HttpError(400, "邮箱不对");
   const old = await env.DB.prepare("SELECT role, status FROM users WHERE email = ?").bind(email).first<{ role: string; status: string }>();
-  const role = body?.role === "admin" || body?.role === "annotator" ? body.role : old?.role ?? "annotator";
+  const role = body?.role === "admin" || body?.role === "annotator" || body?.role === "viewer" ? body.role : old?.role ?? "viewer";
   const status = remove ? "disabled" : body?.status === "active" || body?.status === "disabled" ? body.status : old && old.status !== "pending" ? old.status : "active";
   const losesAdmin = old?.role === "admin" && old.status === "active" && (role !== "admin" || status !== "active");
   if (email === superAdmin(env) && (remove || role !== "admin" || status !== "active")) throw new HttpError(409, "这是超级管理员，不能停用、降级或删除");
@@ -477,6 +480,10 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
     await env.DB.batch([
       env.DB.prepare("UPDATE users SET role = ?, status = ? WHERE email = ?").bind(role, status, email),
       ...(status === "disabled" ? await releaseTasksOf(env, email) : []),
+      // 改成普通用户：手上的标注任务放回大厅
+      ...(role === "viewer" && old.role !== "viewer" && status !== "disabled"
+        ? [env.DB.prepare("UPDATE tasks SET status = 'open', assignee = '', lease_until = NULL, updated_at = ? WHERE assignee = ? AND status = 'claimed'").bind(new Date().toISOString(), email)]
+        : []),
     ]);
   } else {
     await env.DB.prepare("INSERT INTO users (email, role, status, created_at) VALUES (?, ?, ?, ?)").bind(email, role, status, new Date().toISOString()).run();
@@ -490,6 +497,7 @@ export async function teamApi(req: Request, env: Env, path: string, who: Who): P
   if (path === "/auth/claim-admin" && m === "POST") return claimAdmin(req, env, who);
   if (!path.startsWith("/tasks") && !path.startsWith("/admin/")) return null;
   if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+  if (isViewer(who)) throw new HttpError(403, "这个账号只能看，不能改");
   if (path === "/tasks" && m === "GET") return listTasks(env, who);
   const match = path.match(/^\/tasks\/(\d{1,12})\/(claim|release|submit|approve|return)$/);
   if (match && m === "POST") return taskAction(req, env, who, Number(match[1]), match[2]);

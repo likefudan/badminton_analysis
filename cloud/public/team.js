@@ -17,7 +17,7 @@ const Team = (() => {
     av.style.backgroundImage = me && me.picture ? `url("${me.picture}")` : "";
     $t("navName").textContent = name;
     $t("navEmail").textContent = (me && me.email) || "";
-    $t("navRole").textContent = isOwner() ? "超级管理员" : isAdmin() ? "管理员" : "标注员";
+    $t("navRole").textContent = isOwner() ? "超级管理员" : isAdmin() ? "管理员" : isViewer() ? "普通用户" : "标注员";
   }
   // 点菜单外面就收起来
   document.addEventListener("click", (e) => { if (!$t("navMenu").contains(e.target)) $t("navMenu").open = false; });
@@ -330,11 +330,20 @@ const Team = (() => {
       return b;
     };
     group("申请加入", users.filter((u) => u.status === "pending"), (u) =>
-      card(u, "用 Google 登录过，还没有被邀请", [button("允许", "", () => saveUser("/admin/users", { email: u.email, status: "active" })), remove(u, "拒绝")]));
+      card(u, "用 Google 登录过，还没有被邀请", [
+        button("允许（只能看）", "", () => saveUser("/admin/users", { email: u.email, status: "active", role: "viewer" })),
+        button("允许并设为标注员", "plain", () => saveUser("/admin/users", { email: u.email, status: "active", role: "annotator" })),
+        remove(u, "拒绝"),
+      ]));
     group("成员", users.filter((u) => u.status === "active"), (u) => {
       const self = me && u.email === me.email;
-      return card(u, (u.owner ? "超级管理员 · " : u.role === "admin" ? "管理员 · " : "") + stats(u), self || u.owner ? [] : [
+      const seen = u.lastLoginAt ? ` · 上次登录 ${fmtDate(new Date(u.lastLoginAt))}` : " · 还没登录过";
+      const sub = u.owner ? "超级管理员 · " + stats(u) : u.role === "admin" ? "管理员 · " + stats(u)
+        : u.role === "viewer" ? "普通用户 · 只能看分析结果" + seen : "标注员 · 能看分析结果，能标注 · " + stats(u);
+      return card(u, sub, self || u.owner ? [] : [
         button("停用", "plain", () => saveUser("/admin/users", { email: u.email, status: "disabled" })),
+        ...(u.role === "viewer" ? [button("设为标注员", "plain", () => saveUser("/admin/users", { email: u.email, role: "annotator" }))] : []),
+        ...(u.role === "annotator" ? [button("取消标注员", "plain", () => saveUser("/admin/users", { email: u.email, role: "viewer" }))] : []),
         u.role === "admin" ? button("取消管理员", "plain", () => saveUser("/admin/users", { email: u.email, role: "annotator" }))
           : button("设为管理员", "plain", () => saveUser("/admin/users", { email: u.email, role: "admin" })),
       ]);
@@ -352,12 +361,14 @@ const Team = (() => {
     }
   }
 
-  $t("mAdd").onclick = async () => {
+  const invite = (role) => async () => {
     const email = $t("mEmail").value.trim();
     if (!email) return;
-    await saveUser("/admin/users", { email, status: "active" });
+    await saveUser("/admin/users", { email, status: "active", role });
     if ($t("mError").hidden) $t("mEmail").value = "";
   };
+  $t("mAdd").onclick = invite("annotator");
+  $t("mAddViewer").onclick = invite("viewer");
 
   return { setUser, show, cameFrom, openTeam, task, showBar };
 })();

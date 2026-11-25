@@ -10,11 +10,15 @@ const $ = (id) => document.getElementById(id);
 
 let token = "";   // 用口令登录时的口令；用 Google 登录时是空的，靠 cookie
 try { token = localStorage.getItem("ba.token") || ""; } catch {}
-let me = null;    // 登录后 /me 的回答：email、name、role（admin | annotator）、status
+let me = null;    // 登录后 /me 的回答：email、name、role（admin | annotator | viewer）、status
 let authed = false;
 const isAdmin = () => Boolean(me && me.role === "admin" && me.status === "active");
 // 超级管理员：只有它有「分析」这一边（上传、看结果、设置、Mac 状态），也只有它能让 Mac 准备标注材料
 const isOwner = () => Boolean(isAdmin() && me.owner);
+// 普通用户：只能看分析结果，没有标注这一边
+const isViewer = () => Boolean(me && me.role === "viewer" && me.status === "active");
+// 超级管理员以外的人看分析结果都是只读的（我的录像和每段录像的概览、视频、卡片）。后端也只放行读接口
+const readOnly = () => !isOwner();
 // 每个请求都带 x-ba（服务器靠它确认请求是本站的网页发的）；有口令再带口令
 const authHeaders = () => (token ? { "x-ba": "1", authorization: "Bearer " + token } : { "x-ba": "1" });
 
@@ -113,9 +117,11 @@ async function tryLogin() {
   $("app").hidden = false;
   document.body.classList.toggle("annotator", !isAdmin());
   document.body.classList.toggle("owner", isOwner());
+  document.body.classList.toggle("viewer", isViewer());
   Team.setUser();
   route();
-  if (isOwner()) { refreshList(); loadAi(); }
+  refreshList();
+  if (isOwner()) loadAi();
 }
 function showLogin(msg) {
   authed = false;
@@ -766,7 +772,7 @@ function renderList() {
   box.textContent = "";
   const test = (FILTERS.find((f) => f[0] === filter) || FILTERS[0])[2];
   const shown = videos.filter(test);
-  if (!videos.length) box.append(el("div", "empty", "还没有录像。点上面的「上传录像」，传完后家里的 Mac 会自动分析。"));
+  if (!videos.length) box.append(el("div", "empty", readOnly() ? "还没有录像。" : "还没有录像。点上面的「上传录像」，传完后家里的 Mac 会自动分析。"));
   else if (!shown.length) box.append(el("div", "empty", "这一类里没有录像"));
   for (const v of shown) {
     const card = el("div", "vcard");
@@ -904,8 +910,9 @@ function route() {
   let h = location.hash || "#/";
   // 超级管理员什么都能进；别的管理员只有标注这一边和成员；标注员只有任务和标注页
   const labeling = /^#\/(tasks$|label\/|strokes\/)/.test(h);
-  const allowed = isOwner() || labeling || (isAdmin() && /^#\/(materials|review|team)$/.test(h));
-  if (!allowed) h = "#/tasks";
+  // 谁都能看「我的录像」和每段录像的结果页（超级管理员以外是只读的）；普通用户只有这些
+  const allowed = isOwner() || /^#\/(v\/[0-9a-f-]{36})?$/.test(h) || (!isViewer() && labeling) || (isAdmin() && /^#\/(materials|review|team)$/.test(h));
+  if (!allowed) h = "#/";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
   const lm = h.match(/^#\/label\/([0-9a-f-]{36})(?:\/t(\d+))?$/);
   const sm = h.match(/^#\/strokes\/([0-9a-f-]{36})(?:\/t(\d+))?$/);
@@ -914,7 +921,7 @@ function route() {
   for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== name;
   $("navAnalysis").classList.toggle("on", ["vHome", "vUpload", "vDetail"].includes(name));
   $("navLabeling").classList.toggle("on", ["vTasks", "vMaterials", "vReview"].includes(name));
-  $("navHome").href = isOwner() ? "#/" : "#/tasks";
+  $("navHome").href = "#/";
   $("navMenu").open = false;
   document.body.classList.toggle("labeling", Boolean(lm || sm));
   document.querySelector("main").classList.toggle("wide", Boolean(lm || sm));
@@ -958,7 +965,7 @@ function openDetail(id) {
   delete $("dDelete").dataset.armed;
   const v = videos.find((x) => x.id === id);
   // 还在处理或者失败了：先看处理情况；有结果了：先看概览
-  setTab(v && v.job && v.job.status === "done" ? "overview" : v ? "process" : "overview");
+  setTab((v && v.job && v.job.status === "done") || readOnly() ? "overview" : v ? "process" : "overview");
   if (v) renderDetail();
   else refreshList();
 }
@@ -1243,7 +1250,7 @@ async function renderReview(v, force) {
   const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busyNow, reviewError, (v.ai || []).length, ai && ai.defaultModel, ai && ai.available].join("|");
   if (!force && key === reviewKey) return;
   reviewKey = key;
-  if (!md && !can) { box.textContent = ""; return; }
+  if (!md && (!can || readOnly())) { box.textContent = ""; return; }
   const text = async (name) => {
     try { return await (await fetch(`${resultUrl(v, name)}?t=${Date.now()}`)).text(); } catch { return ""; }
   };
@@ -1273,9 +1280,10 @@ async function renderReview(v, force) {
   const note = el("p", reviewError ? "bad" : "quiet",
     reviewError || (busyNow ? "正在请大模型写，大约需要一分钟，请不要关闭页面……"
       : !available ? "网站还没有配置模型的 API key，暂时出不了 AI 报告。"
-      : report ? "" : "这段录像还没有 AI 报告。它只根据上面这些统计数字写，不看视频。"));
+      : report ? "" : readOnly() ? "这段录像还没有 AI 报告。" : "这段录像还没有 AI 报告。它只根据上面这些统计数字写，不看视频。"));
   if (note.textContent) box.append(note);
-  if (!can || busyNow || !available) return;
+  // 超级管理员以外只能看报告和已有的问答：不能生成、不能追问（后端也会拒绝）
+  if (!can || busyNow || !available || readOnly()) return;
   const field = el("div", "field");
   field.append(el("label", "", "用哪个模型"), modelSelect());
   box.append(field);
@@ -1417,7 +1425,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
     return SIDE_ZH[side] + (ps.length ? `（${ps.join("、")}）` : "");
   };
   wrap.append(el("p", "small",
-    `${d.total} 个回合，判出谁赢的 ${d.judged} 个` + (d.labelled ? `（${d.labelled} 个是你标的）` : "") +
+    `${d.total} 个回合，判出谁赢的 ${d.judged} 个` + (d.labelled ? `（${d.labelled} 个是${readOnly() ? "手动" : "你"}标的）` : "") +
     (d.judged ? `：${sideName("near")} ${d.sides.near.points} 分，${sideName("far")} ${d.sides.far.points} 分` : "") +
     "。程序是看死球后谁弯腰捡球、在哪捡推出来的，没看到捡球的回合不判" +
     (onLabel ? "；下面每个回合可以自己点谁赢。" : "。") + "击球类型是模型认的，每回合第一拍按规则算发球" +
@@ -1470,7 +1478,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
     } else text = "没判出谁赢";
     const title = r.dead_ball ? " " : ` 回合 ${r.n} · ${r.hits} 拍：`;
     li.append(a, el("b", "", title), document.createTextNode(text));
-    if (r.label) li.append(el("span", "by", " · 你标的"));
+    if (r.label) li.append(el("span", "by", readOnly() ? " · 手动标的" : " · 你标的"));
     else if (r.confidence === "high") li.append(el("span", "by", " · 程序看到捡球"));
     if (onLabel) {
       const pick = el("span", "winpick");
@@ -1493,7 +1501,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
 async function showPoints(v, doc, names, holder) {
   let labels = {};
   const editable = isOwner();
-  if (editable) {
+  if (editable || readOnly()) {
     try { labels = (await api(`/videos/${v.id}/rally-labels`)).labels || {}; } catch {}
   }
   let card = null;
@@ -1745,7 +1753,7 @@ $("dDelete").onclick = async () => {
   if (v) log("已从云端删除 " + v.filename);
   location.hash = "#/";
 };
-document.addEventListener("visibilitychange", () => { if (!document.hidden && authed && isOwner() && !$("app").hidden) refreshList(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && authed && !$("app").hidden) refreshList(); });
 
 $("copyLog").onclick = async () => {
   try { await navigator.clipboard.writeText($("log").textContent); log("记录已复制"); }
