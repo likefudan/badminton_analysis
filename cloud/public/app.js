@@ -1009,6 +1009,7 @@ async function renderDetail() {
   $("dError").hidden = !(v.job && v.job.error);
   $("dError").textContent = (v.job && v.job.error) || "";
   $("dRetry").hidden = !(v.status === "uploaded" && v.job && ["failed", "done", "archived"].includes(v.job.status));
+  $("dCards").hidden = !(v.status === "uploaded" && v.job && v.job.status === "done");
   // 处理中不能改（Mac 正在跑）；排队中、完成、失败、已清理都可以改
   $("dMode").hidden = !(v.status === "uploaded" && v.job && v.job.status !== "processing");
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
@@ -1712,6 +1713,15 @@ $("dRetry").onclick = async () => {
     await api(`/videos/${openId}/job/retry`, { method: "POST" });
     log("已重新排队");
   } catch (e) { log("重新处理失败：" + e.message); }
+  refreshList();
+};
+$("dCards").onclick = async () => {
+  try {
+    await api(`/videos/${openId}/job/retry`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ only: "cards" }),
+    });
+    log("已排队：只更新卡片，视频和 AI 点评不动");
+  } catch (e) { log("更新卡片失败：" + e.message); }
   refreshList();
 };
 $("dMode").onclick = async () => {

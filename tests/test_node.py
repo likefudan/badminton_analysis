@@ -599,3 +599,49 @@ def test_the_local_state_file_follows_the_job(cloud, tmp_path):
     assert s["job"]["task"] == "process" and s["job"]["name"] == "IMG 0964.mov"
     assert s["pid"] > 0 and s["stopped"] is False
     assert [x["key"] for x in s["progress"]["steps"] if x["status"] == "done"]
+
+
+def test_cards_only_redraws_from_what_is_on_the_mac_and_sends_only_small_files(cloud, tmp_path, monkeypatch):
+    """「只更新卡片」: no skeleton, no cut, no videos, no new AI report; the cards and statistics go up."""
+    cloud.video["options"] = {"mode": "doubles", "only": "cards"}
+    out = tmp_path / "work" / cloud.video["id"] / "analysis-doubles"
+    out.mkdir(parents=True)
+    (out.parent / "IMG_0964.mov").write_bytes(cloud.original)
+    (out.parent / "IMG_0964.court.json").write_text("{}")
+    for name in ("skeleton.npz", "combined.mp4", "rallies.mp4", "strokes.json", "movement.json", "positioning.near.png"):
+        (out / f"IMG_0964.{name}").write_bytes(b"old")
+    calls = []
+
+    def fake_run(args, log, on_line, on_frames):
+        calls.append(args)
+        if args[0] == "analyze":
+            for name in ("movement.1.png", "positioning.near.png", "positioning.json", "movement.json", "report.json"):
+                (out / f"IMG_0964.{name}").write_bytes(b"new")
+        else:
+            (out / "IMG_0964.review.request.json").write_bytes(b"new")
+        return 0
+
+    monkeypatch.setattr(node, "run_step", fake_run)
+    monkeypatch.setattr(node, "web_image", lambda f, dst: f)
+
+    def never(*a, **k):
+        raise AssertionError("the full analysis must not run")
+
+    assert node.run(config(cloud, tmp_path), once=True, analyse_fn=never) == 0
+    assert calls[0][0] == "analyze" and "--no-cut" in calls[0] and "--singles" not in calls[0]
+    assert calls[1][0] == "review"
+    assert set(cloud.results) == {"movement.1.png", "positioning.near.png", "positioning.json", "movement.json",
+                                  "report.json", "review.request.json"}
+    assert set(cloud.results.values()) == {b"new"}
+    last = cloud.jobs[-1]
+    steps = {s["key"]: s for s in last["progress"]["steps"]}
+    assert last["status"] == "done" and steps["stats"]["status"] == "done"
+    assert steps["cut"]["status"] == steps["shuttle"]["status"] == steps["review"]["status"] == "skipped"
+    assert cloud.reviews == 0
+
+
+def test_cards_only_without_earlier_results_says_to_reprocess(cloud, tmp_path):
+    cloud.video["options"] = {"mode": "singles", "only": "cards"}
+    assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
+    assert cloud.jobs[-1]["status"] == "failed" and "重新处理" in cloud.jobs[-1]["error"]
+    assert not cloud.results

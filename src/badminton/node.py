@@ -789,6 +789,34 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
     return extra + files
 
 
+CARD_RESULTS = ("movement.*.png", "positioning.*.png", "movement.json", "positioning.json", "report.json",
+                "review.*.json")
+
+
+def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str], run=None) -> list[Path]:
+    """Only draw the movement and positioning cards again (options["only"] == "cards": the web page's
+    「只更新卡片」, for after the program changed how they are drawn). Everything slow is reused from the
+    earlier run on this Mac, no video is cut or sent; returns the few small files to put over the old ones."""
+    sdr = video.with_name(video.stem + "_sdr.mp4")
+    work = sdr if sdr.exists() else video
+    court = work.with_suffix(".court.json")
+    if not court.exists() or not (out_dir / f"{work.stem}.skeleton.npz").exists():
+        raise StepFailed("这台 Mac 上没有这段录像之前的骨架数据，只更新卡片做不了，请用「重新处理」")
+    for key in ("sdr", "calibrate", "skeleton", "label"):
+        progress.skip(key, "沿用上次的结果")
+    progress.start("stats")
+    args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir), "--no-cut"]
+    if options.get("mode") != "doubles":
+        args.append("--singles")
+    if (run or run_step)(args, log, None, None) != 0:
+        raise StepFailed("重新生成卡片失败")
+    progress.done("stats")
+    for key in ("cut", "shuttle", "technique"):
+        progress.skip(key, "只更新卡片，这一步不动")
+    review_inputs(work, court, out_dir, log, run)  # the statistics the AI report reads follow the new numbers
+    return sorted({p for pattern in CARD_RESULTS for p in out_dir.glob(f"{work.stem}.{pattern}")})
+
+
 def result_name(path: Path, stem: str) -> str:
     """Names on the web are the same for every recording: strip the recording's own file stem."""
     name = path.name
@@ -1136,8 +1164,9 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         # one folder per mode: the skeleton data of a singles run (one player per side) is no use for doubles
         options = video.get("options") or {}
         out_dir = job_dir / ("analysis-doubles" if options.get("mode") == "doubles" else "analysis")
+        cards_only = options.get("only") == "cards"
         try:
-            files = analyse_fn(local, out_dir, options, progress, log)
+            files = (refresh_cards if cards_only else analyse_fn)(local, out_dir, options, progress, log)
         except StepFailedWithFiles as e:
             (job_dir / "web").mkdir(exist_ok=True)
             for f in e.files:
@@ -1159,14 +1188,17 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
             print(f"  上传 {name}（{f.stat().st_size / 1e6:.1f} MB）")
             api.upload_result(vid, f, name)
         shown = local.with_name(local.stem + "_sdr.mp4") if local.with_name(local.stem + "_sdr.mp4").exists() else local
-        cover = cover_image(shown, web_dir / "cover.jpg", (progress.video_seconds or 0) * 0.1)
+        cover = None if cards_only else cover_image(shown, web_dir / "cover.jpg", (progress.video_seconds or 0) * 0.1)
         if cover:
             api.upload_result(vid, cover, "cover.jpg")
-        frame = cover_image(shown, web_dir / "frame.jpg", (progress.video_seconds or 0) * 0.1, width=1280)
+        frame = None if cards_only else cover_image(shown, web_dir / "frame.jpg", (progress.video_seconds or 0) * 0.1, width=1280)
         if frame:  # the picture the analysis region is drawn on
             api.upload_result(vid, frame, "frame.jpg")
         progress.done("upload", f"{len(files)} 个文件")
-        ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
+        if cards_only:  # the report on the site stays; asking again would cost tokens for the same words
+            progress.skip("review", "只更新卡片，AI 报告不动")
+        else:
+            ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
         stop.set()
         api.retrying(lambda: api.json("POST", f"/videos/{vid}/job",
                                       {"status": "done", "stage": "完成", "progress": progress.to_json()}), "汇报完成")

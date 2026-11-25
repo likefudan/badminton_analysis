@@ -29,7 +29,7 @@
 | `POST /node/status` | 节点每半分钟上报一次这台 Mac 的状态（当前作业、后台任务和日志、机器负载），原样存成 JSON |
 | `GET /status` | 「Mac 状态」页要的全部内容：各节点最后上报的状态，加上正在做、排队、失败的作业 |
 | `POST /videos/{id}/job` | 节点汇报进度（`stage` 文字加 `progress` 步骤列表：每步状态、用时、百分比、预计剩余），或以 `done` / `failed` 结束 |
-| `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打 |
+| `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打；`{"only": "cards"}` 只重新出卡片和统计，旧结果、视频和 AI 点评都不动 |
 | `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
 | `PUT /videos/{id}/results/{name}` | 传一个结果文件；大文件用 `.../multipart` 分片传 |
 | `GET /videos/{id}/results/{name}` | 读结果，支持 Range |
