@@ -10,6 +10,7 @@ in-play time. Per pair (the two players on one half):
     side-by-side; a change that lasts >= ROLE_MIN_S counts as one rotation;
   * partner spacing: distance between the two (too close < 1.5 m: both cover
     the same shuttle; too far > 4.5 m: a hole opens between them);
+  * position: where each partner stood (heatmap + mean), drawn on the card;
   * open court: for every frame the point of the half that is farthest from
     both players (the biggest hole), how far it is, and in which zone;
   * coverage: share of the half that is closer to each player (Voronoi).
@@ -23,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 from .court import LENGTH, NET_Y, WIDTH
-from .movement import _runs, smooth_track
+from .movement import _runs, heatmap, smooth_track
 
 FRONT_BACK_DEG = 60.0
 SIDE_BY_SIDE_DEG = 30.0
@@ -114,9 +115,11 @@ def pair_report(a_xy: np.ndarray, b_xy: np.ndarray, side: int, t: np.ndarray, in
         share_a[i] = np.mean(da < db)
     zones = _zone(gap_pt[ok], side)
     zone_pct = {f"{dz}_{lz}": round(100 * sum(z == (dz, lz) for z in zones) / n, 1) for dz, lz in ZONES}
+    # cells that exactly tile the half: with fixed 0.5 m cells the last 0.2 m next to
+    # the net fell outside the grid, and that strip is where most holes are
+    y0 = 0.0 if side == 0 else NET_Y
     gap_hist, xe, ye = np.histogram2d(gap_pt[ok, 0], gap_pt[ok, 1],
-                                      bins=[np.arange(0, WIDTH + 1e-9, 0.5),
-                                            np.arange(0, NET_Y + 1e-9, 0.5) + (0 if side == 0 else NET_Y)])
+                                      bins=[np.linspace(0, WIDTH, 13), np.linspace(y0, y0 + NET_Y, 14)])
 
     def pct(m):
         return round(100 * float(m.sum()) / n, 1)
@@ -134,10 +137,12 @@ def pair_report(a_xy: np.ndarray, b_xy: np.ndarray, side: int, t: np.ndarray, in
                       "p10": round(float(np.percentile(dist[ok], 10)), 2),
                       "p90": round(float(np.percentile(dist[ok], 90)), 2),
                       "too_close_pct": pct(ok & (dist < CLOSE_M)), "too_far_pct": pct(ok & (dist > FAR_M))},
+        "position": {"mean_xy": [[round(float(v), 2) for v in p[ok].mean(0)] for p in (a_xy, b_xy)],
+                     "heatmap": [heatmap(p[ok], side) for p in (a_xy, b_xy)]},
         "open_court": {"mean_gap_m": round(float(np.nanmean(gap_dist[ok])), 2),
                        "p90_gap_m": round(float(np.nanpercentile(gap_dist[ok], 90)), 2),
                        "biggest_gap_zone_pct": zone_pct,
-                       "heatmap": {"x_edges": xe.tolist(), "y_edges": ye.tolist(), "counts": gap_hist.T.astype(int).tolist()}},
+                       "heatmap": {"x_edges": xe.round(3).tolist(), "y_edges": ye.round(3).tolist(), "counts": gap_hist.T.astype(int).tolist()}},
         "coverage_pct": {names[0]: round(100 * float(np.nanmean(share_a[ok])), 1),
                          names[1]: round(100 * (1 - float(np.nanmean(share_a[ok]))), 1)},
         "_series": {"angle": angle, "dist": dist, "ok": ok, "gap_pt": gap_pt},
@@ -181,13 +186,29 @@ def json_ready(rep: dict) -> dict:
     return {k: v for k, v in rep.items() if not k.startswith("_")}
 
 
+PAIR_COLORS = ("#ff9f1c", "#c77dff")  # the two partners on the card
+
+
+def _zone_rect(zone: str, side: int) -> tuple[float, float, float, float]:
+    """(x, y, width, height) in court metres of a "front_left"-style zone of one half."""
+    dz, lz = zone.split("_")
+    k = ("front", "mid", "back").index(dz)
+    third = NET_Y / 3
+    y = NET_Y - (k + 1) * third if side == 0 else NET_Y + k * third
+    x = 0.0 if (lz == "left") == (side == 0) else WIDTH / 2
+    return x, y, WIDTH / 2, third
+
+
 def render_pair_card(rep: dict, out_path) -> None:
-    """Half court with the biggest-gap heatmap, plus the key numbers."""
+    """Court with where the two partners stood (one colour each) and the zone where
+    the biggest hole usually was, plus the key numbers."""
     import matplotlib
 
     matplotlib.use("Agg")
     import cv2
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, to_rgba
+    from matplotlib.patches import Rectangle
 
     from .card import _setup_font, draw_court
 
@@ -195,20 +216,33 @@ def render_pair_card(rep: dict, out_path) -> None:
     fig = plt.figure(figsize=(8, 6), dpi=150)
     ax = fig.add_axes([0.02, 0.03, 0.45, 0.9])
     draw_court(ax)
+    side = 0 if rep["side"] == "near" else 1
+    zone = None
     if "open_court" in rep:
-        hm = rep["open_court"]["heatmap"]
-        c = np.asarray(hm["counts"], float)
-        if c.max() > 0:
-            dens = cv2.GaussianBlur(c, (0, 0), 1.0)
+        zone = max(rep["open_court"]["biggest_gap_zone_pct"], key=rep["open_court"]["biggest_gap_zone_pct"].get)
+        x, y, w, h = _zone_rect(zone, side)
+        ax.add_patch(Rectangle((x, y), w, h, facecolor=to_rgba("#9bd1ff", 0.22), edgecolor="#d6ecff", lw=1.4,
+                               ls=(0, (4, 3)), zorder=2))
+        ax.text(x + w / 2, y + h / 2, "空当" if zh else "gap", color="#eaf5ff", fontsize=9, ha="center",
+                va="center", zorder=5)
+    if "position" in rep:
+        for hm, mean, pid, color in zip(rep["position"]["heatmap"], rep["position"]["mean_xy"], rep["ids"], PAIR_COLORS):
+            c = np.asarray(hm["counts"], float)
+            if not c.size or c.max() <= 0:
+                continue
+            dens = cv2.GaussianBlur(c, (0, 0), 2.0)  # 2 cells = 0.5 m, as on the movement card
             dens /= dens.max()
-            ax.pcolormesh(hm["x_edges"], hm["y_edges"], np.ma.masked_where(dens < 0.05, dens), cmap="Blues",
-                          alpha=0.85, zorder=2, vmin=0, vmax=1)
+            cmap = LinearSegmentedColormap.from_list("p", [to_rgba(color, 0.0), to_rgba(color, 0.9)])
+            ax.pcolormesh(hm["x_edges"], hm["y_edges"], np.ma.masked_where(dens < 0.08, dens), cmap=cmap,
+                          zorder=3, shading="flat", vmin=0, vmax=1)
+            ax.plot(*mean, "o", ms=13, color=color, mec="white", mew=1.2, zorder=6)
+            ax.text(mean[0], mean[1], str(pid), color="black", fontsize=8, weight="bold", ha="center",
+                    va="center_baseline", zorder=7)
     fig.text(0.52, 0.9, " / ".join(rep["names"]), fontsize=18, weight="semibold")
-    side = ("近端" if rep["side"] == "near" else "远端") if zh else rep["side"]
-    fig.text(0.52, 0.85, ("双打站位报告 · " if zh else "Doubles positioning · ") + side, fontsize=10, color="#555")
+    side_txt = ("近端" if rep["side"] == "near" else "远端") if zh else rep["side"]
+    fig.text(0.52, 0.85, ("双打站位报告 · " if zh else "Doubles positioning · ") + side_txt, fontsize=10, color="#555")
     if "formation_pct" in rep:
         f, r, s_, o = rep["formation_pct"], rep["rotations"], rep["spacing_m"], rep["open_court"]
-        zone = max(o["biggest_gap_zone_pct"], key=o["biggest_gap_zone_pct"].get)
         dz, lz = zone.split("_")
         cov = list(rep["coverage_pct"].values())
         rows = [
@@ -227,7 +261,12 @@ def render_pair_card(rep: dict, out_path) -> None:
             fig.text(0.52, y, k, fontsize=11, color="#555")
             fig.text(0.95, y, v, fontsize=14, weight="semibold", ha="right")
             y -= 0.07
-    fig.text(0.52, 0.04, ("蓝色：最大空当出现的位置（离两人都最远的点）；只统计回合内时间" if zh else
-                          "Blue: where the biggest open space was; in-play time only"), fontsize=8, color="#888")
+        for n, (name, color) in enumerate(zip(rep["names"], PAIR_COLORS)):
+            fig.text(0.52 + 0.2 * n, y - 0.01, "●", fontsize=12, color=color)
+            fig.text(0.545 + 0.2 * n, y - 0.01, name, fontsize=10, color="#333")
+    fig.text(0.52, 0.055, "色块：两人回合内站的位置，圆点是平均位置" if zh else "Colours: where each partner stood; dot = mean",
+             fontsize=8, color="#888")
+    fig.text(0.52, 0.03, "虚线框：最大空当最常出现的区域（左右按球员面向球网）" if zh else
+             "Dashed box: where the biggest open space usually was", fontsize=8, color="#888")
     fig.savefig(out_path, facecolor="white")
     plt.close(fig)
