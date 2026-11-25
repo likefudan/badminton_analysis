@@ -99,3 +99,29 @@ def test_cli_movement_and_positioning_on_synthetic_doubles(camera, tmp_path):
     assert (tmp_path / "doubles.positioning.near.png").exists()
     mv = json.loads((tmp_path / "doubles.movement.json").read_text())
     assert len(mv["players"]) == 4
+
+
+def test_position_heatmap_and_gap_cells_cover_the_whole_half(tmp_path):
+    """The card draws where the pair stood. The gap cells must reach the net: a hole
+    in the last 0.2 m before the net used to fall outside the grid on the near half."""
+    from badminton.positioning import _zone_rect, render_pair_card
+
+    t = np.arange(0, 3, 1 / FPS)
+    one = np.ones(len(t), bool)
+    for side, a0, b0 in ((0, [1.5, 1.0], [4.5, 1.2]), (1, [1.5, 12.4], [4.5, 12.2])):
+        rep = pair_report(np.tile([a0], (len(t), 1)), np.tile([b0], (len(t), 1)), side, t, one, (1, 2), ("A", "B"))
+        gap = rep["open_court"]["heatmap"]
+        assert np.sum(gap["counts"]) == len(t)  # nothing dropped
+        assert abs(gap["y_edges"][-1] - gap["y_edges"][0] - 6.7) < 1e-6
+        assert np.allclose(rep["position"]["mean_xy"], [a0, b0], atol=0.01)
+        for hm, (x, y) in zip(rep["position"]["heatmap"], (a0, b0)):
+            c = np.asarray(hm["counts"])
+            row, col = np.unravel_index(c.argmax(), c.shape)
+            assert hm["x_edges"][col] <= x <= hm["x_edges"][col + 1]
+            assert hm["y_edges"][row] <= y <= hm["y_edges"][row + 1]
+        render_pair_card(rep, tmp_path / f"{side}.png")
+        assert (tmp_path / f"{side}.png").stat().st_size > 10_000
+    # zones are drawn from the pair's own view: the far pair's left is the camera's right
+    assert _zone_rect("front_left", 0) == (0.0, 6.7 * 2 / 3, 3.05, 6.7 / 3)
+    assert _zone_rect("front_left", 1)[:2] == (3.05, 6.7)
+    assert _zone_rect("back_right", 1)[:2] == (0.0, 6.7 + 2 * 6.7 / 3)
