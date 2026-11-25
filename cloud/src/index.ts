@@ -1,4 +1,4 @@
-import { identify, publicApi, teamApi, requireTaskOn, guardLabelWrite, isAdmin, meJson, type Who } from "./team";
+import { identify, publicApi, teamApi, requireTaskOn, guardLabelWrite, isAdmin, isViewer, meJson, type Who } from "./team";
 
 // ba.llmat.dev 后端。阶段 0：录像分片上传到 R2，可断点续传。
 // 接口在 /api/v1 下，用 Bearer 口令登录；网页、将来的 App 和 Mac 处理节点共用。
@@ -1339,16 +1339,21 @@ async function rallyLabelsSynced(req: Request, env: Env, id: string): Promise<Re
   return json({ ok: true });
 }
 
-async function listVideos(env: Env): Promise<Response> {
+// 给超级管理员以外的人看的录像：不带 AI 的 token 用量和花费
+const forViewer = <T extends { ai: unknown[] }>(v: T): T => ({ ...v, ai: [] });
+
+async function listVideos(env: Env, viewer = false): Promise<Response> {
   const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .bind(USER_ID)
     .all<VideoRow>();
   const node = await env.DB.prepare("SELECT name, seen_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 1")
     .bind(USER_ID)
     .first<{ name: string; seen_at: string }>();
+  const list = await Promise.all(rows.results.map((v) => describe(env, v)));
   return json({
-    videos: await Promise.all(rows.results.map((v) => describe(env, v))),
-    node: node ? { name: node.name, seenAt: node.seen_at } : null,
+    // 别人只看得到已经有结果的录像（还在上传、排队、第一次处理中的不显示）
+    videos: viewer ? list.filter((v) => v.results.length > 0).map(forViewer) : list,
+    node: node && !viewer ? { name: node.name, seenAt: node.seen_at } : null,
     now: new Date().toISOString(), // 手机时钟可能不准，时间差都按服务器时间算
   });
 }
@@ -1467,6 +1472,23 @@ async function macStatus(env: Env): Promise<Response> {
   });
 }
 
+// 超级管理员以外的成员（普通用户、标注员、管理员）看分析结果：只有下面四个读接口。
+// 普通用户（viewer）只有这些；别的（上传、删除、改标题、重跑、AI 报告和追问、标胜负、分析区域、设置、Mac 状态）
+// 只有超级管理员能用。新加接口时不用管这里：没列进来的就是不能用。不归这里管的返回 null。
+async function readOnlyApi(req: Request, env: Env, path: string): Promise<Response | null> {
+  if (req.method === "GET") {
+    if (path === "/videos") return listVideos(env, true);
+    let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
+    if (match) return json(forViewer(await describe(env, await getVideo(env, match[1]))));
+    match = path.match(/^\/videos\/([0-9a-f-]{36})\/results\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);
+    if (match) return getResult(req, env, match[1], match[2]);
+    // 手动标的回合胜负：网页拿它盖在程序的判断上，别人看到的比分才和超级管理员一样
+    match = path.match(/^\/videos\/([0-9a-f-]{36})\/rally-labels$/);
+    if (match) return getRallyLabels(env, match[1]);
+  }
+  return null;
+}
+
 // 标注员（不是管理员）能用的接口：自己领过任务的录像的标注材料和标注
 const ANNOTATOR_PATHS = /^\/videos\/([0-9a-f-]{36})\/(annot\/files\/[^/]+|strokes\/files\/[^/]+|labels|stroke-labels)$/;
 
@@ -1480,8 +1502,12 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   const team = await teamApi(req, env, path, who);
   if (team) return team;
   if (!who.owner) {
-    // 不是超级管理员：只有标注这一边。管理员能看所有录像的标注材料和进度，标注员只能读自己领过任务的录像的
+    // 不是超级管理员：分析结果只能看；标注员和管理员另外有标注这一边。
+    // 管理员能看所有录像的标注材料和进度，标注员只能读自己领过任务的录像的
     if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+    const read = await readOnlyApi(req, env, path);
+    if (read) return read;
+    if (isViewer(who)) throw new HttpError(403, "这个账号只能看，不能改");
     if (isAdmin(who) && path === "/labeling/videos" && m === "GET") return listLabelingVideos(env);
     const allowed = path.match(ANNOTATOR_PATHS);
     const write = allowed && m === "PUT" && !allowed[2].includes("/");

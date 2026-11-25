@@ -288,6 +288,8 @@
   body.annotator .adminOnly { display: none !important; }
   body:not(.owner) .ownerOnly { display: none !important; }
   body.owner .notOwner { display: none; }
+  /* 普通用户（只能看）：没有标注这一边。改东西的入口是 ownerOnly，只有超级管理员看得到 */
+  body.viewer .noViewer { display: none !important; }
   /* 顶部导航 */
   #nav { display: flex; align-items: center; gap: 10px; margin: -4px 0 14px; }
   body.labeling #nav { display: none; }
@@ -357,8 +359,8 @@
     <nav id="nav">
       <a class="home" id="navHome" href="#/"><img src="/logo.svg" alt=""><span>Badminton Analysis</span></a>
       <div class="areas">
-        <a href="#/" id="navAnalysis" class="ownerOnly">分析</a>
-        <a href="#/tasks" id="navLabeling">标注</a>
+        <a href="#/" id="navAnalysis">分析</a>
+        <a href="#/tasks" id="navLabeling" class="noViewer">标注</a>
       </div>
       <details id="navMenu">
         <summary aria-label="账号"><span id="navAvatar"></span></summary>
@@ -376,10 +378,10 @@
     <!-- 首页：我的录像 -->
     <div class="view" id="vHome">
       <div class="top"><h1>我的录像</h1></div>
-      <a class="pick" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
+      <a class="pick ownerOnly" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
       <div class="chips" id="filters"></div>
       <div id="list"><div class="empty">读取中</div></div>
-      <p class="quiet" id="nodeLine" style="margin-top:14px"></p>
+      <p class="quiet ownerOnly" id="nodeLine" style="margin-top:14px"></p>
     </div>
 
     <!-- 上传 -->
@@ -428,17 +430,17 @@
     <div class="view" id="vDetail" hidden>
       <div class="top"><a href="#/">‹ 我的录像</a><h1></h1></div>
       <section class="card" id="detail">
-        <div id="dTitleRow"><h2 id="dTitle"></h2><a id="dRename">改标题</a></div>
+        <div id="dTitleRow"><h2 id="dTitle"></h2><a id="dRename" class="ownerOnly">改标题</a></div>
         <div id="dRenameBox" class="row" hidden><input type="text" id="dTitleInput" maxlength="80"><button id="dTitleSave" style="flex:none;width:auto;padding:10px 16px">保存</button></div>
         <p class="quiet" id="dMeta"></p>
         <p id="dStatus"></p>
         <div class="tabs" id="tabs">
-          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process">处理</button>
+          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process" class="ownerOnly">处理</button>
         </div>
         <div id="tOverview"><div id="dStats"></div><div id="dReview"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
         <div id="tVideos" hidden></div>
         <div id="tCards" hidden></div>
-        <div id="tProcess" hidden>
+        <div id="tProcess" class="ownerOnly" hidden>
           <p id="dError" class="bad" hidden></p>
           <div id="dProgress"></div>
           <div class="row">
@@ -499,8 +501,10 @@
       <div class="top"><h1>成员</h1></div>
       <section class="card">
         <h2>邀请</h2>
-        <p class="quiet">填对方的 Google 邮箱。对方打开网站用 Google 登录就能领任务。没被邀请的人登录后会出现在下面的「申请加入」里，点「允许」也可以。</p>
-        <div class="row"><input type="text" id="mEmail" inputmode="email" autocapitalize="off" placeholder="name@gmail.com"><button id="mAdd" style="flex:none;width:auto;padding:10px 16px">邀请</button></div>
+        <p class="quiet">填对方的 Google 邮箱。对方打开网站用 Google 登录就能进。没被邀请的人登录后会出现在下面的「申请加入」里，在那里放行也可以。</p>
+        <p class="quiet">「普通用户」只能看：能看所有录像的分析结果、播放和保存视频，但不能上传、删除、重新处理、追问 AI。「标注员」在这之上还能领标注任务。</p>
+        <input type="text" id="mEmail" inputmode="email" autocapitalize="off" placeholder="name@gmail.com">
+        <div class="row"><button id="mAddViewer">邀请为普通用户（只能看）</button><button id="mAdd" class="plain">邀请为标注员</button></div>
         <p class="bad" id="mError" hidden></p>
       </section>
       <div id="mList"><div class="empty">读取中</div></div>

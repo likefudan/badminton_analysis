@@ -49,6 +49,7 @@ const as = (cookie) => ({
   get: (path) => fetch(BASE + path, { headers: { cookie } }),
   post: (path, body) => fetch(BASE + path, { method: "POST", headers: { cookie, "x-ba": "1", ...json }, body: JSON.stringify(body ?? {}) }),
   put: (path, body) => fetch(BASE + path, { method: "PUT", headers: { cookie, "x-ba": "1", ...json }, body: JSON.stringify(body ?? {}) }),
+  send: (method, path, body) => fetch(BASE + path, { method, headers: { cookie, "x-ba": "1", ...json }, body: JSON.stringify(body ?? {}) }),
 });
 const cookieFrom = (res, name) => {
   const c = res.headers.getSetCookie().find((x) => x.startsWith(name + "="));
@@ -146,7 +147,7 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   assert.equal(a.location, "/");
   const alice = as(a.cookie);
   let me = await (await alice.get("/me")).json();
-  assert.deepEqual([me.email, me.name, me.role, me.status, me.via], ["alice@example.com", "Alice", "annotator", "pending", "google"]);
+  assert.deepEqual([me.email, me.name, me.role, me.status, me.via], ["alice@example.com", "Alice", "viewer", "pending", "google"]);
   assert.equal((await alice.get("/tasks")).status, 403);
   assert.equal((await alice.get("/videos")).status, 403);
   assert.equal((await alice.post("/auth/claim-admin", { password: "nope" })).status, 403);
@@ -172,7 +173,7 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
 
   // 邀请 bob；carol 自己登录后出现在申请里，管理员放行
   assert.equal((await alice.post("/admin/users", { email: "not-an-email" })).status, 400);
-  assert.equal((await alice.post("/admin/users", { email: "Bob@Example.com" })).status, 200);
+  assert.equal((await alice.post("/admin/users", { email: "Bob@Example.com", role: "annotator" })).status, 200);
   const bob = as((await login("bob@example.com")).cookie);
   assert.deepEqual((({ role, status }) => [role, status])(await (await bob.get("/me")).json()), ["annotator", "active"]);
   const c = await login("carol@example.com");
@@ -180,14 +181,60 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   assert.equal((await carol.get("/tasks")).status, 403);
   let users = (await (await alice.get("/admin/users")).json()).users;
   assert.deepEqual(users.map((u) => [u.email, u.role, u.status]), [
-    ["carol@example.com", "annotator", "pending"], ["alice@example.com", "admin", "active"], ["bob@example.com", "annotator", "active"],
+    ["carol@example.com", "viewer", "pending"], ["alice@example.com", "admin", "active"], ["bob@example.com", "annotator", "active"],
   ]);
   assert.equal(users[1].frames, 3); // 以前没署名的标注记到第一个管理员名下
-  assert.equal((await alice.post("/admin/users", { email: "carol@example.com", status: "active" })).status, 200);
+  assert.equal((await alice.post("/admin/users", { email: "carol@example.com", status: "active", role: "annotator" })).status, 200);
   assert.equal((await carol.get("/tasks")).status, 200);
 
-  // 标注员：看不到录像、设置、成员，不能改标注材料；没领任务读不了材料
-  for (const path of ["/videos", `/videos/${vid}`, "/ai", "/status", "/admin/users", "/labeling/videos"]) assert.equal((await bob.get(path)).status, 403, path);
+  // 普通用户 dave（邀请时不说角色就是普通用户）：只能看有结果的录像、结果文件和回合胜负，别的都不行
+  assert.equal((await alice.post("/admin/users", { email: "dave@example.com" })).status, 200);
+  const dave = as((await login("dave@example.com")).cookie);
+  assert.deepEqual((({ role, status, owner }) => [role, status, owner])(await (await dave.get("/me")).json()), ["viewer", "active", false]);
+  assert.deepEqual((await (await dave.get("/videos")).json()).videos, []); // 还没有结果的录像不显示
+  assert.equal((await call(`/videos/${vid}/results/points.json`, { method: "PUT", headers: json, body: JSON.stringify({ rallies: [] }) })).status, 200);
+  assert.equal((await call(`/videos/${vid}/results/combined.mp4`, { method: "PUT", headers: { "content-type": "video/mp4" }, body: randomBytes(300) })).status, 200);
+  await sql(`INSERT INTO ai_usage (user_id, video_id, kind, model, input_tokens, output_tokens, cost_usd, created_at) VALUES ('owner', '${vid}', 'report', 'm', 10, 20, 0.5, '2026-01-01T00:00:00.000Z')`);
+  assert.equal((await (await alice.get(`/videos/${vid}`)).json()).ai.length, 1);
+  const seen = await (await dave.get("/videos")).json();
+  assert.deepEqual([seen.videos.map((x) => x.id), seen.videos[0].ai, seen.node], [[vid], [], null]); // 不带 token 用量和 Mac 的名字
+  assert.deepEqual((await (await dave.get(`/videos/${vid}`)).json()).ai, []);
+  assert.deepEqual(await (await dave.get(`/videos/${vid}/results/points.json`)).json(), { rallies: [] });
+  const saved = await dave.get(`/videos/${vid}/results/combined.mp4?download=1`); // 保存视频
+  assert.equal(saved.status, 200);
+  assert.match(saved.headers.get("content-disposition"), /^attachment/);
+  assert.equal((await saved.arrayBuffer()).byteLength, 300);
+  assert.equal((await dave.get(`/videos/${vid}/rally-labels`)).status, 200);
+  for (const path of ["/ai", "/status", "/tasks", "/admin/users", "/labeling/videos", `/videos/${vid}/file`, `/videos/${vid}/labels`, `/videos/${vid}/stroke-labels`,
+    `/videos/${vid}/annot/files/state.json`, `/videos/${vid}/strokes/files/strokes.state.json`]) assert.equal((await dave.get(path)).status, 403, path);
+  for (const [path, body] of [
+    ["/videos", { filename: "x.mp4", size: 10, contentType: "video/mp4" }],   // 上传
+    [`/videos/${vid}/complete`], [`/videos/${vid}/job/retry`], [`/videos/${vid}/job/retry`, { only: "cards" }],   // 重新处理、只更新卡片
+    [`/videos/${vid}/review`], [`/videos/${vid}/review/ask`, { question: "hi" }],   // AI 报告、追问
+    [`/videos/${vid}/annot`], [`/videos/${vid}/strokes`], [`/videos/${vid}/original/release`], [`/videos/${vid}/job`, { status: "done" }],
+    ["/node/claim", { node: "x" }], ["/node/status", {}], ["/session"], ["/admin/users", { email: "dave@example.com", role: "admin" }],
+    [`/tasks/${rally2.id}/claim`],
+  ]) assert.equal((await dave.post(path, body)).status, 403, path);
+  for (const path of [`/videos/${vid}/rally-labels`, `/videos/${vid}/labels`, `/videos/${vid}/stroke-labels`, `/videos/${vid}/results/points.json`, `/videos/${vid}/parts/1`, "/ai/settings"])
+    assert.equal((await dave.put(path, { items: [] })).status, 403, path);
+  for (const [method, path] of [["DELETE", `/videos/${vid}`], ["PATCH", `/videos/${vid}`], ["DELETE", `/videos/${vid}/annot`], ["DELETE", `/videos/${vid}/strokes`]])
+    assert.equal((await dave.send(method, path, { title: "x" })).status, 403, method + path);
+  assert.equal((await (await alice.get(`/videos/${vid}`)).json()).title, ""); // 什么都没被改
+  // 改成标注员就能领任务，改回普通用户：手上的任务放回大厅
+  await alice.post("/admin/users", { email: "dave@example.com", role: "annotator" });
+  assert.equal((await dave.post(`/tasks/${strokes2.id}/claim`)).status, 200);
+  await alice.post("/admin/users", { email: "dave@example.com", role: "viewer" });
+  assert.equal((await dave.get("/tasks")).status, 403);
+  assert.equal((await (await alice.get("/tasks")).json()).tasks.find((x) => x.id === strokes2.id).status, "open");
+  await alice.post("/admin/users/remove", { email: "dave@example.com" });
+  assert.equal((await dave.get("/me")).status, 401);
+
+  // 标注员：分析结果和普通用户一样只能看；看不到设置、成员，不能改标注材料；没领任务读不了材料
+  for (const path of ["/videos", `/videos/${vid}`, `/videos/${vid}/results/points.json`]) assert.equal((await bob.get(path)).status, 200, path);
+  for (const path of ["/ai", "/status", "/admin/users", "/labeling/videos"]) assert.equal((await bob.get(path)).status, 403, path);
+  assert.equal((await bob.post(`/videos/${vid}/job/retry`)).status, 403);
+  assert.equal((await bob.post(`/videos/${vid}/review/ask`, { question: "hi" })).status, 403);
+  assert.equal((await bob.send("DELETE", `/videos/${vid}`)).status, 403);
   assert.equal((await bob.post("/admin/users", { email: "eve@example.com" })).status, 403);
   assert.equal((await bob.post(`/videos/${vid}/annot`)).status, 403);
   assert.equal((await bob.put(`/videos/${vid}/annot/files/state.json`, {})).status, 403);
@@ -209,9 +256,9 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
   assert.equal((await putLabel(alice, 51)).status, 409);      // 管理员也不能写别人正在标的
   assert.equal((await putLabel(alice, 10)).status, 200);      // 别的地方管理员可以改
   assert.equal((await bob.put(`/videos/${vid}/stroke-labels`, { items: [{ frame: 100, type: "杀球" }] })).status, 403);
-  // 回合谁赢只有超级管理员能看能改，标注员不行
+  // 回合谁赢只有超级管理员能改，别人只能看
   assert.equal((await bob.put(`/videos/${vid}/rally-labels`, { items: [{ frame: 100, winner: "near" }] })).status, 403);
-  assert.equal((await bob.get(`/videos/${vid}/rally-labels`)).status, 403);
+  assert.equal((await bob.get(`/videos/${vid}/rally-labels`)).status, 200);
   list = await (await carol.get("/tasks")).json();
   assert.ok(!list.tasks.some((t) => t.id === rally2.id)); // 别人领走的不显示
 
@@ -326,12 +373,13 @@ test("超级管理员：用 ADMIN_GOOGLE_EMAIL 登录直接是管理员，不能
     assert.equal((await boss.post("/admin/users", { email: "dave@example.com", role: "admin" })).status, 200);
     const dave = await signIn("dave@example.com");
     assert.equal((await dave.get("/admin/users")).status, 200);
-    // 别的管理员只有标注这一边：能看素材和进度，不能看录像、上传、设置，也不能让 Mac 准备材料
+    // 别的管理员：标注这一边能看素材和进度；分析结果只能看，不能上传、看设置，也不能让 Mac 准备材料
     assert.equal((await (await dave.get("/me")).json()).owner, false);
     assert.equal(me.owner, true);
     assert.deepEqual((await (await dave.get("/labeling/videos")).json()).videos, []);
     assert.equal((await dave.get("/tasks")).status, 200);
-    for (const path of ["/videos", "/ai", "/status"]) assert.equal((await dave.get(path)).status, 403, path);
+    assert.deepEqual((await (await dave.get("/videos")).json()).videos, []);
+    for (const path of ["/ai", "/status"]) assert.equal((await dave.get(path)).status, 403, path);
     assert.equal((await dave.post("/videos", { filename: "a.mp4", size: 10 })).status, 403);
     assert.equal((await dave.post("/videos/00000000-0000-0000-0000-000000000000/annot")).status, 403);
     assert.equal((await dave.get("/videos/00000000-0000-0000-0000-000000000000/labels")).status, 404); // 过了权限，只是没有这段录像
