@@ -57,3 +57,18 @@ def test_sampler_keeps_a_bounded_history_and_drops_a_stale_reading():
     assert out["now"] == {"cpu": 4.0, "gpu": 1.0}
     s.samples[-1]["t"] -= 60                     # the reader stopped a minute ago
     assert s.to_json()["now"] == {}
+
+
+def test_macmon_0_12_busy_share_is_preferred_over_the_frequency_scaled_one():
+    # trimmed from a real `macmon pipe` line (macmon 0.12.1, M5: 6 E + 4 S cores)
+    line = json.dumps({
+        "ecpu_active_ratio": 0.047602, "ecpu_usage": [2253, 0.032199],
+        "pcpu_active_ratio": 0.391838, "pcpu_usage": [3253, 0.285642],
+        "gpu_active_ratio": 0.25, "gpu_usage": [1200, 0.1],
+        "ane_power": 2.759435, "cpu_power": 5.196643, "gpu_power": 0.0, "all_power": 10.283924,
+        "memory": {"ram_total": 25769803776, "ram_usage": 16308387840},
+        "temp": {"cpu_temp_avg": 75.418869, "gpu_temp_avg": 74.09375}})
+    s = metrics.parse_macmon(line, cores=(4, 6))
+    assert s["ecpu"] == 4.8 and s["pcpu"] == 39.2 and s["gpu"] == 25.0
+    assert s["cpu"] == 18.6                      # (39.2 * 4 + 4.8 * 6) / 10
+    assert s["anePowerW"] == 2.76 and s["memTotalGb"] == 24.0

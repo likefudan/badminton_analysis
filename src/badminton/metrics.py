@@ -66,7 +66,14 @@ def parse_macmon(line: str, cores: tuple[int | None, int | None] = (None, None))
     if not isinstance(d, dict):
         return None
     out: dict = {}
-    ecpu, pcpu = _percent(d.get("ecpu_usage")), _percent(d.get("pcpu_usage"))
+    # macmon 0.12+ also gives *_active_ratio: the share of time the cores were busy, as Activity Monitor
+    # counts it. *_usage is that share scaled down by how far below top speed they ran; older versions
+    # only have *_usage.
+    def busy(name: str):
+        v = d.get(f"{name}_active_ratio")
+        return _percent(v if isinstance(v, (int, float)) else d.get(f"{name}_usage"))
+
+    ecpu, pcpu = busy("ecpu"), busy("pcpu")
     if ecpu is not None:
         out["ecpu"] = ecpu
     if pcpu is not None:
@@ -76,7 +83,7 @@ def parse_macmon(line: str, cores: tuple[int | None, int | None] = (None, None))
         out["cpu"] = round((pcpu * p + ecpu * e) / (p + e), 1)
     elif pcpu is not None or ecpu is not None:
         out["cpu"] = pcpu if pcpu is not None else ecpu
-    gpu = _percent(d.get("gpu_usage"))
+    gpu = busy("gpu")
     if gpu is not None:
         out["gpu"] = gpu
     for key, name in (("ane_power", "anePowerW"), ("cpu_power", "cpuPowerW"), ("gpu_power", "gpuPowerW"),

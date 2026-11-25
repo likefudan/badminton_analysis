@@ -157,11 +157,13 @@ def test_the_node_reports_its_status_while_it_waits(tmp_path, monkeypatch):
         class Stop(Exception):
             pass
 
+        import time as real
+        real_sleep = real.sleep   # node.time is this same module: once patched, real.sleep is the fake below
+
         def sleep(seconds):   # the node's wait between two questions for work: by then a report has gone out
-            import time as real
             deadline = real.monotonic() + 5
             while not cloud.statuses and real.monotonic() < deadline:
-                real.sleep(0.01)
+                real_sleep(0.01)
             raise Stop
 
         monkeypatch.setattr(node.time, "sleep", sleep)

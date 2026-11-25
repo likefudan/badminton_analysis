@@ -34,7 +34,19 @@ class Launchctl:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setattr(service.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(service, "_alive", lambda pid: False)   # the fake pids are not real processes
     return tmp_path
+
+
+def test_stop_waits_until_the_process_is_gone(home, monkeypatch):
+    # launchctl bootout returns at once; the node may still be handing its job back
+    ctl = Launchctl()
+    service.install(service.NODE, ["node"], run=ctl)
+    asked = []
+    monkeypatch.setattr(service, "_alive", lambda pid: asked.append(pid) or len(asked) < 3)
+    monkeypatch.setattr(service.time, "sleep", lambda s: None)
+    service.stop(service.NODE, ctl)
+    assert asked == [4242, 4242, 4242]
 
 
 def test_install_writes_the_definition_and_starts(home):

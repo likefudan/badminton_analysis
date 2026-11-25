@@ -16,6 +16,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 NODE = "dev.llmat.badminton.node"
@@ -94,13 +95,35 @@ def state(label: str, run=subprocess.run) -> dict:
     return out
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _bootout(label: str, run=subprocess.run, timeout: float = EXIT_TIMEOUT + 5) -> subprocess.CompletedProcess:
+    """``launchctl bootout`` returns at once, while the process may still be finishing (the node hands
+    its job back first). This waits until it is gone, at most ``timeout`` seconds: launchd kills it
+    after EXIT_TIMEOUT."""
+    pid = state(label, run)["pid"]
+    res = _run(["launchctl", "bootout", f"{domain()}/{label}"], run)
+    deadline = time.monotonic() + timeout
+    while pid and _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    return res
+
+
 def install(label: str, args: list[str], run=subprocess.run) -> Path:
     """Write the service's definition (again) and start it. A running one is restarted with the new definition."""
     path = plist_path(label)
     path.parent.mkdir(parents=True, exist_ok=True)
     log_dir().mkdir(parents=True, exist_ok=True)
     if state(label, run)["loaded"]:
-        _run(["launchctl", "bootout", f"{domain()}/{label}"], run)
+        _bootout(label, run)
     path.write_bytes(plistlib.dumps(definition(label, args)))
     start(label, run)
     return path
@@ -108,7 +131,7 @@ def install(label: str, args: list[str], run=subprocess.run) -> Path:
 
 def uninstall(label: str, run=subprocess.run) -> None:
     if state(label, run)["loaded"]:
-        _run(["launchctl", "bootout", f"{domain()}/{label}"], run)
+        _bootout(label, run)
     plist_path(label).unlink(missing_ok=True)
 
 
@@ -129,7 +152,7 @@ def start(label: str, run=subprocess.run) -> None:
 def stop(label: str, run=subprocess.run) -> None:
     """Returns when the process is gone (at most EXIT_TIMEOUT seconds later)."""
     if state(label, run)["loaded"]:
-        res = _run(["launchctl", "bootout", f"{domain()}/{label}"], run)
+        res = _bootout(label, run)
         if res.returncode != 0 and state(label, run)["loaded"]:
             raise RuntimeError((res.stderr or res.stdout).strip() or f"launchctl 返回 {res.returncode}")
 
