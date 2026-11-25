@@ -28,6 +28,8 @@
 | `POST /node/claim` | 处理节点领取一个排队中的录像（节点失联 10 分钟后可被重新领取） |
 | `POST /node/status` | 节点每半分钟上报一次这台 Mac 的状态（当前作业、后台任务和日志、机器负载），原样存成 JSON |
 | `GET /status` | 「Mac 状态」页要的全部内容：各节点最后上报的状态，加上正在做、排队、失败的作业 |
+| `POST /node/agent` | Mac 上的面板服务每 10 秒来一次：交上状态和上一批指令的结果，带走新的指令 |
+| `POST /node/commands` | 网页给 Mac 下指令（`start`、`stop`、`stop-after`、`cancel-stop-after`、`restart`、`update`） |
 | `POST /videos/{id}/job` | 节点汇报进度（`stage` 文字加 `progress` 步骤列表：每步状态、用时、百分比、预计剩余），或以 `done` / `failed` 结束 |
 | `POST /videos/{id}/job/retry` | 重新处理，可以改单打/双打；`{"only": "cards"}` 只重新出卡片和统计，旧结果、视频和 AI 点评都不动 |
 | `POST /videos/{id}/original/release` | 节点下载完原片后调用，云端删掉原片 |
@@ -82,6 +84,7 @@ badminton dashboard install    # 面板也装成后台服务，然后打开 http
 - 「立即停」：launchd 发 SIGTERM，节点结束正在跑的那一步，告诉网站把作业退回队列（不用等 10 分钟租约过期），30 秒内退出。下次启动这一局从头重做（原片已经在 Mac 上，不用重新下载）。
 - 「更新代码并重启」：`git pull --ff-only` 成功后重启节点和面板；拉不下来时节点不动。
 - 利用率来自 `macmon`（`src/badminton/metrics.py`）；没装时 CPU 用 `top`、GPU 用 `ioreg`。macOS 不公开 NPU（神经引擎）的利用率，只有功耗，所以 NPU 显示的是瓦数。节点每半分钟也把一份读数报给网站，`#/mac` 上能看到。
+- 手机上远程看和启停：面板服务每 10 秒向网站报一次它看到的状态（`POST /node/agent`：节点在不在跑、每一步的进度、利用率和最近 10 分钟的曲线），顺便取走网页上点的指令（`POST /node/commands` 记在 D1 的 `node_commands` 表里）并执行，所以 `#/mac` 上也有同样的按钮，点了之后最多等 10 秒生效。Mac 只往外发请求，不对外开端口；指令只能是面板上那几个按钮。节点停着时面板服务还在，所以手机上也能「启动」。面板服务 45 秒没消息时网页不让下指令；指令 90 秒没被取走算失败。
 - 节点把自己的状态写在 `~/badminton_uploads/node_state.json`，面板从这里读，不经过网站。
 
 ## 手机上标注球的位置

@@ -278,6 +278,86 @@ class Dashboard:
         return {"ok": True}
 
 
+REMOTE_INTERVAL = 10.0
+REMOTE_ACTIONS = ("start", "stop", "stop-after", "cancel-stop-after", "restart", "update")
+REMOTE_POINTS = 60      # the ten minutes of curves, thinned out for the phone
+
+
+def thin(history: dict, points: int = REMOTE_POINTS) -> dict:
+    """Every n-th sample, always ending with the newest."""
+    n = len(history.get("t", []))
+    step = max(1, -(-n // points))
+    keep = list(range(n - 1, -1, -step))[::-1]
+    return {k: [v[i] for i in keep] for k, v in history.items()}
+
+
+class Remote:
+    """The phone's way in: every ten seconds the dashboard tells the site what it sees and asks for commands
+    (the buttons of the 「Mac 状态」 page). The Mac only ever calls out; nothing listens for the internet.
+    It runs here and not in the node, so that a stopped node can be started from the phone."""
+
+    def __init__(self, dash: Dashboard, api=None, name: str = "", interval: float = REMOTE_INTERVAL):
+        self.dash = dash
+        self.api = api
+        self.name = name
+        self.interval = interval
+        self.results: list[dict] = []
+        self.last_error = ""
+        self._stop = threading.Event()
+
+    def state(self) -> dict:
+        d = self.dash
+        m = d.sampler.to_json()
+        return {"at": node_status._iso(time.time()), "node": d.node_state(), "busy": d.busy, "error": d.last_error,
+                "metrics": {"source": m["source"], "note": m["note"], "now": m["now"], "history": thin(m["history"])},
+                "system": d.system.get()}
+
+    def sync(self) -> int:
+        """One exchange with the site. Returns how many commands were carried out."""
+        sent, self.results = self.results, []
+        try:
+            got = self.api.json("POST", "/node/agent", {"node": self.name, "state": self.state(), "results": sent}, timeout=20)
+        except Exception:
+            self.results = sent + self.results   # the outcome of a command is not lost with one failed request
+            raise
+        commands = got.get("commands") or []
+        for c in commands:
+            action = str(c.get("action", ""))
+            try:
+                if action not in REMOTE_ACTIONS:   # never anything but the page's own buttons
+                    raise RuntimeError("不认识的指令")
+                self.dash.command(action, {})
+                self.results.append({"id": c.get("id"), "ok": True, "message": "Mac 已收到，开始执行"})
+            except Exception as e:
+                self.results.append({"id": c.get("id"), "ok": False, "message": str(e)[:300]})
+        return len(commands)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            wait = self.interval
+            try:
+                if self.api is None:
+                    cfg = self.dash.cfg()
+                    if cfg is None:          # no token yet: look again in a minute
+                        self._stop.wait(60)
+                        continue
+                    self.api, self.name = node.Api(cfg), cfg.name
+                if self.sync():
+                    wait = 1.0               # say at once that the command arrived, and what it changed
+                self.last_error = ""
+            except Exception as e:           # the site is unreachable, or older than this: keep trying quietly
+                if str(e) != self.last_error:
+                    print(f"和网站同步面板状态失败：{e}")
+                self.last_error = str(e)
+            self._stop.wait(wait)
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, daemon=True, name="remote").start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 def make_server(dash: Dashboard, port: int = PORT) -> ThreadingHTTPServer:
     page = (Path(__file__).with_name("dashboard.html")).read_bytes()
 
@@ -333,6 +413,8 @@ def run(port: int = PORT, open_browser: bool = False) -> int:
     except OSError as e:
         raise SystemExit(f"端口 {port} 用不了（{e}）。面板可能已经在运行：打开 http://localhost:{port}") from None
     dash.sampler.start()
+    remote = Remote(dash)
+    remote.start()
     url = f"http://localhost:{port}"
     print(f"面板在 {url}，只有这台 Mac 能打开。Ctrl+C 退出。")
     if open_browser:
@@ -342,5 +424,6 @@ def run(port: int = PORT, open_browser: bool = False) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        remote.stop()
         dash.sampler.stop()
     return 0
