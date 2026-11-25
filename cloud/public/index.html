@@ -32,6 +32,23 @@
   .bar { height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; margin: 10px 0; }
   .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
   .ok { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .queue { list-style: none; margin: 0 0 12px; padding: 0; }
+  .qitem { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-top: 1px solid var(--line); }
+  .qnum { flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+  .qitem[data-state="done"] .qnum { background: var(--good); }
+  .qitem[data-state="wait"] .qnum { background: none; color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
+  .qitem[data-state="error"] .qnum { background: var(--bad); }
+  .qmain { flex: 1; min-width: 0; }
+  .qname { font-weight: 600; word-break: break-all; }
+  .qmain input { width: 100%; margin-top: 6px; }
+  .qinfo, .qverdict, .qstatus { font-size: 13px; margin-top: 3px; }
+  .qinfo { color: var(--quiet); }
+  .qverdict:empty { display: none; }
+  .qmain .bar { height: 6px; margin: 6px 0 2px; }
+  .qitem[data-state="wait"] .bar { display: none; }
+  .qtools { flex: none; display: flex; gap: 4px; }
+  .qtools button { width: 34px; padding: 6px 0; font-weight: 400; }
+  .qtools button:disabled { opacity: .3; }
   #log { font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--quiet); white-space: pre-wrap; max-height: 220px; overflow: auto; margin: 0; }
   .row { display: flex; gap: 8px; margin-top: 8px; }
   .row > * { flex: 1; }
@@ -358,23 +375,15 @@
     <div class="view" id="vUpload" hidden>
       <div class="top"><a href="#/">‹ 返回</a><h1>上传录像</h1></div>
       <section class="card">
-        <label class="pick" for="file">选择录像</label>
-        <input type="file" id="file" accept="video/*">
+        <label class="pick" for="file">选择录像（可以一次选多个）</label>
+        <input type="file" id="file" accept="video/*" multiple>
         <p class="quiet">从相册选的时候，如果出现“选项”，请选“当前格式”或“原始”，不要选“最兼容”。也可以从“文件”App 里选。上传期间请停在这个页面，插上电源。传完后由家里的 Mac 自动处理。</p>
       </section>
 
       <section class="card" id="info" hidden>
-        <h2>这个文件</h2>
-        <dl>
-          <dt>文件名</dt><dd id="iName"></dd>
-          <dt>大小</dt><dd id="iSize"></dd>
-          <dt>分辨率</dt><dd id="iRes"></dd>
-          <dt>帧率（估计）</dt><dd id="iFps"></dd>
-          <dt>时长</dt><dd id="iDur"></dd>
-          <dt>每分钟大小</dt><dd id="iRate"></dd>
-        </dl>
-        <p id="verdict"></p>
-        <div class="field"><label for="upTitle">标题（可以不填，之后也能改）</label><input type="text" id="upTitle" maxlength="80" placeholder="例如：周六双打第 2 局"></div>
+        <h2 id="qTitle">要上传的录像</h2>
+        <p class="quiet" id="qHint">按下面的顺序一个一个传，可以用 ↑ ↓ 调整。前面的传完就先开始处理，不用等后面的。</p>
+        <ol class="queue" id="queue"></ol>
         <div class="seg" id="mode">
           <label><input type="radio" name="mode" value="singles" checked><span>单打</span></label>
           <label><input type="radio" name="mode" value="doubles"><span>双打</span></label>
@@ -387,12 +396,14 @@
 
       <section class="card" id="progress" hidden>
         <h2 id="pTitle">上传中</h2>
+        <p class="quiet" id="pName" style="word-break:break-all"></p>
         <div class="bar"><div id="pBar"></div></div>
         <dl>
           <dt>已上传</dt><dd id="pBytes"></dd>
           <dt>当前速度</dt><dd id="pSpeed"></dd>
           <dt>平均速度</dt><dd id="pAvg"></dd>
-          <dt>预计剩余</dt><dd id="pEta"></dd>
+          <dt>这一个预计剩余</dt><dd id="pEta"></dd>
+          <dt>全部预计剩余</dt><dd id="pEtaAll"></dd>
           <dt>已用时间</dt><dd id="pElapsed"></dd>
           <dt>重试次数</dt><dd id="pRetries">0</dd>
           <dt>页面进入后台</dt><dd id="pHidden">0 次</dd>
