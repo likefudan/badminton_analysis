@@ -500,18 +500,27 @@ async function updateJob(req: Request, env: Env, id: string): Promise<Response> 
 }
 
 // 重新处理（失败后，或者改了单打/双打、球员名字之后）。节点本地留着原片，所以云端原片删了也能重跑。
+// body.only = "cards"：只重新出跑动卡片和站位卡片（程序更新了画法之后）。旧结果全部留着，节点只把
+// 卡片和统计这几个小文件传上来盖掉旧的；视频、AI 点评都不动。
 async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   const v = await getVideo(env, id);
   if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
-  const options = body?.options ? JSON.stringify(cleanOptions(body.options)) : v.options;
-  // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错。原始画面的截图留着：列表里的封面不空，
-  // 排队时也能接着改分析区域
-  await deleteResults(env, id, ["cover.jpg", "frame.jpg"]);
+  // only 只管这一次：每次都从干净的选项重新写，不会留到下一次重新处理
+  const options: Record<string, unknown> = cleanOptions(body?.options ?? JSON.parse(v.options || "{}"));
+  if (body?.only === "cards") {
+    if (v.job_status !== "done") throw new HttpError(409, "这一段还没有处理完的结果，请用「重新处理」");
+    options.only = "cards";
+  } else {
+    if (body?.only !== undefined) throw new HttpError(400, "only 只能是 cards");
+    // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错。原始画面的截图留着：列表里的封面不空，
+    // 排队时也能接着改分析区域
+    await deleteResults(env, id, ["cover.jpg", "frame.jpg"]);
+  }
   await env.DB.prepare(
     "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
   )
-    .bind(options, new Date().toISOString(), id)
+    .bind(JSON.stringify(options), new Date().toISOString(), id)
     .run();
   return json(await describe(env, await getVideo(env, id)));
 }

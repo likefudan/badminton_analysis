@@ -265,6 +265,17 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal(st.title, "周六双打第 2 局");
   assert.equal((await call(`/videos/${v.id}`, { method: "PATCH", headers: json, body: "{}" })).status, 400);
 
+  // 只更新卡片：回到排队并带上 only，旧结果一个都不删；处理完之前不能用
+  const before = st.results.map((r) => r.name);
+  st = await (await post(`/videos/${v.id}/job/retry`, { only: "cards" })).json();
+  assert.equal(st.job.status, "queued");
+  assert.equal(st.options.only, "cards");
+  assert.deepEqual(st.results.map((r) => r.name), before);
+  assert.equal((await post(`/videos/${v.id}/job/retry`, { only: "cards" })).status, 409);
+  assert.equal((await post(`/videos/${v.id}/job/retry`, { only: "videos" })).status, 400);
+  assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.options.only, "cards");
+  await post(`/videos/${v.id}/job`, { status: "done", stage: "完成" });
+
   // 重新处理：回到排队，可以改单打/双打；旧结果清掉，原始画面的截图（画分析区域用）留着
   assert.equal((await call(`/videos/${v.id}/results/frame.jpg`, { method: "PUT", body: card })).status, 200);
   st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();
