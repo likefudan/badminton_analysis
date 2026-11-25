@@ -212,6 +212,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--work-dir", help="原片和结果放在哪，默认 ~/badminton_uploads")
     s.add_argument("--once", action="store_true", help="处理完排队中的录像就退出，不常驻")
     s.add_argument("--interval", type=float, default=15.0, help="没有任务时每隔多少秒查一次，默认 15")
+    s.add_argument("action", nargs="?", default="run", choices=["run", "install", "uninstall", "start", "stop", "status"],
+                   help="不写就是在前台运行。install：装成 macOS 的后台服务（登录后自动启动，崩溃自动重启）；"
+                        "uninstall：卸载服务；start / stop / status：启动、停止、查看这个服务")
+
+    s = sub.add_parser("dashboard", help="处理节点的面板：只在这台 Mac 上能打开的网页，看状态、队列、CPU/GPU/NPU，启动和停止节点")
+    s.add_argument("--port", type=int, default=8787, help="端口，默认 8787")
+    s.add_argument("--open", action="store_true", help="启动后在浏览器里打开")
+    s.add_argument("action", nargs="?", default="run", choices=["run", "install", "uninstall"],
+                   help="不写就是在前台运行。install：装成后台服务，登录后一直开着；uninstall：卸载")
 
     s = sub.add_parser("hits", help="击球时刻和击球人（球轨迹转折 + 手腕速度），输出带数据来源标记的事件 JSON")
     s.add_argument("video")
@@ -286,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             "label": cmd_label, "movement": cmd_movement, "shuttle": cmd_shuttle,
             "stabilize": cmd_stabilize, "overlay": cmd_overlay, "annotate": cmd_annotate,
             "annotate-export": cmd_annotate_export, "annotate-pack": cmd_annotate_pack, "annotate-strokes": cmd_annotate_strokes, "positioning": cmd_positioning,
-            "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "strokes": cmd_strokes,
+            "analyze": cmd_analyze, "review": cmd_review, "cut": cmd_cut, "node": cmd_node, "dashboard": cmd_dashboard, "strokes": cmd_strokes,
             "technique": cmd_technique, "technique-ref": cmd_technique_ref,
             "points": cmd_points}[a.cmd](a)
 
@@ -1317,8 +1326,51 @@ def cmd_annotate_export(a) -> int:
     return 0
 
 
+def _service(label: str, action: str, args: list[str]) -> int:
+    """install / uninstall / start / stop / status of one of the two launchd services."""
+    from . import service
+
+    if sys.platform != "darwin":
+        raise SystemExit("后台服务只支持 macOS（launchd）")
+    try:
+        if action == "install":
+            path = service.install(label, args)
+            print(f"已安装并启动：{path}\n日志在 {service.log_path(label)}，登录后会自动启动。")
+        elif action == "uninstall":
+            service.uninstall(label)
+            print("已停止并卸载。")
+        elif action == "start":
+            service.start(label)
+            print("已启动。")
+        elif action == "stop":
+            service.stop(label)
+            print("已停止。下次登录或 start 时再启动。")
+        else:
+            s = service.state(label)
+            print("没有安装成服务" if not s["installed"] else f"运行中，进程 {s['pid']}" if s["pid"]
+                  else "已停止" if not s["loaded"] or not s["lastExit"] else f"上次退出码 {s['lastExit']}，系统会重启它")
+    except RuntimeError as e:
+        raise SystemExit(str(e)) from None
+    return 0
+
+
+def cmd_dashboard(a) -> int:
+    from . import dashboard, service
+
+    if a.action != "run":
+        code = _service(service.DASHBOARD, a.action, ["dashboard", "--port", str(a.port)])
+        if a.action == "install":
+            print(f"面板：http://localhost:{a.port}")
+        return code
+    return dashboard.run(a.port, a.open)
+
+
 def cmd_node(a) -> int:
-    from . import node
+    from . import node, service
+
+    if a.action != "run":
+        extra = [x for flag, value in (("--url", a.url), ("--work-dir", a.work_dir)) if value for x in (flag, value)]
+        return _service(service.NODE, a.action, ["node", *extra])
 
     return node.run(node.Config.load(a.url, a.work_dir), once=a.once, interval=a.interval)
 

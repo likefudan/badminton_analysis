@@ -560,6 +560,7 @@ badminton strokes match.mp4 --court match.court.json --hits match.hits.json
 | `scripts/hit_sound_probe.py` | 击球声实验：声音起点和击球时刻对得上的比例（没有采用） |
 | `labels/hits/` | 击球对照标注（`Frame, Player, Note`） |
 | `src/badminton/node.py` | 处理节点 `badminton node`：从 ba.llmat.dev 取手机上传的录像，本机分析，结果传回（见 `cloud/README.md`） |
+| `src/badminton/dashboard.py`、`service.py`、`metrics.py` | 本机面板 `badminton dashboard`（http://localhost:8787）：节点状态、队列、CPU/GPU/NPU，启动和停止节点；launchd 后台服务；利用率读数 |
 | `cloud/` | 手机上传和看结果的网站：Cloudflare Worker + D1 + R2 |
 | `src/badminton/cli.py` | 命令行 `badminton` |
 

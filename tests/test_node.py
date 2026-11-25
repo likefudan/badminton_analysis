@@ -540,3 +540,62 @@ def test_stroke_technique_failure_or_no_weights_only_skips(tmp_path, monkeypatch
     step = progress.steps["technique"]
     assert step["status"] == "skipped" and "找不到 BST 权重" in step["detail"]
     assert "--singles" not in calls[0]
+
+
+def test_stop_now_hands_the_job_back_instead_of_failing_it(cloud, tmp_path, capsys):
+    def stopped(video, out_dir, options, progress, log):
+        progress.start("skeleton")
+        raise node.StopNow()
+
+    assert node.run(config(cloud, tmp_path), once=True, analyse_fn=stopped) == 0
+    assert cloud.jobs[-1]["status"] == "queued"
+    assert not any(j["status"] in ("failed", "done") for j in cloud.jobs)
+    assert "退回队列" in capsys.readouterr().out
+
+
+def test_sigterm_becomes_stop_now_and_the_old_handler_comes_back():
+    import os
+    import signal
+
+    before = signal.getsignal(signal.SIGTERM)
+    restore = node._stop_on_sigterm()
+    try:
+        with pytest.raises(node.StopNow):
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(100):  # the handler runs between two instructions of the main thread
+                pass
+    finally:
+        restore()
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_stop_after_this_job_finishes_it_and_then_leaves(cloud, tmp_path, capsys):
+    cfg = config(cloud, tmp_path)
+
+    def analyse(video, out_dir, options, progress, log):
+        node.stop_after_path(cfg).write_text("")        # the dashboard's button, pressed in the middle of the job
+        return fake_analyse(video, out_dir, options, progress, log)
+
+    assert node.run(cfg, once=False, interval=0.01, analyse_fn=analyse) == 0   # would loop for ever otherwise
+    assert cloud.jobs[-1]["status"] == "done"
+    assert not node.stop_after_path(cfg).exists()
+    state = json.loads((cfg.work_dir / "node_state.json").read_text())
+    assert state["stopped"] is True and state["job"] is None
+    assert "按要求停止" in capsys.readouterr().out
+
+
+def test_the_local_state_file_follows_the_job(cloud, tmp_path):
+    cfg = config(cloud, tmp_path)
+    seen = []
+
+    def analyse(video, out_dir, options, progress, log):
+        files = fake_analyse(video, out_dir, options, progress, log)
+        node.stop_after_path(cfg).write_text("")
+        seen.append(json.loads((cfg.work_dir / "node_state.json").read_text()))
+        return files
+
+    node.run(cfg, once=False, interval=0.01, analyse_fn=analyse)
+    s = seen[0]
+    assert s["job"]["task"] == "process" and s["job"]["name"] == "IMG 0964.mov"
+    assert s["pid"] > 0 and s["stopped"] is False
+    assert [x["key"] for x in s["progress"]["steps"] if x["status"] == "done"]

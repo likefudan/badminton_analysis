@@ -66,6 +66,24 @@ badminton node --once     # 处理完排队中的就退出
 
 要看别的目录下的任务，在 `~/.config/badminton/node.json` 里加 `"watch": ["~/codebase/badminton_analysis", "~/codebase/third_party"]`（写了就以它为准）。日志里像口令、token、API key 的值上传前会换成 `***`。实现在 `src/badminton/node_status.py`。
 
+### 本机面板：启动、停止和 CPU / GPU / NPU
+
+`#/mac` 是从手机上远远地看；坐在 Mac 前用本机面板，每秒刷新，还能启停节点：
+
+```bash
+brew install macmon            # 读 CPU / GPU 利用率和 NPU 功耗，不需要 sudo；不装也能用，只是少了 NPU
+badminton node install         # 节点装成后台服务：登录后自动启动，崩溃自动重启
+badminton dashboard install    # 面板也装成后台服务，然后打开 http://localhost:8787
+```
+
+- 面板（`src/badminton/dashboard.py` 和 `dashboard.html`）只监听 127.0.0.1，别的机器打不开，所以不用登录。显示：节点状态和按钮、正在做的录像每一步的进度和预计剩余、网站上的队列（失败的分析可以点「重试」）、CPU / GPU / NPU / 内存的读数和最近 10 分钟的曲线、后台任务、节点日志。
+- 服务是当前用户的 LaunchAgent（`src/badminton/service.py`，`~/Library/LaunchAgents/dev.llmat.badminton.*.plist`），日志在 `~/Library/Logs/badminton/`。命令行也能管：`badminton node start | stop | status | uninstall`。还没装服务时点面板上的「启动」会自动装。
+- 「做完这个再停」：面板在工作目录里写一个 `stop_after_job` 文件，节点做完手上的作业看到它就退出。
+- 「立即停」：launchd 发 SIGTERM，节点结束正在跑的那一步，告诉网站把作业退回队列（不用等 10 分钟租约过期），30 秒内退出。下次启动这一局从头重做（原片已经在 Mac 上，不用重新下载）。
+- 「更新代码并重启」：`git pull --ff-only` 成功后重启节点和面板；拉不下来时节点不动。
+- 利用率来自 `macmon`（`src/badminton/metrics.py`）；没装时 CPU 用 `top`、GPU 用 `ioreg`。macOS 不公开 NPU（神经引擎）的利用率，只有功耗，所以 NPU 显示的是瓦数。节点每半分钟也把一份读数报给网站，`#/mac` 上能看到。
+- 节点把自己的状态写在 `~/badminton_uploads/node_state.json`，面板从这里读，不经过网站。
+
 ## 手机上标注球的位置
 
 录像页的「标注」里点「准备标注」：节点领到 `annotate` 任务（只有没有录像要分析时才领），运行 `badminton annotate-pack`，挑模型最没把握的 3 个回合（优先 20 秒以内的，最多 3600 帧），每个回合的帧切成 1920 宽的 JPEG 拼成一个文件（4K 视频另外每帧在预测的球附近切一块 768×768 的原图，`rally-<k>.hd.bin`，给放大镜用），`state.json` 记每帧在文件里的位置和模型的预测，传到 R2 的 `annot/` 下（不算在 10 GB 结果里）。网页（`public/label.js`，`#/label/<编号>`）一次用 Range 取 8 帧。

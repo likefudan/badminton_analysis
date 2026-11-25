@@ -469,8 +469,17 @@ async function updateJob(req: Request, env: Env, id: string): Promise<Response> 
   const v = await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const status = body?.status;
-  if (status !== "processing" && status !== "done" && status !== "failed") throw new HttpError(400, "status 不对");
+  // queued：节点做到一半被停掉，把任务退回队列，下次启动马上重新领，不用等租约过期
+  if (status !== "processing" && status !== "done" && status !== "failed" && status !== "queued") throw new HttpError(400, "status 不对");
   if (v.job_status !== "processing") throw new HttpError(409, "这个任务现在不在处理中");
+  if (status === "queued") {
+    await env.DB.prepare(
+      "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, job_updated_at = ? WHERE id = ?",
+    )
+      .bind(new Date().toISOString(), id)
+      .run();
+    return json(await describe(env, await getVideo(env, id)));
+  }
   const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.job_stage;
   const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
   // 步骤进度原样保存（节点写、网页读），只限制大小
@@ -957,8 +966,15 @@ async function updateAnnotJob(req: Request, env: Env, id: string): Promise<Respo
   const v = await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const status = body?.status;
-  if (status !== "preparing" && status !== "ready" && status !== "failed") throw new HttpError(400, "status 不对");
+  if (status !== "preparing" && status !== "ready" && status !== "failed" && status !== "queued") throw new HttpError(400, "status 不对");
   if (v.annot_status !== "preparing") throw new HttpError(409, "这个标注任务现在不在准备中");
+  if (status === "queued") {
+    // 节点被停掉：退回队列
+    await env.DB.prepare("UPDATE videos SET annot_status = 'queued', annot_stage = '', annot_error = '', annot_lease_until = NULL, annot_updated_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), id)
+      .run();
+    return json(await describe(env, await getVideo(env, id)));
+  }
   const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.annot_stage;
   const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
   const now = new Date();
@@ -1094,8 +1110,15 @@ async function updateStrokesJob(req: Request, env: Env, id: string): Promise<Res
   const v = await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const status = body?.status;
-  if (status !== "preparing" && status !== "ready" && status !== "failed") throw new HttpError(400, "status 不对");
+  if (status !== "preparing" && status !== "ready" && status !== "failed" && status !== "queued") throw new HttpError(400, "status 不对");
   if (v.strokes_status !== "preparing") throw new HttpError(409, "这个任务现在不在准备中");
+  if (status === "queued") {
+    // 节点被停掉：退回队列
+    await env.DB.prepare("UPDATE videos SET strokes_status = 'queued', strokes_stage = '', strokes_error = '', strokes_lease_until = NULL, strokes_updated_at = ? WHERE id = ?")
+      .bind(new Date().toISOString(), id)
+      .run();
+    return json(await describe(env, await getVideo(env, id)));
+  }
   const stage = typeof body?.stage === "string" ? body.stage.slice(0, 200) : v.strokes_stage;
   const error = typeof body?.error === "string" ? body.error.slice(0, 4000) : "";
   const now = new Date();
