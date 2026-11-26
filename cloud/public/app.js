@@ -1047,7 +1047,7 @@ async function renderDetail() {
     try {
       const doc = await (await fetch(resultUrl(v, "technique.json"))).json();
       if (openId !== v.id || key !== shownKey) return;
-      const card = techniqueCard(doc, names);
+      const card = techniqueCard(doc, names, (name) => (have.has(name) ? resultUrl(v, name) : null));
       if (card) strokesPane.append(card);
     } catch {}
   }
@@ -1661,7 +1661,44 @@ function seekResultVideo(t) {
   vid.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
-function techniqueCard(doc, names) {
+// 逐拍分析里每一拍的截图：Mac 节点从视频里截出的 shot.<击球帧>.jpg（引拍、击球、随挥三张）和
+// shot.<击球帧>.mp4（这一拍的小片段）。点图片就慢放片段，再点回到图片。
+function shotFigure(r, fileUrl) {
+  const jpg = fileUrl(`shot.${r.frame}.jpg`);
+  if (!jpg) return null;
+  const mp4 = fileUrl(`shot.${r.frame}.mp4`);
+  const fig = el("figure", "shot");
+  const img = document.createElement("img");
+  img.loading = "lazy";
+  img.alt = `${r.type} ${fmtClock2(r.time_s)}`;
+  img.src = jpg;
+  const cap = el("figcaption", "quiet small", mp4 ? "引拍 · 击球 · 随挥（点图片慢放）" : "引拍 · 击球 · 随挥");
+  fig.append(img, cap);
+  if (mp4) {
+    let video = null;
+    const toggle = () => {
+      if (video) { video.remove(); video = null; img.hidden = false; cap.textContent = "引拍 · 击球 · 随挥（点图片慢放）"; return; }
+      video = document.createElement("video");
+      video.muted = true;
+      video.loop = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.src = mp4;
+      video.addEventListener("loadedmetadata", () => { video.playbackRate = 0.4; }, { once: true });
+      video.onclick = toggle;
+      img.hidden = true;
+      fig.insertBefore(video, cap);
+      video.play().catch(() => {});
+      video.playbackRate = 0.4;
+      cap.textContent = "慢放这一拍（点画面回到截图）";
+    };
+    img.onclick = toggle;
+    img.style.cursor = "pointer";
+  }
+  return fig;
+}
+
+function techniqueCard(doc, names, fileUrl = () => null) {
   const keys = (doc.noted_metrics || Object.keys(TECH_LABEL)).filter((k) => TECH_LABEL[k]);
   const strokes = (doc.strokes || []).filter((r) => r.ok);
   if (!strokes.length) return null;
@@ -1709,13 +1746,17 @@ function techniqueCard(doc, names) {
     const noted = rs.filter((r) => r.notes && r.notes.length);
     if (noted.length) {
       const det = document.createElement("details");
-      det.append(el("summary", "", `有提示的 ${noted.length} 拍（点时间跳到视频）`));
+      det.open = true; // 逐拍分析有自己的 tab，提示和截图就是这里的主要内容
+      const pics = noted.some((r) => fileUrl(`shot.${r.frame}.jpg`));
+      det.append(el("summary", "", `有提示的 ${noted.length} 拍（点时间跳到视频${pics ? "，点图片慢放" : ""}）`));
       const ul = el("ul", "technotes");
       for (const r of noted) {
         const li = el("li");
         const a = el("button", "linkish", fmtClock2(r.time_s));
         a.onclick = () => seekResultVideo(r.time_s);
         li.append(a, el("b", "", " " + r.type + "："), document.createTextNode(r.notes.join("；")));
+        const fig = shotFigure(r, fileUrl);
+        if (fig) li.append(fig);
         ul.append(li);
       }
       det.append(ul);

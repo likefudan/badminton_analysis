@@ -523,12 +523,24 @@ def analyse(data: dict, tracking, strokes: list[dict], fps: float, sides=("near"
         out.append({"frame": int(s["frame"]), "time_s": s.get("time_s", round(s["frame"] / fps, 3)),
                     "player_id": s["player_id"], "player_name": s.get("player_name", ""), "side": s["side"],
                     "type": s["type"], "group": s["group"], "type_prob": s.get("prob"),
-                    "type_needs_review": bool(s.get("needs_review")), "airborne_at_hit": airborne, **r})
+                    "type_needs_review": bool(s.get("needs_review")), "airborne_at_hit": airborne,
+                    "box": player_box(kp, sc), **r})
     add_disguise(out)
     for r in out:
         if r["ok"]:
             r["notes"], r["percentiles"] = flags_for(r["group"], r["metrics"], reference)
     return out
+
+
+def player_box(kp: np.ndarray, sc: np.ndarray) -> list[int] | None:
+    """[x0, y0, x1, y1] in video pixels around every joint seen in the stroke window: where the
+    player is, for cutting the pictures of the stroke out of the video (stroke_shots)."""
+    seen = (sc >= KPT_THR) & np.isfinite(kp).all(-1)
+    if seen.sum() < 4:
+        return None
+    pts = kp[seen]
+    return [int(np.floor(pts[:, 0].min())), int(np.floor(pts[:, 1].min())),
+            int(np.ceil(pts[:, 0].max())), int(np.ceil(pts[:, 1].max()))]
 
 
 def summary(results: list[dict]) -> dict:

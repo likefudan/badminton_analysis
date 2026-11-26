@@ -274,13 +274,13 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     first = p.to_json()
     assert first["etaSeconds"] is None and first["elapsedSeconds"] == 10
     assert first["steps"][0]["seconds"] == 10 and "estimateSeconds" not in first["steps"][3]
-    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("technique", 4), ("upload", 12), ("review", 30)):
+    for key, seconds in (("sdr", 8), ("calibrate", 6), ("skeleton", 40), ("label", 2), ("stats", 4), ("cut", 6), ("shuttle", 10), ("technique", 4), ("shots", 3), ("upload", 12), ("review", 30)):
         p.start(key)          # starting the next step finishes the one before
         clock.t += seconds
     p.done("review")
     done = p.to_json()
-    assert [s["status"] for s in done["steps"]] == ["done"] * 11
-    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 4, 12, 30]
+    assert [s["status"] for s in done["steps"]] == ["done"] * 12
+    assert [s["seconds"] for s in done["steps"]] == [10, 8, 6, 40, 2, 4, 6, 10, 4, 3, 12, 30]
     assert done["etaSeconds"] == 0
 
     # second recording, twice as long and twice as big: estimates scale with it
@@ -292,7 +292,7 @@ def test_progress_times_steps_and_estimates_the_rest_from_earlier_runs(tmp_path)
     j = p2.to_json()
     assert j["steps"][0]["etaSeconds"] == 12
     assert j["steps"][3]["estimateSeconds"] == 80           # skeleton: 40 s for 20 s of video -> 80 s for 40 s
-    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 8 + 24 + 60
+    assert j["etaSeconds"] == 12 + 16 + 12 + 80 + 4 + 8 + 12 + 20 + 8 + 6 + 24 + 60
     p2.start("sdr")
     clock.t += 6
     assert p2.to_json()["steps"][1]["etaSeconds"] == 10     # 16 s expected, 6 s gone
@@ -645,6 +645,89 @@ def test_cards_only_without_earlier_results_says_to_reprocess(cloud, tmp_path):
     assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
     assert cloud.jobs[-1]["status"] == "failed" and "重新处理" in cloud.jobs[-1]["error"]
     assert not cloud.results
+
+
+def test_cards_only_adds_stroke_pictures_to_an_older_result(cloud, tmp_path, monkeypatch):
+    """「只更新卡片」 on a video processed before the pictures: technique runs again for the players'
+    boxes, then the pictures and clips of the noted strokes go up next to the cards."""
+    from badminton import stroke_shots
+
+    cloud.video["options"] = {"mode": "singles", "only": "cards"}
+    out = tmp_path / "work" / cloud.video["id"] / "analysis"
+    out.mkdir(parents=True)
+    (out.parent / "IMG_0964.mov").write_bytes(cloud.original)
+    (out.parent / "IMG_0964.court.json").write_text("{}")
+    for name in ("skeleton.npz", "strokes.json", "shuttle.csv"):
+        (out / f"IMG_0964.{name}").write_bytes(b"old")
+    (out / "IMG_0964.technique.json").write_text(json.dumps({"strokes": [{"ok": True, "notes": ["a"], "frame": 30}]}))
+    calls = []
+
+    def fake_run(args, log, on_line, on_frames):
+        calls.append(args)
+        if args[0] == "analyze":
+            (out / "IMG_0964.movement.json").write_bytes(b"new")
+        elif args[0] == "technique":
+            (out / "IMG_0964.technique.json").write_text(json.dumps(
+                {"strokes": [{"ok": True, "notes": ["a"], "frame": 30, "box": [0, 0, 10, 10]}]}))
+        return 0
+
+    def fake_shots(video, technique, out_dir, clips=True):
+        (out_dir / "shots").mkdir(exist_ok=True)
+        files = [out_dir / "shots" / "IMG_0964.shot.30.jpg", out_dir / "shots" / "IMG_0964.shot.30.mp4"]
+        for f in files:
+            f.write_bytes(b"pic")
+        return files
+
+    monkeypatch.setattr(node, "run_step", fake_run)
+    monkeypatch.setattr(stroke_shots, "make_shots", fake_shots)
+    monkeypatch.setattr(node, "web_video", lambda f, dst: (_ for _ in ()).throw(AssertionError("clips are not re-encoded")))
+    assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
+    assert [c[0] for c in calls] == ["analyze", "technique", "review"] and "--singles" in calls[1]
+    assert {"technique.json", "shot.30.jpg", "shot.30.mp4", "movement.json"} <= set(cloud.results)
+    steps = {s["key"]: s for s in cloud.jobs[-1]["progress"]["steps"]}
+    assert steps["technique"]["status"] == steps["shots"]["status"] == "done"
+
+
+def test_stroke_shots_cuts_the_player_out_around_the_hit(tmp_path):
+    import cv2
+    import numpy as np
+
+    from badminton import stroke_shots
+    from badminton.video import VideoWriter
+
+    video = tmp_path / "v.mp4"
+    with VideoWriter(video, 640, 360, 30.0) as w:
+        for i in range(90):
+            img = np.zeros((360, 640, 3), np.uint8)
+            img[:, :, 1] = i * 2  # frame number in the green channel
+            w.write(img)
+    doc = {"fps": 30.0, "strokes": [
+        {"ok": True, "notes": ["击球点偏低"], "frame": 45, "box": [300, 150, 340, 300]},
+        {"ok": True, "notes": [], "frame": 60, "box": [300, 150, 340, 300]},      # no note: no picture
+        {"ok": False, "notes": ["x"], "frame": 70, "box": [300, 150, 340, 300]}]}
+    tj = tmp_path / "v.technique.json"
+    tj.write_text(json.dumps(doc))
+    (tmp_path / "shots").mkdir()
+    (tmp_path / "shots" / "v.shot.1.jpg").write_bytes(b"stale")
+    files = stroke_shots.make_shots(video, tj, tmp_path)
+    assert [f.name for f in files] == ["v.shot.45.jpg", "v.shot.45.mp4"]
+    assert not (tmp_path / "shots" / "v.shot.1.jpg").exists()
+    still = cv2.imread(str(files[0]))
+    assert still.shape[0] == stroke_shots.PANEL_HEIGHT and still.shape[1] > still.shape[0]
+    third = still.shape[1] // 3
+    greens = [int(still[180, k * third + third // 2, 1]) for k in range(3)]
+    assert abs(greens[1] - 90) <= 6 and greens[0] < greens[1] < greens[2]  # backswing, hit, follow-through
+    cap = cv2.VideoCapture(str(files[1]))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 40  # -0.8 s .. +0.5 s at 30 fps
+    cap.release()
+
+
+def test_crop_box_stays_inside_the_frame():
+    from badminton.stroke_shots import crop_box
+
+    x, y, w, h = crop_box([1850, 900, 1910, 1070], 1920, 1080)
+    assert x >= 0 and y >= 0 and x + w <= 1920 and y + h <= 1080 and w % 2 == h % 2 == 0
+    assert y < 900 - 30  # room above the head for the racket
 
 
 def test_names_from_the_result_page_go_into_players_json_before_the_cards(cloud, tmp_path, monkeypatch):
