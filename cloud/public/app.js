@@ -959,7 +959,7 @@ function openDetail(id) {
   shownKey = "";
   reviewKey = "";
   reviewError = "";
-  for (const pane of ["dStats", "dReview", "tVideos", "tCards"]) $(pane).textContent = "";
+  for (const pane of ["dPlayers", "dStats", "dStrokes", "dReview", "tVideos", "tCards", "dCourt"]) $(pane).textContent = "";
   $("dRenameBox").hidden = true;
   $("dDelete").textContent = "删除这段录像";
   delete $("dDelete").dataset.armed;
@@ -971,10 +971,11 @@ function openDetail(id) {
 }
 function closeDetail() {
   openId = null;
-  for (const pane of ["tVideos", "tCards"]) $(pane).textContent = ""; // 停掉正在放的视频
+  for (const pane of ["tVideos", "tCards", "dCourt"]) $(pane).textContent = ""; // 停掉正在放的视频
 }
 
-const TABS = { overview: "tOverview", videos: "tVideos", cards: "tCards", process: "tProcess" };
+// 数据概览（球员是谁 + 数字表格）· 逐拍分析 · 跑位分析（卡片）· AI 报告 · 视频 · 处理（只有超级管理员）
+const TABS = { overview: "tOverview", strokes: "tStrokes", cards: "tCards", review: "tReview", videos: "tVideos", process: "tProcess" };
 function setTab(name) {
   tab = name;
   for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
@@ -991,9 +992,8 @@ const RESULT_ORDER = [
   ["videos", /^longest\.mp4$/, () => "最长的几个回合"],
   ["cards", /^movement\.(.+)\.png$/, (m, names) => "跑动卡片 · " + (names[m[1]] || m[1] + " 号")],
   ["cards", /^positioning\.(near|far)\.png$/, (m) => "站位卡片 · " + (m[1] === "near" ? "近端" : "远端")],
-  ["cards", /^players\.(png|jpg)$/, () => "球员编号"],
-  ["cards", /^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
-  ["cards", /^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
+  ["court", /^court\.(png|jpg)$/, () => "球场标定（绿线应该压在白线上）"],
+  ["court", /^court\.rejected\.(png|jpg)$/, () => "自动标定找到的最好结果（红线，没有采用）"],
 ];
 
 async function renderDetail() {
@@ -1022,27 +1022,33 @@ async function renderDetail() {
   $("dMode").textContent = v.options && v.options.mode === "doubles" ? "改成单打重跑" : "改成双打重跑";
 
   renderReview(v);
-  const key = v.id + "|" + v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
+  const key = v.id + "|" + JSON.stringify(v.playerNames) + "|" + v.results.filter((r) => !r.name.startsWith("review.")).map((r) => r.name + ":" + r.size).join("|");
   if (key === shownKey) return;
   shownKey = key;
   const have = new Set(v.results.map((r) => r.name));
   const stats = $("dStats");
   stats.textContent = "";
-  let names = {};
+  const strokesPane = $("dStrokes");
+  strokesPane.textContent = "";
+  // 名字：网页上起的 > 程序结果里带的（Mac 上的 players.json，默认「球员 1」）
+  const baked = {};
+  let mv = null;
   if (have.has("movement.json")) {
     try {
-      const mv = await (await fetch(resultUrl(v, "movement.json"))).json();
+      mv = await (await fetch(resultUrl(v, "movement.json"))).json();
       if (openId !== v.id || key !== shownKey) return;
-      stats.append(statsTable(mv));
-      for (const p of mv.players || []) if (p.name) names[p.id] = p.name;
-    } catch {}
+      for (const p of mv.players || []) if (p.name) baked[p.id] = p.name;
+    } catch { mv = null; }
   }
+  const names = { ...baked, ...(v.playerNames || {}) };
+  playersBox(v, mv, baked, names);
+  if (mv) stats.append(statsTable(mv, names));
   if (have.has("technique.json")) {
     try {
       const doc = await (await fetch(resultUrl(v, "technique.json"))).json();
       if (openId !== v.id || key !== shownKey) return;
       const card = techniqueCard(doc, names, (name) => (have.has(name) ? resultUrl(v, name) : null));
-      if (card) stats.append(card);
+      if (card) strokesPane.append(card);
     } catch {}
   }
   if (have.has("points.json")) {
@@ -1052,7 +1058,7 @@ async function renderDetail() {
       await showPoints(v, doc, names, stats);
     } catch {}
   }
-  const panes = { videos: $("tVideos"), cards: $("tCards") };
+  const panes = { videos: $("tVideos"), cards: $("tCards"), court: $("dCourt") };
   for (const pane of Object.values(panes)) pane.textContent = "";
   for (const [where, pattern, title] of RESULT_ORDER) {
     for (const r of v.results) {
@@ -1078,9 +1084,13 @@ async function renderDetail() {
   }
   const waiting = v.job && v.job.status === "archived" ? "云端只保留最近约 10 GB 的结果，这一段的结果已经清理，Mac 上还有。点「处理」里的「重新处理」可以重新生成。"
     : "处理完成后，结果会出现在这里。进度在「处理」里。";
-  for (const pane of Object.values(panes)) if (!pane.children.length) pane.append(el("p", "empty", waiting));
+  for (const pane of [panes.videos, panes.cards]) if (!pane.children.length) pane.append(el("p", "empty", waiting));
+  if (!strokesPane.children.length) {
+    strokesPane.append(el("p", "empty", have.has("movement.json")
+      ? "这段录像没有逐拍分析：要找到击球、认出类型有把握的拍才有。" : waiting));
+  }
   const empty = $("dOverviewEmpty");
-  empty.hidden = have.has("movement.json") || have.has("review.md") || have.has("review.request.json");
+  empty.hidden = have.has("movement.json");
   empty.textContent = waiting;
 }
 
@@ -1247,10 +1257,10 @@ async function renderReview(v, force) {
   const find = (name) => v.results.find((r) => r.name === name);
   const md = find("review.md"), qa = find("review.qa.md"), can = find("review.request.json");
   const busyNow = reviewBusy === v.id;
-  const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busyNow, reviewError, (v.ai || []).length, ai && ai.defaultModel, ai && ai.available].join("|");
+  const key = [v.id, md && md.size, qa && qa.size, Boolean(can), busyNow, reviewError, JSON.stringify([v.playerNames, v.playerNamesWas]), (v.ai || []).length, ai && ai.defaultModel, ai && ai.available].join("|");
   if (!force && key === reviewKey) return;
   reviewKey = key;
-  if (!md && (!can || readOnly())) { box.textContent = ""; return; }
+  if (!md && (!can || readOnly())) { box.textContent = ""; box.append(el("p", "empty", "这段录像还没有 AI 报告。")); return; }
   const text = async (name) => {
     try { return await (await fetch(`${resultUrl(v, name)}?t=${Date.now()}`)).text(); } catch { return ""; }
   };
@@ -1262,11 +1272,11 @@ async function renderReview(v, force) {
   const usage = v.ai || [];
   const lastReport = [...usage].reverse().find((u) => u.kind === "report");
   if (report) {
-    box.append(renderMarkdown(report));
+    box.append(renderMarkdown(swapNames(report, v)));
     if (lastReport) box.append(el("p", "usage", usageLine(lastReport)));
   }
   if (answers) {
-    box.append(el("h3", "", "追问"), renderMarkdown(answers));
+    box.append(el("h3", "", "追问"), renderMarkdown(swapNames(answers, v)));
     // 这份报告之后的追问用量
     const asks = usage.slice(lastReport ? usage.lastIndexOf(lastReport) + 1 : 0).filter((u) => u.kind === "ask");
     for (const [i, u] of asks.entries()) box.append(el("p", "usage", `第 ${i + 1} 问：${usageLine(u)}`));
@@ -1328,8 +1338,99 @@ async function runReview(id, path, body) {
   again();
 }
 
+// ---------- 球员是谁（概览最上面） ----------
+// 编号图 + 每个编号的名字。超级管理员可以改，名字按录像存在云端；别人只看名字。
+// 这一页的表格、得失分、击球动作、AI 报告马上换成名字；卡片图上的名字要 Mac 重画（自动排队「只更新卡片」）。
+function playersBox(v, mv, baked, names) {
+  const box = $("dPlayers");
+  box.textContent = "";
+  const pic = v.results.find((r) => /^players\.(png|jpg)$/.test(r.name));
+  const list = (mv && mv.players) || [];
+  if (!pic && !list.length) return;
+  box.append(el("h3", "", "球员是谁"));
+  if (pic) {
+    const img = document.createElement("img");
+    img.alt = "球员编号";
+    img.src = resultUrl(v, pic.name);
+    box.append(img);
+  }
+  if (!list.length) return;
+  const sideOf = (p) => (p.side ? SIDE_ZH[p.side] || "" : "");
+  if (readOnly()) {
+    const ul = el("ul", "plist");
+    for (const p of list) {
+      const li = el("li");
+      li.append(el("b", "", `${p.id} 号`), ` ${sideOf(p)}：${names[p.id] || "球员 " + p.id}`);
+      ul.append(li);
+    }
+    box.append(ul);
+    return;
+  }
+  box.append(el("p", "quiet", "照着上面图里的编号填名字，空着就还叫「球员 N」。名字只属于这一段录像。"));
+  const inputs = {};
+  const grid = el("div", "pnames");
+  for (const p of list) {
+    const row = el("label", "");
+    row.append(el("span", "", `${p.id} 号${sideOf(p) ? " · " + sideOf(p) : ""}`));
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 20;
+    input.placeholder = baked[p.id] || "球员 " + p.id;
+    input.value = (v.playerNames || {})[p.id] || "";
+    inputs[p.id] = input;
+    row.append(input);
+    grid.append(row);
+  }
+  box.append(grid);
+  const note = el("p", "quiet", "");
+  const save = el("button", "plain", "保存名字");
+  save.onclick = async () => {
+    const body = { names: {}, shown: {} };
+    for (const [id, input] of Object.entries(inputs)) {
+      if (input.value.trim()) body.names[id] = input.value.trim();
+      body.shown[id] = names[id] || "球员 " + id;
+    }
+    save.disabled = true;
+    note.className = "quiet";
+    note.textContent = "保存中……";
+    try {
+      const nv = await api(`/videos/${v.id}/players`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      log("球员名字已保存");
+      note.textContent = nv.job && nv.job.status === "queued" && nv.options && nv.options.only === "cards"
+        ? "已保存。卡片图上的名字要等 Mac 重画（已排队「只更新卡片」，几分钟）。" : "已保存。";
+      await refreshList();
+    } catch (e) {
+      note.className = "bad";
+      note.textContent = "保存失败：" + e.message;
+    } finally { save.disabled = false; }
+  };
+  const row = el("div", "row");
+  row.append(save);
+  box.append(row, note);
+}
+
+// AI 报告是按当时的名字写的（「球员 1」或旧名字）：显示时换成现在的名字。一次替换完，两人互换名字也不会乱。
+const ZH_NUM = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+function swapNames(text, v) {
+  const now = v.playerNames || {}, was = v.playerNamesWas || {};
+  const pats = [];
+  const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const [id, name] of Object.entries(now)) {
+    pats.push([`球员\\s?${id}(?!\\d)`, name, 99]);
+    if (ZH_NUM[id]) pats.push([`球员${ZH_NUM[id]}(?![一二三四五六七八九十])`, name, 99]);
+    for (const old of was[id] || []) if (old && old !== name && !/^球员\s?\d+$/.test(old)) pats.push([esc(old), name, old.length]);
+  }
+  if (!pats.length) return text;
+  pats.sort((a, b) => b[2] - a[2]);
+  const re = new RegExp(pats.map((p) => `(${p[0]})`).join("|"), "g");
+  return text.replace(re, (...m) => {
+    const i = m.slice(1, pats.length + 1).findIndex((g) => g !== undefined);
+    return i >= 0 ? pats[i][1] : m[0];
+  });
+}
+
 // 概览顶部的几个大数字和球员表
-function statsTable(mv) {
+function statsTable(mv, names = {}) {
   const wrap = document.createElement("div");
   const rallies = (mv.rallies || []).length;
   const kpis = el("div", "kpis");
@@ -1345,7 +1446,7 @@ function statsTable(mv) {
   for (const pl of mv.players || []) {
     const row = table.insertRow();
     const cells = [
-      pl.name || pl.id + " 号",
+      names[pl.id] || pl.name || pl.id + " 号",
       pl.distance_m != null ? Math.round(pl.distance_m) + " 米" : "—",
       pl.mean_speed_mps != null ? pl.mean_speed_mps.toFixed(1) + " 米/秒" : "—",
       pl.max_speed_mps != null ? pl.max_speed_mps.toFixed(1) + " 米/秒" : "—",
@@ -1419,7 +1520,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
   const d = applyRallyLabels(doc, labels);
   const wrap = el("div", "tech points");
   wrap.append(el("h3", "", "回合和得失分"));
-  const who = (p) => p.name || names[p.id] || p.id + " 号";
+  const who = (p) => names[p.id] || p.name || p.id + " 号";
   const sideName = (side) => {
     const ps = d.players.filter((p) => p.side === side).map(who);
     return SIDE_ZH[side] + (ps.length ? `（${ps.join("、")}）` : "");
@@ -1610,7 +1711,7 @@ function techniqueCard(doc, names, fileUrl = () => null) {
     players.get(r.player_id).push(r);
   }
   for (const [pid, rs] of players) {
-    const who = rs[0].player_name || names[pid] || pid + " 号";
+    const who = names[pid] || rs[0].player_name || pid + " 号";
     wrap.append(el("h4", "", `${who} · ${rs.length} 拍`));
     const groups = new Map();
     for (const r of rs) {
@@ -1645,8 +1746,9 @@ function techniqueCard(doc, names, fileUrl = () => null) {
     const noted = rs.filter((r) => r.notes && r.notes.length);
     if (noted.length) {
       const det = document.createElement("details");
+      det.open = true; // 逐拍分析有自己的 tab，提示和截图就是这里的主要内容
       const pics = noted.some((r) => fileUrl(`shot.${r.frame}.jpg`));
-      det.append(el("summary", "", `逐拍分析：有提示的 ${noted.length} 拍（点时间跳到视频${pics ? "，点图片慢放" : ""}）`));
+      det.append(el("summary", "", `有提示的 ${noted.length} 拍（点时间跳到视频${pics ? "，点图片慢放" : ""}）`));
       const ul = el("ul", "technotes");
       for (const r of noted) {
         const li = el("li");

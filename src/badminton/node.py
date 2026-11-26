@@ -743,6 +743,35 @@ def use_region(raw, out_dir: Path, stem: str) -> Path | None:
     return path
 
 
+def use_player_names(options: dict, out_dir: Path, stem: str) -> bool:
+    """The names given on the web page (options["player_names"], {"1": "小王"}) as <stem>.players.json,
+    which every later step reads. None = never named on the web: the file is left as it is.
+    Returns True when names were given (analyze then skips its numbered player picture)."""
+    raw = options.get("player_names")
+    if not isinstance(raw, dict):
+        return False
+    names = {str(k): str(v).strip() for k, v in raw.items() if str(k).isdigit() and str(v).strip()}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(dict(sorted(names.items(), key=lambda kv: int(kv[0]))), ensure_ascii=False, indent=2)
+    (out_dir / f"{stem}.players.json").write_text(text)
+    return True
+
+
+def draw_player_names(work: Path, court: Path, out_dir: Path, singles: bool, log: list[str], run=None) -> Path | None:
+    """<stem>.players.png, the picture of who is which number (`badminton label` without --names only draws)."""
+    npz, players = out_dir / f"{work.stem}.skeleton.npz", out_dir / f"{work.stem}.players.json"
+    if not npz.exists():
+        return None
+    args = ["label", str(work), "--court", str(court), "--data", str(npz), "--players", str(players)]
+    if singles:
+        args.append("--singles")
+    png = players.with_suffix(".png")
+    if (run or run_step)(args, log, None, None) != 0 or not png.exists():
+        print("  重画球员编号图失败：" + (log[-1] if log else ""))
+        return None
+    return png
+
+
 def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str]) -> list[Path]:
     """The normal one-click pipeline, without anything that needs a person at the keyboard."""
     from .video import probe  # needs OpenCV; imported late so the node itself starts without it
@@ -773,12 +802,13 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
     if court.with_suffix(".png").exists():
         extra.append(court.with_suffix(".png"))
     region = use_region(options.get("region"), out_dir, work.stem)
+    named = use_player_names(options, out_dir, work.stem)
     args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir)]
     if region:
         args += ["--region", str(region)]
     if options.get("mode") != "doubles":
         args.append("--singles")
-    if options.get("names"):
+    if options.get("names") and not named:
         args += ["--names", str(options["names"])]
 
     def on_line(line: str) -> None:
@@ -802,6 +832,8 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
     for key in ("skeleton", "label", "stats", "cut"):  # anything analyze did not announce
         if progress.steps[key]["status"] == "pending":
             progress.skip(key, "这次没有运行")
+    if named and not (out_dir / f"{work.stem}.players.png").exists():  # analyze skipped it: names file was there
+        draw_player_names(work, court, out_dir, options.get("mode") != "doubles", log)
     combined = track_shuttle(work, court, out_dir, progress, log, region=region)
     stroke_technique(work, court, out_dir, options.get("mode") != "doubles", progress, log)
     shots = stroke_shots(work, out_dir, progress)
@@ -832,6 +864,7 @@ def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress,
     for key in ("sdr", "calibrate", "skeleton", "label"):
         progress.skip(key, "沿用上次的结果")
     progress.start("stats")
+    use_player_names(options, out_dir, work.stem)
     args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir), "--no-cut"]
     if options.get("mode") != "doubles":
         args.append("--singles")
@@ -1216,7 +1249,9 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
             api.retrying(lambda: api.json("POST", f"/videos/{vid}/original/release"), "删除云端原片")
             print("  云端原片已删除，本地保留在 " + str(local))
         # one folder per mode: the skeleton data of a singles run (one player per side) is no use for doubles
-        options = video.get("options") or {}
+        options = dict(video.get("options") or {})
+        if isinstance(video.get("playerNames"), dict):  # names given on the result page
+            options["player_names"] = video["playerNames"]
         out_dir = job_dir / ("analysis-doubles" if options.get("mode") == "doubles" else "analysis")
         cards_only = options.get("only") == "cards"
         try:

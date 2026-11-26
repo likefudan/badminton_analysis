@@ -182,8 +182,13 @@
   .badge.busy { color: var(--accent); border-color: var(--accent); } .badge.warn { color: var(--warn); border-color: var(--warn); }
   .empty { text-align: center; color: var(--quiet); padding: 28px 12px; }
   .tabs { display: flex; border-bottom: 1px solid var(--line); margin: 4px 0 12px; }
-  .tabs button { flex: 1; width: auto; padding: 10px 4px; background: none; color: var(--quiet); border: 0; border-bottom: 2px solid transparent; border-radius: 0; font-weight: 400; }
+  .tabs { overflow-x: auto; scrollbar-width: none; } .tabs::-webkit-scrollbar { display: none; }
+  .tabs button { flex: 1 0 auto; white-space: nowrap; width: auto; padding: 10px 3px; font-size: 14px; background: none; color: var(--quiet); border: 0; border-bottom: 2px solid transparent; border-radius: 0; font-weight: 400; }
   .tabs button.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+  #dPlayers h3 { margin-top: 0; }
+  .pnames { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; margin: 8px 0; }
+  .pnames label { display: block; } .pnames span { display: block; color: var(--quiet); font-size: 13px; margin-bottom: 2px; }
+  .plist { list-style: none; padding: 0; margin: 4px 0 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 10px; }
   .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
   .kpis div { background: var(--bg); border-radius: 10px; padding: 8px 10px; }
   .kpis b { display: block; font-size: 16px; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -448,11 +453,13 @@
         <p class="quiet" id="dMeta"></p>
         <p id="dStatus"></p>
         <div class="tabs" id="tabs">
-          <button data-tab="overview">概览</button><button data-tab="videos">视频</button><button data-tab="cards">卡片</button><button data-tab="process" class="ownerOnly">处理</button>
+          <button data-tab="overview">数据概览</button><button data-tab="strokes">逐拍分析</button><button data-tab="cards">跑位分析</button><button data-tab="review">AI 报告</button><button data-tab="videos">视频</button><button data-tab="process" class="ownerOnly">处理</button>
         </div>
-        <div id="tOverview"><div id="dStats"></div><div id="dReview"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
-        <div id="tVideos" hidden></div>
+        <div id="tOverview"><div id="dPlayers"></div><div id="dStats"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
+        <div id="tStrokes" hidden><div id="dStrokes"></div></div>
         <div id="tCards" hidden></div>
+        <div id="tReview" hidden><div id="dReview"></div></div>
+        <div id="tVideos" hidden></div>
         <div id="tProcess" class="ownerOnly" hidden>
           <p id="dError" class="bad" hidden></p>
           <div id="dProgress"></div>
@@ -476,6 +483,7 @@
               <div class="row"><button id="rgSave">保存并重新分析</button></div>
             </div>
           </div>
+          <div id="dCourt"></div>
           <div class="row"><button class="plain danger" id="dDelete">删除这段录像</button></div>
         </div>
       </section>
