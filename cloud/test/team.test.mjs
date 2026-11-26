@@ -209,7 +209,7 @@ test("Google 登录、白名单、领任务、标注归属、超时放回、重�
     `/videos/${vid}/annot/files/state.json`, `/videos/${vid}/strokes/files/strokes.state.json`]) assert.equal((await dave.get(path)).status, 403, path);
   for (const [path, body] of [
     ["/videos", { filename: "x.mp4", size: 10, contentType: "video/mp4" }],   // 上传
-    [`/videos/${vid}/complete`], [`/videos/${vid}/job/retry`], [`/videos/${vid}/job/retry`, { only: "cards" }],   // 重新处理、只更新卡片
+    [`/videos/${vid}/complete`], [`/videos/${vid}/job/retry`], [`/videos/${vid}/job/retry`, { only: "cards" }],   // 全部重跑、重跑后处理
     [`/videos/${vid}/review`], [`/videos/${vid}/review/ask`, { question: "hi" }],   // AI 报告、追问
     [`/videos/${vid}/annot`], [`/videos/${vid}/strokes`], [`/videos/${vid}/original/release`], [`/videos/${vid}/job`, { status: "done" }],
     ["/node/claim", { node: "x" }], ["/node/status", {}], ["/session"], ["/admin/users", { email: "dave@example.com", role: "admin" }],

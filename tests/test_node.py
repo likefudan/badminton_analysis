@@ -602,7 +602,7 @@ def test_the_local_state_file_follows_the_job(cloud, tmp_path):
 
 
 def test_cards_only_redraws_from_what_is_on_the_mac_and_sends_only_small_files(cloud, tmp_path, monkeypatch):
-    """「只更新卡片」: no skeleton, no cut, no videos, no new AI report; the cards and statistics go up."""
+    """「重跑后处理」: no skeleton, no cut, no videos, no new AI report; the cards and statistics go up."""
     cloud.video["options"] = {"mode": "doubles", "only": "cards"}
     out = tmp_path / "work" / cloud.video["id"] / "analysis-doubles"
     out.mkdir(parents=True)
@@ -643,12 +643,12 @@ def test_cards_only_redraws_from_what_is_on_the_mac_and_sends_only_small_files(c
 def test_cards_only_without_earlier_results_says_to_reprocess(cloud, tmp_path):
     cloud.video["options"] = {"mode": "singles", "only": "cards"}
     assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
-    assert cloud.jobs[-1]["status"] == "failed" and "重新处理" in cloud.jobs[-1]["error"]
+    assert cloud.jobs[-1]["status"] == "failed" and "全部重跑" in cloud.jobs[-1]["error"]
     assert not cloud.results
 
 
 def test_cards_only_adds_stroke_pictures_to_an_older_result(cloud, tmp_path, monkeypatch):
-    """「只更新卡片」 on a video processed before the pictures: technique runs again for the players'
+    """「重跑后处理」 on a video processed before the pictures: technique runs again for the players'
     boxes, then the pictures and clips of the noted strokes go up next to the cards."""
     from badminton import stroke_shots
 
@@ -760,3 +760,11 @@ def test_no_names_on_the_web_leaves_players_json_alone(tmp_path):
     assert (tmp_path / "v.players.json").read_text() == '{"1": "cli"}'
     assert node.use_player_names({"player_names": {}}, tmp_path, "v") is True
     assert json.loads((tmp_path / "v.players.json").read_text()) == {}
+
+
+def test_fresh_rerun_forgets_model_results_but_keeps_names_and_region(tmp_path):
+    for name in ("skeleton.npz", "shuttle.csv", "technique.json", "players.json", "region.json"):
+        (tmp_path / f"v.{name}").write_text("x")
+    node.forget_results(tmp_path, "v")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["v.players.json", "v.region.json"]
+    node.forget_results(tmp_path / "missing", "v")  # nothing there yet: no error

@@ -509,7 +509,7 @@ def auto_calibrate_video(work: Path, court: Path, duration: float, progress: Pro
     if best is None:
         raise StepFailedWithFiles(
             f"自动标定球场失败（试了录像里的 {len(times)} 个时刻）。{reason}\n"
-            "请确认整片球场（四条边线和两条底线）都在画面里；或者在 Mac 上手动标定后，在网页上点“重新处理”。",
+            "请确认整片球场（四条边线和两条底线）都在画面里；或者在 Mac 上手动标定后，在网页上点“全部重跑”。",
             [rejected] if rejected else [])
     shutil.copyfile(best[1], court)
     if best[1].with_suffix(".png").exists():
@@ -743,6 +743,18 @@ def use_region(raw, out_dir: Path, stem: str) -> Path | None:
     return path
 
 
+def forget_results(out_dir: Path, stem: str) -> None:
+    """「全部重跑」 (options["fresh"]): throw away everything the models made for this recording, so
+    nothing is reused. The court calibration (next to the video), names and analysis region stay."""
+    if not out_dir.exists():
+        return
+    keep = {f"{stem}.players.json", f"{stem}.region.json"}
+    gone = [p for p in out_dir.iterdir() if p.is_file() and p.name not in keep]
+    for p in gone:
+        p.unlink()
+    print(f"  全部重跑：丢掉之前的 {len(gone)} 个结果文件，从模型开始")
+
+
 def use_player_names(options: dict, out_dir: Path, stem: str) -> bool:
     """The names given on the web page (options["player_names"], {"1": "小王"}) as <stem>.players.json,
     which every later step reads. None = never named on the web: the file is left as it is.
@@ -801,6 +813,8 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
         progress.done("calibrate", chosen)
     if court.with_suffix(".png").exists():
         extra.append(court.with_suffix(".png"))
+    if options.get("fresh"):
+        forget_results(out_dir, work.stem)
     region = use_region(options.get("region"), out_dir, work.stem)
     named = use_player_names(options, out_dir, work.stem)
     args = ["analyze", str(work), "--court", str(court), "-o", str(out_dir)]
@@ -854,13 +868,13 @@ CARD_RESULTS = ("movement.*.png", "positioning.*.png", "movement.json", "positio
 def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str], run=None,
                   shots_fn=None) -> list[Path]:
     """Only draw the movement and positioning cards again (options["only"] == "cards": the web page's
-    「只更新卡片」, for after the program changed how they are drawn). Everything slow is reused from the
+    「重跑后处理」, for after the program changed how they are drawn, or new player names). Everything slow is reused from the
     earlier run on this Mac, no video is cut or sent; returns the few small files to put over the old ones."""
     sdr = video.with_name(video.stem + "_sdr.mp4")
     work = sdr if sdr.exists() else video
     court = work.with_suffix(".court.json")
     if not court.exists() or not (out_dir / f"{work.stem}.skeleton.npz").exists():
-        raise StepFailed("这台 Mac 上没有这段录像之前的骨架数据，只更新卡片做不了，请用「重新处理」")
+        raise StepFailed("这台 Mac 上没有这段录像之前的骨架数据，重跑后处理做不了，请用「全部重跑」")
     for key in ("sdr", "calibrate", "skeleton", "label"):
         progress.skip(key, "沿用上次的结果")
     progress.start("stats")
@@ -872,7 +886,7 @@ def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress,
         raise StepFailed("重新生成卡片失败")
     progress.done("stats")
     for key in ("cut", "shuttle"):
-        progress.skip(key, "只更新卡片，这一步不动")
+        progress.skip(key, "重跑后处理，沿用模型结果")
     extra = technique_boxes(work, court, out_dir, options.get("mode") != "doubles", progress, log, run)
     shots = stroke_shots(work, out_dir, progress, shots_fn)
     review_inputs(work, court, out_dir, log, run)  # the statistics the AI report reads follow the new numbers
@@ -881,7 +895,7 @@ def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress,
 
 def technique_boxes(work: Path, court: Path, out_dir: Path, singles: bool, progress: Progress, log: list[str],
                     run=None) -> list[Path]:
-    """For 「只更新卡片」: a technique.json from before the pictures needs the players' boxes, so run
+    """For 「重跑后处理」: a technique.json from before the pictures needs the players' boxes, so run
     `badminton technique` again (quick: the strokes are kept). Returns the new technique.json to upload."""
     from .stroke_shots import needs_boxes
 
@@ -892,7 +906,7 @@ def technique_boxes(work: Path, court: Path, out_dir: Path, singles: bool, progr
     except (OSError, ValueError):
         stale = False
     if not (stale and strokes.exists() and npz.exists()):
-        progress.skip("technique", "只更新卡片，这一步不动")
+        progress.skip("technique", "重跑后处理，沿用模型结果")
         return []
     progress.start("technique", "补上每拍球员的位置，好截图")
     args = ["technique", str(work), "--court", str(court), "--data", str(npz), "-o", str(out_dir),
@@ -1285,7 +1299,7 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
             api.upload_result(vid, frame, "frame.jpg")
         progress.done("upload", f"{len(files)} 个文件")
         if cards_only:  # the report on the site stays; asking again would cost tokens for the same words
-            progress.skip("review", "只更新卡片，AI 报告不动")
+            progress.skip("review", "重跑后处理，AI 报告不动")
         else:
             ask_for_review(api, vid, progress, {result_name(f, local.stem) for f in files})
         stop.set()

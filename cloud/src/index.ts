@@ -316,7 +316,7 @@ const cleanName = (raw: unknown) =>
   typeof raw === "string" ? raw.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 20) : "";
 
 // body: { names: {"1": "小王", ...}, shown: {"1": "球员 1", ...} }。shown 是保存前页面上显示的名字，
-// 记进 was，旧的 AI 报告里写的名字网页也能换。处理完的录像存完自动排队「只更新卡片」，卡片图上的名字也换掉。
+// 记进 was，旧的 AI 报告里写的名字网页也能换。只存名字，不排任务：卡片图上的名字等用户点「重跑后处理」再换。
 async function savePlayerNames(req: Request, env: Env, id: string): Promise<Response> {
   const v = await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as { names?: unknown; shown?: unknown } | null;
@@ -338,16 +338,6 @@ async function savePlayerNames(req: Request, env: Env, id: string): Promise<Resp
     if (list.length) was[k] = list.slice(-6);
   }
   await env.DB.prepare("UPDATE videos SET player_names = ? WHERE id = ?").bind(JSON.stringify({ names, was }), id).run();
-  const changed = JSON.stringify(names) !== JSON.stringify(before.playerNames || {});
-  if (changed && v.status === "uploaded" && v.job_status === "done") {
-    // 和「只更新卡片」一样：视频、AI 报告都不动，Mac 只重画卡片
-    const options: Record<string, unknown> = { ...cleanOptions(JSON.parse(v.options || "{}")), only: "cards" };
-    await env.DB.prepare(
-      "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
-    )
-      .bind(JSON.stringify(options), new Date().toISOString(), id)
-      .run();
-  }
   return json(await describe(env, await getVideo(env, id)));
 }
 
@@ -625,9 +615,11 @@ async function updateJob(req: Request, env: Env, id: string): Promise<Response> 
   return json(await describe(env, await getVideo(env, id)));
 }
 
-// 重新处理（失败后，或者改了单打/双打、球员名字之后）。节点本地留着原片，所以云端原片删了也能重跑。
-// body.only = "cards"：只重新出跑动卡片和站位卡片（程序更新了画法之后）。旧结果全部留着，节点只把
-// 卡片和统计这几个小文件传上来盖掉旧的；视频、AI 点评都不动。
+// 重新处理。节点本地留着原片，所以云端原片删了也能重跑。
+// body.fresh = true：「全部重跑」，Mac 上这段录像的模型结果（骨架、找球、击球类型……）全部丢掉从头算；
+//   球场标定、球员名字、分析区域留着。不带 fresh（改单打/双打、改分析区域）时 Mac 能沿用的照旧沿用。
+// body.only = "cards"：「重跑后处理」，沿用模型结果，只重算跑动/站位卡片、统计、逐拍截图。旧结果全部留着，
+//   节点只把这些小文件传上来盖掉旧的；视频、AI 点评都不动。
 async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   const v = await getVideo(env, id);
   if (v.status !== "uploaded") throw new HttpError(409, "还没传完");
@@ -635,9 +627,10 @@ async function retryJob(req: Request, env: Env, id: string): Promise<Response> {
   // only 只管这一次：每次都从干净的选项重新写，不会留到下一次重新处理
   const options: Record<string, unknown> = cleanOptions(body?.options ?? JSON.parse(v.options || "{}"));
   if (body?.only === "cards") {
-    if (v.job_status !== "done") throw new HttpError(409, "这一段还没有处理完的结果，请用「重新处理」");
+    if (v.job_status !== "done") throw new HttpError(409, "这一段还没有处理完的结果，请用「全部重跑」");
     options.only = "cards";
   } else {
+    if (body?.fresh === true) options.fresh = true;
     if (body?.only !== undefined) throw new HttpError(400, "only 只能是 cards");
     // 旧结果不留：换了单打/双打后文件不一样，混在一起会看错。原始画面的截图留着：列表里的封面不空，
     // 排队时也能接着改分析区域
