@@ -669,7 +669,8 @@ def cmd_label(a) -> int:
             continue
         x0, y0, x1, y1 = data["bbox"][i, t.det_index[i]].astype(int)
         cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 255), max(1, int(2 * scale)))
-        label = f"{t.id}" + (f" {t.name}" if t.name else "")
+        # OpenCV's font has no Chinese: such names would come out as "???", the web page shows them beside
+        label = f"{t.id}" + (f" {t.name}" if t.name and t.name.isascii() else "")
         cv2.putText(frame, label, (x0, max(30, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.4 * scale, (0, 0, 0),
                     int(8 * scale), cv2.LINE_AA)
         cv2.putText(frame, label, (x0, max(30, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.4 * scale, (0, 255, 255),

@@ -276,6 +276,22 @@ test("处理任务：排队、领取、汇报进度、传结果、读结果、�
   assert.equal((await (await post("/node/claim", { node: "mac" })).json()).video.options.only, "cards");
   await post(`/videos/${v.id}/job`, { status: "done", stage: "完成" });
 
+  // 球员名字：按录像存，坏编号和空名字丢掉；改名前显示的名字记进 was；处理完的录像自动排队只更新卡片
+  assert.equal(st.playerNames, null);
+  const putNames = (body) => call(`/videos/${v.id}/players`, { method: "PUT", headers: json, body: JSON.stringify(body) });
+  assert.equal((await putNames({})).status, 400);
+  st = await (await putNames({ names: { 1: " 小王 ", 2: "", x: "坏", 3: "老李\n" }, shown: { 1: "球员 1", 2: "球员 2", 3: "球员 3" } })).json();
+  assert.deepEqual(st.playerNames, { 1: "小王", 3: "老李" });
+  assert.deepEqual(st.playerNamesWas, { 1: ["球员 1"], 2: ["球员 2"], 3: ["球员 3"] });
+  assert.equal(st.job.status, "queued");
+  assert.equal(st.options.only, "cards");
+  const named = (await (await post("/node/claim", { node: "mac" })).json()).video;
+  assert.deepEqual(named.playerNames, { 1: "小王", 3: "老李" });
+  st = await (await putNames({ names: { 1: "老李", 3: "小王" }, shown: { 1: "小王", 3: "老李" } })).json();
+  assert.deepEqual(st.playerNamesWas[1], ["球员 1", "小王"]);
+  assert.equal(st.job.status, "processing"); // 正在处理时不重新排队
+  await post(`/videos/${v.id}/job`, { status: "done", stage: "完成" });
+
   // 重新处理：回到排队，可以改单打/双打；旧结果清掉，原始画面的截图（画分析区域用）留着
   assert.equal((await call(`/videos/${v.id}/results/frame.jpg`, { method: "PUT", body: card })).status, 200);
   st = await (await post(`/videos/${v.id}/job/retry`, { options: { mode: "singles" } })).json();

@@ -645,3 +645,35 @@ def test_cards_only_without_earlier_results_says_to_reprocess(cloud, tmp_path):
     assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
     assert cloud.jobs[-1]["status"] == "failed" and "重新处理" in cloud.jobs[-1]["error"]
     assert not cloud.results
+
+
+def test_names_from_the_result_page_go_into_players_json_before_the_cards(cloud, tmp_path, monkeypatch):
+    """Names typed on the web (video["playerNames"]) are written as players.json, which analyze reads."""
+    cloud.video["options"] = {"mode": "doubles", "only": "cards"}
+    cloud.video["playerNames"] = {"1": "小王", "3": "老李", "x": "bad", "4": " "}
+    out = tmp_path / "work" / cloud.video["id"] / "analysis-doubles"
+    out.mkdir(parents=True)
+    (out.parent / "IMG_0964.mov").write_bytes(cloud.original)
+    (out.parent / "IMG_0964.court.json").write_text("{}")
+    (out / "IMG_0964.skeleton.npz").write_bytes(b"old")
+    (out / "IMG_0964.players.json").write_text('{"1": "old", "2": "gone"}')
+    seen = {}
+
+    def fake_run(args, log, on_line, on_frames):
+        if args[0] == "analyze":
+            seen["players"] = json.loads((out / "IMG_0964.players.json").read_text())
+            (out / "IMG_0964.movement.json").write_bytes(b"new")
+        return 0
+
+    monkeypatch.setattr(node, "run_step", fake_run)
+    assert node.run(config(cloud, tmp_path), once=True, analyse_fn=fake_analyse) == 0
+    assert seen["players"] == {"1": "小王", "3": "老李"}
+    assert cloud.jobs[-1]["status"] == "done"
+
+
+def test_no_names_on_the_web_leaves_players_json_alone(tmp_path):
+    (tmp_path / "v.players.json").write_text('{"1": "cli"}')
+    assert node.use_player_names({}, tmp_path, "v") is False
+    assert (tmp_path / "v.players.json").read_text() == '{"1": "cli"}'
+    assert node.use_player_names({"player_names": {}}, tmp_path, "v") is True
+    assert json.loads((tmp_path / "v.players.json").read_text()) == {}
