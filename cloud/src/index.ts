@@ -1504,7 +1504,7 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (!who.owner) {
     // 不是超级管理员：分析结果只能看；标注员和管理员另外有标注这一边。
     // 管理员能看所有录像的标注材料和进度，标注员只能读自己领过任务的录像的
-    if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+    if (who.status !== "active") throw new HttpError(403, "需要管理员批准，请等几分钟或者联系管理员");
     const read = await readOnlyApi(req, env, path);
     if (read) return read;
     if (isViewer(who)) throw new HttpError(403, "这个账号只能看，不能改");

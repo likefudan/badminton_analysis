@@ -329,10 +329,10 @@ const Team = (() => {
       });
       return b;
     };
-    group("申请加入", users.filter((u) => u.status === "pending"), (u) =>
-      card(u, "用 Google 登录过，还没有被邀请", [
-        button("允许（只能看）", "", () => saveUser("/admin/users", { email: u.email, status: "active", role: "viewer" })),
-        button("允许并设为标注员", "plain", () => saveUser("/admin/users", { email: u.email, status: "active", role: "annotator" })),
+    group("等待批准", users.filter((u) => u.status === "pending"), (u) =>
+      card(u, "用 Google 登录过，等你批准", [
+        button("批准（只能看）", "", () => saveUser("/admin/users", { email: u.email, status: "active", role: "viewer" })),
+        button("批准并设为标注员", "plain", () => saveUser("/admin/users", { email: u.email, status: "active", role: "annotator" })),
         remove(u, "拒绝"),
       ]));
     group("成员", users.filter((u) => u.status === "active"), (u) => {
@@ -350,7 +350,7 @@ const Team = (() => {
     });
     group("已停用", users.filter((u) => u.status === "disabled"), (u) =>
       card(u, stats(u), [button("恢复", "plain", () => saveUser("/admin/users", { email: u.email, status: "active" })), remove(u, "删除")]));
-    if (!users.length) box.append(el("div", "empty", "还没有成员。你自己先用 Google 登录一次（登录后在「我是管理员」里输入口令），再在上面邀请别人。"));
+    if (!users.length) box.append(el("div", "empty", "还没有成员。你自己先用 Google 登录一次（登录后在「我是管理员」里输入口令），别人用 Google 登录后会出现在这里等你批准。"));
   }
 
   async function openTeam() {
@@ -361,14 +361,6 @@ const Team = (() => {
     }
   }
 
-  const invite = (role) => async () => {
-    const email = $t("mEmail").value.trim();
-    if (!email) return;
-    await saveUser("/admin/users", { email, status: "active", role });
-    if ($t("mError").hidden) $t("mEmail").value = "";
-  };
-  $t("mAdd").onclick = invite("annotator");
-  $t("mAddViewer").onclick = invite("viewer");
 
   return { setUser, show, cameFrom, openTeam, task, showBar };
 })();
