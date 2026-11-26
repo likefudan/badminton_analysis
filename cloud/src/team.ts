@@ -1,7 +1,7 @@
 // 多人标注：Google 登录、成员（白名单）、领任务。
 // 角色一层包一层：viewer（普通用户，只能看分析结果，什么都不能改）< annotator（标注员，另外能领标注任务）
 // < admin（管理员，另外能管成员和审核标注）。上传、重跑、删除、AI 追问只有超级管理员能做。
-// 登录后浏览器拿到一个随机的会话 cookie（库里只存它的 SHA-256）。没被邀请的账号登录后是 pending，
+// 登录后浏览器拿到一个随机的会话 cookie（库里只存它的 SHA-256）。没批准过的账号登录后是 pending，
 // 管理员在「成员」页点一下就能放行。口令（ACCESS_TOKEN）仍然有效：Mac 节点用它，管理员也可以用它登录，
 // 第一个管理员就是用 Google 登录后再输一次口令认领的。
 
@@ -24,7 +24,7 @@ const LEGACY_COOKIE = "ba_session";
 const SESSION_MS = 30 * 24 * 3600 * 1000;
 export const TASK_LEASE_MS = 2 * 3600 * 1000;  // 领了任务这么久没有保存，任务放回大厅
 const MAX_HELD = 3;                            // 标注员同时最多领几个任务
-const MAX_PENDING = 100;                       // 没被邀请的账号最多记这么多个
+const MAX_PENDING = 100;                       // 等批准的账号最多记这么多个
 const STROKES_PER_TASK = 20;
 
 const superAdmin = (env: Env) => (env.ADMIN_GOOGLE_EMAIL ?? "").trim().toLowerCase();
@@ -496,7 +496,7 @@ export async function teamApi(req: Request, env: Env, path: string, who: Who): P
   const m = req.method;
   if (path === "/auth/claim-admin" && m === "POST") return claimAdmin(req, env, who);
   if (!path.startsWith("/tasks") && !path.startsWith("/admin/")) return null;
-  if (who.status !== "active") throw new HttpError(403, "这个账号还没有被邀请");
+  if (who.status !== "active") throw new HttpError(403, "需要管理员批准，请等几分钟或者联系管理员");
   if (isViewer(who)) throw new HttpError(403, "这个账号只能看，不能改");
   if (path === "/tasks" && m === "GET") return listTasks(env, who);
   const match = path.match(/^\/tasks\/(\d{1,12})\/(claim|release|submit|approve|return)$/);

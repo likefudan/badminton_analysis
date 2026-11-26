@@ -109,7 +109,7 @@ async function tryLogin() {
     $("pending").hidden = false;
     $("app").hidden = true;
     $("pendingWho").textContent = me.email;
-    $("pendingMsg").textContent = me.status === "disabled" ? "这个账号已经被管理员停用。" : "这个账号还没有被邀请。管理员已经能在「成员」页看到你的申请，放行后刷新这个页面就能进。";
+    $("pendingMsg").textContent = me.status === "disabled" ? "这个账号已经被管理员停用。" : "需要管理员批准，请等几分钟或者联系管理员。批准后刷新这个页面就能进。";
     return;
   }
   authed = true;
