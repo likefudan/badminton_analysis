@@ -209,6 +209,7 @@ STEPS = [
     ("cut", "剪辑回合视频"),
     ("shuttle", "羽毛球追踪"),
     ("technique", "击球类型和动作"),
+    ("shots", "逐拍截图"),
     ("upload", "转码并上传结果"),
     ("review", "AI 报告"),
 ]
@@ -578,7 +579,7 @@ def track_shuttle(work: Path, court: Path, out_dir: Path, progress: Progress, lo
     return combined
 
 
-TECHNIQUE_VERSION = "2"  # raise when strokes / technique change, so recordings on this Mac are redone
+TECHNIQUE_VERSION = "3"  # raise when strokes / technique change, so recordings on this Mac are redone
 
 
 def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, progress: Progress, log: list[str],
@@ -630,6 +631,30 @@ def stroke_technique(work: Path, court: Path, out_dir: Path, singles: bool, prog
     except (OSError, ValueError):
         progress.done("technique")
     return technique
+
+
+def stroke_shots(work: Path, out_dir: Path, progress: Progress, shots_fn=None) -> list[Path]:
+    """Pictures and short clips of the strokes that got a note (逐拍分析 on the page), cut from the
+    video around each hit. A failure only leaves them out."""
+    technique = out_dir / f"{work.stem}.technique.json"
+    if not technique.exists():
+        progress.skip("shots", "没有击球动作的结果")
+        return []
+    from . import stroke_shots as SS
+
+    try:
+        if not SS.picked(json.loads(technique.read_text())):
+            SS.make_shots(work, technique, out_dir)  # clears pictures of an earlier run
+            progress.skip("shots", "没有带提示的击球")
+            return []
+        progress.start("shots", "从视频里截出有提示的每一拍")
+        files = (shots_fn or SS.make_shots)(work, technique, out_dir)
+    except Exception as e:  # noqa: BLE001 - pictures are extra; never fail the job for them
+        print(f"  逐拍截图没有成功：{e}")
+        progress.skip("shots", f"这次没有成功，其它结果不受影响（{str(e)[:120]}）")
+        return []
+    progress.done("shots", f"{sum(1 for f in files if f.suffix == '.jpg')} 拍")
+    return files
 
 
 def rally_points(work: Path, court: Path, out_dir: Path, singles: bool, run=None) -> Path | None:
@@ -779,6 +804,7 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
             progress.skip(key, "这次没有运行")
     combined = track_shuttle(work, court, out_dir, progress, log, region=region)
     stroke_technique(work, court, out_dir, options.get("mode") != "doubles", progress, log)
+    shots = stroke_shots(work, out_dir, progress)
     rally_points(work, court, out_dir, options.get("mode") != "doubles")
     review_inputs(work, court, out_dir, log)
     files = sorted(p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in RESULT_SUFFIXES)
@@ -786,14 +812,15 @@ def analyse(video: Path, out_dir: Path, options: dict, progress: Progress, log: 
         files = [p for p in files if p.name != f"{work.stem}.skeleton.mp4"]
     else:
         files = [p for p in files if p.name != f"{work.stem}.combined.mp4"]
-    return extra + files
+    return extra + files + shots
 
 
 CARD_RESULTS = ("movement.*.png", "positioning.*.png", "movement.json", "positioning.json", "report.json",
                 "review.*.json")
 
 
-def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str], run=None) -> list[Path]:
+def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress, log: list[str], run=None,
+                  shots_fn=None) -> list[Path]:
     """Only draw the movement and positioning cards again (options["only"] == "cards": the web page's
     「只更新卡片」, for after the program changed how they are drawn). Everything slow is reused from the
     earlier run on this Mac, no video is cut or sent; returns the few small files to put over the old ones."""
@@ -811,10 +838,37 @@ def refresh_cards(video: Path, out_dir: Path, options: dict, progress: Progress,
     if (run or run_step)(args, log, None, None) != 0:
         raise StepFailed("重新生成卡片失败")
     progress.done("stats")
-    for key in ("cut", "shuttle", "technique"):
+    for key in ("cut", "shuttle"):
         progress.skip(key, "只更新卡片，这一步不动")
+    extra = technique_boxes(work, court, out_dir, options.get("mode") != "doubles", progress, log, run)
+    shots = stroke_shots(work, out_dir, progress, shots_fn)
     review_inputs(work, court, out_dir, log, run)  # the statistics the AI report reads follow the new numbers
-    return sorted({p for pattern in CARD_RESULTS for p in out_dir.glob(f"{work.stem}.{pattern}")})
+    return sorted({p for pattern in CARD_RESULTS for p in out_dir.glob(f"{work.stem}.{pattern}")} | set(extra)) + shots
+
+
+def technique_boxes(work: Path, court: Path, out_dir: Path, singles: bool, progress: Progress, log: list[str],
+                    run=None) -> list[Path]:
+    """For 「只更新卡片」: a technique.json from before the pictures needs the players' boxes, so run
+    `badminton technique` again (quick: the strokes are kept). Returns the new technique.json to upload."""
+    from .stroke_shots import needs_boxes
+
+    technique, strokes = out_dir / f"{work.stem}.technique.json", out_dir / f"{work.stem}.strokes.json"
+    npz, csv = out_dir / f"{work.stem}.skeleton.npz", out_dir / f"{work.stem}.shuttle.csv"
+    try:
+        stale = technique.exists() and needs_boxes(json.loads(technique.read_text()))
+    except (OSError, ValueError):
+        stale = False
+    if not (stale and strokes.exists() and npz.exists()):
+        progress.skip("technique", "只更新卡片，这一步不动")
+        return []
+    progress.start("technique", "补上每拍球员的位置，好截图")
+    args = ["technique", str(work), "--court", str(court), "--data", str(npz), "-o", str(out_dir),
+            "--strokes", str(strokes)] + (["--shuttle", str(csv)] if csv.exists() else []) + (["--singles"] if singles else [])
+    if (run or run_step)(args, log, None, None) != 0 or not technique.exists():
+        progress.skip("technique", "没有成功，截图跳过")
+        return []
+    progress.done("technique")
+    return [technique]
 
 
 def result_name(path: Path, stem: str) -> str:
@@ -1180,7 +1234,7 @@ def process(api: Api, cfg: Config, video: dict, analyse_fn=analyse) -> None:
         for i, f in enumerate(files, 1):
             name = result_name(f, local.stem)
             progress.update("upload", percent=(i - 1) * 100 // len(files), detail=f"第 {i}/{len(files)} 个：{name}")
-            if f.suffix.lower() == ".mp4":
+            if f.suffix.lower() == ".mp4" and not name.startswith("shot."):  # stroke clips are small H.264 already
                 f = web_video(f, web_dir / name)
             elif f.suffix.lower() == ".png":
                 f = web_image(f, web_dir / (name[:-4] + ".jpg"))
