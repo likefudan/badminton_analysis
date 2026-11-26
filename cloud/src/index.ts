@@ -59,6 +59,7 @@ type VideoRow = {
   job_lease_until: string | null;
   job_updated_at: string | null;
   options: string;
+  player_names: string | null;
   original_deleted_at: string | null;
   job_progress: string;
   job_started_at: string | null;
@@ -193,6 +194,8 @@ async function describe(env: Env, v: VideoRow) {
       progress: v.job_progress ? JSON.parse(v.job_progress) : null,
     },
     options: JSON.parse(v.options),
+    // 网页上起的球员名字；null = 没起过。was = 改名前显示过的名字（换掉旧 AI 报告里的名字用）
+    ...playerNamesOf(v),
     originalDeleted: v.original_deleted_at !== null,
     results: results.results.map((r) => ({ name: r.name, size: r.size, contentType: r.content_type })),
     id: v.id,
@@ -291,6 +294,60 @@ async function renameVideo(req: Request, env: Env, id: string): Promise<Response
   const body = (await req.json().catch(() => null)) as { title?: unknown } | null;
   if (typeof body?.title !== "string") throw new HttpError(400, "缺少标题");
   await env.DB.prepare("UPDATE videos SET title = ? WHERE id = ?").bind(body.title.trim().slice(0, 80), id).run();
+  return json(await describe(env, await getVideo(env, id)));
+}
+
+// ---------- 球员名字（每段录像单独起） ----------
+
+type PlayerNames = { names: Record<string, string>; was: Record<string, string[]> };
+
+function playerNamesOf(v: VideoRow): { playerNames: Record<string, string> | null; playerNamesWas: Record<string, string[]> } {
+  if (!v.player_names) return { playerNames: null, playerNamesWas: {} };
+  try {
+    const p = JSON.parse(v.player_names) as PlayerNames;
+    return { playerNames: p.names || {}, playerNamesWas: p.was || {} };
+  } catch {
+    return { playerNames: null, playerNamesWas: {} };
+  }
+}
+
+// 名字只留可见字符，最多 20 个字
+const cleanName = (raw: unknown) =>
+  typeof raw === "string" ? raw.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 20) : "";
+
+// body: { names: {"1": "小王", ...}, shown: {"1": "球员 1", ...} }。shown 是保存前页面上显示的名字，
+// 记进 was，旧的 AI 报告里写的名字网页也能换。处理完的录像存完自动排队「只更新卡片」，卡片图上的名字也换掉。
+async function savePlayerNames(req: Request, env: Env, id: string): Promise<Response> {
+  const v = await getVideo(env, id);
+  const body = (await req.json().catch(() => null)) as { names?: unknown; shown?: unknown } | null;
+  if (!body || !body.names || typeof body.names !== "object") throw new HttpError(400, "缺少 names");
+  const names: Record<string, string> = {};
+  for (const [k, raw] of Object.entries(body.names as Record<string, unknown>).slice(0, 12)) {
+    const name = cleanName(raw);
+    if (/^\d{1,4}$/.test(k) && name) names[k] = name;
+  }
+  const before = playerNamesOf(v);
+  const was: Record<string, string[]> = { ...before.playerNamesWas };
+  const shown = body.shown && typeof body.shown === "object" ? (body.shown as Record<string, unknown>) : {};
+  const ids = new Set([...Object.keys(names), ...Object.keys(before.playerNames || {}), ...Object.keys(shown)]);
+  for (const k of ids) {
+    if (!/^\d{1,4}$/.test(k)) continue;
+    const old = [cleanName(shown[k]), (before.playerNames || {})[k] || ""];
+    const list = [...(was[k] || [])];
+    for (const o of old) if (o && o !== names[k] && !list.includes(o)) list.push(o);
+    if (list.length) was[k] = list.slice(-6);
+  }
+  await env.DB.prepare("UPDATE videos SET player_names = ? WHERE id = ?").bind(JSON.stringify({ names, was }), id).run();
+  const changed = JSON.stringify(names) !== JSON.stringify(before.playerNames || {});
+  if (changed && v.status === "uploaded" && v.job_status === "done") {
+    // 和「只更新卡片」一样：视频、AI 报告都不动，Mac 只重画卡片
+    const options: Record<string, unknown> = { ...cleanOptions(JSON.parse(v.options || "{}")), only: "cards" };
+    await env.DB.prepare(
+      "UPDATE videos SET job_status = 'queued', job_stage = '', job_error = '', job_progress = '', job_lease_until = NULL, options = ?, job_updated_at = ? WHERE id = ?",
+    )
+      .bind(JSON.stringify(options), new Date().toISOString(), id)
+      .run();
+  }
   return json(await describe(env, await getVideo(env, id)));
 }
 
@@ -1539,6 +1596,8 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   if (match && m === "POST") return updateJob(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/job\/retry$/);
   if (match && m === "POST") return retryJob(req, env, match[1]);
+  match = path.match(/^\/videos\/([0-9a-f-]{36})\/players$/);
+  if (match && m === "PUT") return savePlayerNames(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review$/);
   if (match && m === "POST") return makeReview(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review\/ask$/);
