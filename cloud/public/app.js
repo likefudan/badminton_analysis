@@ -1082,7 +1082,7 @@ async function renderDetail() {
       }
     }
   }
-  const waiting = v.job && v.job.status === "archived" ? "云端只保留最近约 10 GB 的结果，这一段的结果已经清理，Mac 上还有。点「处理」里的「重新处理」可以重新生成。"
+  const waiting = v.job && v.job.status === "archived" ? "云端只保留最近约 10 GB 的结果，这一段的结果已经清理，Mac 上还有。点「处理」里的「全部重跑」可以重新生成。"
     : "处理完成后，结果会出现在这里。进度在「处理」里。";
   for (const pane of [panes.videos, panes.cards]) if (!pane.children.length) pane.append(el("p", "empty", waiting));
   if (!strokesPane.children.length) {
@@ -1340,7 +1340,7 @@ async function runReview(id, path, body) {
 
 // ---------- 球员是谁（概览最上面） ----------
 // 编号图 + 每个编号的名字。超级管理员可以改，名字按录像存在云端；别人只看名字。
-// 这一页的表格、得失分、击球动作、AI 报告马上换成名字；卡片图上的名字要 Mac 重画（自动排队「只更新卡片」）。
+// 这一页的表格、得失分、击球动作、AI 报告马上换成名字；卡片图上的名字要用户点「重跑后处理」才换。
 function playersBox(v, mv, baked, names) {
   const box = $("dPlayers");
   box.textContent = "";
@@ -1394,10 +1394,9 @@ function playersBox(v, mv, baked, names) {
     note.className = "quiet";
     note.textContent = "保存中……";
     try {
-      const nv = await api(`/videos/${v.id}/players`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      await api(`/videos/${v.id}/players`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       log("球员名字已保存");
-      note.textContent = nv.job && nv.job.status === "queued" && nv.options && nv.options.only === "cards"
-        ? "已保存。卡片图上的名字要等 Mac 重画（已排队「只更新卡片」，几分钟）。" : "已保存。";
+      note.textContent = "已保存。卡片图片上的名字没有变，想换的话点「处理」里的「重跑后处理」。";
       await refreshList();
     } catch (e) {
       note.className = "bad";
@@ -1860,9 +1859,11 @@ $("aiSave").onclick = () => {
 
 $("dRetry").onclick = async () => {
   try {
-    await api(`/videos/${openId}/job/retry`, { method: "POST" });
-    log("已重新排队");
-  } catch (e) { log("重新处理失败：" + e.message); }
+    await api(`/videos/${openId}/job/retry`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fresh: true }),
+    });
+    log("已排队：全部重跑，从模型开始");
+  } catch (e) { log("全部重跑失败：" + e.message); }
   refreshList();
 };
 $("dCards").onclick = async () => {
@@ -1870,8 +1871,8 @@ $("dCards").onclick = async () => {
     await api(`/videos/${openId}/job/retry`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ only: "cards" }),
     });
-    log("已排队：只更新卡片，视频和 AI 点评不动");
-  } catch (e) { log("更新卡片失败：" + e.message); }
+    log("已排队：重跑后处理，模型结果、视频和 AI 报告不动");
+  } catch (e) { log("重跑后处理失败：" + e.message); }
   refreshList();
 };
 $("dMode").onclick = async () => {
