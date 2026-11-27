@@ -17,8 +17,12 @@ const isAdmin = () => Boolean(me && me.role === "admin" && me.status === "active
 const isOwner = () => Boolean(isAdmin() && me.owner);
 // 普通用户：只能看分析结果，没有标注这一边
 const isViewer = () => Boolean(me && me.role === "viewer" && me.status === "active");
-// 超级管理员以外的人看分析结果都是只读的（我的录像和每段录像的概览、视频、卡片）。后端也只放行读接口
-const readOnly = () => !isOwner();
+// 超级管理员给的「能用 Mac 分析」：能上传自己的录像，管自己传的录像（后端 analystApi）
+const isAnalyst = () => Boolean(me && !isOwner() && me.canAnalyze && me.status === "active");
+const isMine = (v) => Boolean(v && isAnalyst() && v.uploader && v.uploader === me.email);
+const canEditVideo = (v) => isOwner() || isMine(v);
+// 超级管理员以外的人看分析结果都是只读的（我的录像和每段录像的概览、视频、卡片），自己传的录像除外。后端也只放行读接口
+const readOnly = () => !canEditVideo(openId && videos.find((x) => x.id === openId));
 // 每个请求都带 x-ba（服务器靠它确认请求是本站的网页发的）；有口令再带口令
 const authHeaders = () => (token ? { "x-ba": "1", authorization: "Bearer " + token } : { "x-ba": "1" });
 
@@ -118,10 +122,11 @@ async function tryLogin() {
   document.body.classList.toggle("annotator", !isAdmin());
   document.body.classList.toggle("owner", isOwner());
   document.body.classList.toggle("viewer", isViewer());
+  document.body.classList.toggle("analyst", isAnalyst());
   Team.setUser();
   route();
   refreshList();
-  if (isOwner()) loadAi();
+  if (isOwner() || isAnalyst()) loadAi();
 }
 function showLogin(msg) {
   authed = false;
@@ -694,7 +699,8 @@ const fmtClock = (s) => {
 };
 
 function queueText(v) {
-  const ahead = videos.filter((x) => x.id !== v.id && x.status === "uploaded" && x.job &&
+  // 服务器算的（超级管理员的录像排在别人前面，别人传的录像这里看不到）；旧的服务器没有就自己数
+  const ahead = typeof v.job.ahead === "number" ? v.job.ahead : videos.filter((x) => x.id !== v.id && x.status === "uploaded" && x.job &&
     (x.job.status === "processing" || (x.job.status === "queued" && x.completedAt < v.completedAt))).length;
   const where = ahead ? `排队中，前面还有 ${ahead} 局` : "排队中，下一个就是它";
   if (!node) return where + "。Mac 上的处理程序还没连接过";
@@ -738,7 +744,10 @@ const FILTERS = [
   ["busy", "进行中", (v) => v.status !== "uploaded" || busy(v)],
   ["done", "已完成", (v) => v.status === "uploaded" && v.job && v.job.status === "done"],
   ["failed", "失败", (v) => v.status === "uploaded" && v.job && v.job.status === "failed"],
+  // 超级管理员：别的成员传的；能用 Mac 分析的成员：自己传的
+  ["others", () => (isOwner() ? "别人传的" : "我传的"), (v) => (isOwner() ? Boolean(v.uploader) : isMine(v))],
 ];
+const uploaderName = (v) => (v.uploader ? (isMine(v) ? "我传的" : v.uploader.split("@")[0] + " 传的") : "");
 
 function coverOf(v) {
   const have = new Set(v.results.map((r) => r.name));
@@ -762,7 +771,7 @@ function renderList() {
   for (const [key, label, test] of FILTERS) {
     const n = videos.filter(test).length;
     if (key !== "all" && !n) continue;
-    const b = el("button", key === filter ? "on" : "", label);
+    const b = el("button", key === filter ? "on" : "", typeof label === "function" ? label() : label);
     b.append(el("span", "n", String(n)));
     b.onclick = () => { filter = key; renderList(); };
     chips.append(b);
@@ -772,7 +781,7 @@ function renderList() {
   box.textContent = "";
   const test = (FILTERS.find((f) => f[0] === filter) || FILTERS[0])[2];
   const shown = videos.filter(test);
-  if (!videos.length) box.append(el("div", "empty", readOnly() ? "还没有录像。" : "还没有录像。点上面的「上传录像」，传完后家里的 Mac 会自动分析。"));
+  if (!videos.length) box.append(el("div", "empty", !isOwner() && !isAnalyst() ? "还没有录像。" : "还没有录像。点上面的「上传录像」，传完后家里的 Mac 会自动分析。"));
   else if (!shown.length) box.append(el("div", "empty", "这一类里没有录像"));
   for (const v of shown) {
     const card = el("div", "vcard");
@@ -791,7 +800,7 @@ function renderList() {
     }
     const body = el("div", "body");
     body.append(el("div", "name", titleOf(v)));
-    body.append(el("div", "sub", `${fmtDate(shotAt(v))} · ${v.options && v.options.mode === "doubles" ? "双打" : "单打"} · ${fmtBytes(v.size)}`));
+    body.append(el("div", "sub", [fmtDate(shotAt(v)), v.options && v.options.mode === "doubles" ? "双打" : "单打", fmtBytes(v.size), uploaderName(v)].filter(Boolean).join(" · ")));
     const [cls, text] = badgeOf(v);
     body.append(el("span", "badge " + cls, text));
     card.append(cover, body);
@@ -911,7 +920,8 @@ function route() {
   // 超级管理员什么都能进；别的管理员只有标注这一边和成员；标注员只有任务和标注页
   const labeling = /^#\/(tasks$|label\/|strokes\/)/.test(h);
   // 谁都能看「我的录像」和每段录像的结果页（超级管理员以外是只读的）；普通用户只有这些
-  const allowed = isOwner() || /^#\/(v\/[0-9a-f-]{36})?$/.test(h) || (!isViewer() && labeling) || (isAdmin() && /^#\/(materials|review|team)$/.test(h));
+  const allowed = isOwner() || /^#\/(v\/[0-9a-f-]{36})?$/.test(h) || (!isViewer() && labeling) || (isAdmin() && /^#\/(materials|review|team)$/.test(h)) ||
+    (isAnalyst() && h === "#/upload");
   if (!allowed) h = "#/";
   const m = h.match(/^#\/v\/([0-9a-f-]{36})$/);
   const lm = h.match(/^#\/label\/([0-9a-f-]{36})(?:\/t(\d+))?$/);
@@ -971,6 +981,7 @@ function openDetail(id) {
 }
 function closeDetail() {
   openId = null;
+  document.body.classList.remove("mine");
   for (const pane of ["tVideos", "tCards", "dCourt"]) $(pane).textContent = ""; // 停掉正在放的视频
 }
 
@@ -999,13 +1010,14 @@ const RESULT_ORDER = [
 async function renderDetail() {
   const v = videos.find((x) => x.id === openId);
   if (!v) { location.hash = "#/"; return; }
+  document.body.classList.toggle("mine", canEditVideo(v)); // 能改这段录像：显示「改标题」和「处理」
   $("dTitle").textContent = titleOf(v);
   const m = v.meta || {};
   $("dMeta").textContent = [
     v.title ? v.filename : "", fmtDate(shotAt(v)), m.duration ? fmtDur(m.duration) : "",
     m.width ? `${m.width}×${m.height}${m.fps ? ` ${Math.round(m.fps)} 帧` : ""}` : "", fmtBytes(v.size),
     v.options && v.options.mode === "doubles" ? "双打" : "单打",
-    v.options && v.options.region ? "有分析区域" : "",
+    v.options && v.options.region ? "有分析区域" : "", uploaderName(v),
   ].filter(Boolean).join(" · ");
   const st = $("dStatus");
   st.textContent = statusText(v);
@@ -1294,9 +1306,16 @@ async function renderReview(v, force) {
   if (note.textContent) box.append(note);
   // 超级管理员以外只能看报告和已有的问答：不能生成、不能追问（后端也会拒绝）
   if (!can || busyNow || !available || readOnly()) return;
-  const field = el("div", "field");
-  field.append(el("label", "", "用哪个模型"), modelSelect());
-  box.append(field);
+  // 别的成员只能用默认模型，每月有次数
+  const quota = !isOwner() && ai && ai.quota;
+  if (quota) {
+    const left = (q) => Math.max(0, q.limit - q.used);
+    box.append(el("p", "quiet", `这个月你还能生成 ${left(quota.reports)} 次报告、追问 ${left(quota.asks)} 次（每月 ${quota.reports.limit} 次、${quota.asks.limit} 次）。`));
+  } else {
+    const field = el("div", "field");
+    field.append(el("label", "", "用哪个模型"), modelSelect());
+    box.append(field);
+  }
   const row = el("div", "row");
   const make = el("button", "plain", report ? "重新生成报告" : "生成 AI 报告");
   make.onclick = () => runReview(v.id, "/review", {});
@@ -1334,6 +1353,7 @@ async function runReview(id, path, body) {
     log(reviewError);
   }
   reviewBusy = "";
+  if (!isOwner()) { try { ai = await api("/ai"); } catch {} } // 更新这个月还剩几次
   await refreshList();
   again();
 }
@@ -1600,7 +1620,7 @@ function pointsCard(doc, names, labels = {}, onLabel = null) {
 // 在结果页上显示、并让超级管理员标谁赢
 async function showPoints(v, doc, names, holder) {
   let labels = {};
-  const editable = isOwner();
+  const editable = canEditVideo(v);
   if (editable || readOnly()) {
     try { labels = (await api(`/videos/${v.id}/rally-labels`)).labels || {}; } catch {}
   }
@@ -1776,7 +1796,7 @@ function techniqueCard(doc, names, fileUrl = () => null) {
 
 async function loadAi() {
   try { ai = await api("/ai"); } catch (e) { $("aiState").textContent = "读取失败：" + e.message; return; }
-  renderAi();
+  if (isOwner()) renderAi(); // 别的成员拿到的只有默认模型和这个月的次数，没有设置页
   const v = openId && videos.find((x) => x.id === openId);
   if (v) renderReview(v);
 }

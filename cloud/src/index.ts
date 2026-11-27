@@ -1,4 +1,4 @@
-import { identify, publicApi, teamApi, requireTaskOn, guardLabelWrite, isAdmin, isViewer, meJson, type Who } from "./team";
+import { identify, publicApi, teamApi, requireTaskOn, guardLabelWrite, isAdmin, isAnalyst, isViewer, meJson, type Who } from "./team";
 
 // ba.llmat.dev 后端。阶段 0：录像分片上传到 R2，可断点续传。
 // 接口在 /api/v1 下，用 Bearer 口令登录；网页、将来的 App 和 Mac 处理节点共用。
@@ -35,6 +35,10 @@ const MAX_SIZE = 200 * 1024 ** 3;
 const USER_ID = "owner"; // 第一版只有一个用户
 const LEASE_MS = 10 * 60 * 1000;        // 处理节点这么久没有消息，任务可以被重新领取
 const KEEP_RESULT_BYTES = 10 * 1024 ** 3; // 云端只留最近这么多结果，更早的只在 Mac 上
+// 「能用 Mac 分析」的成员（不是超级管理员）的限额：Mac 只有一台，AI 用的是超级管理员的额度
+const ANALYST_ACTIVE = 2;           // 每人同时最多这么多段在上传、排队或处理中
+const ANALYST_REPORTS_PER_MONTH = 10; // 每人每月（按 UTC 的自然月）最多生成几次 AI 报告
+const ANALYST_ASKS_PER_MONTH = 30;    // 每人每月最多追问几次
 const SESSION_COOKIE = "ba_session";
 // 网页上停手这么久（默认 60 秒）后，Mac 节点把标注同步回去；测试里设成 0
 const labelSyncDelay = (env: Env) => (env.LABEL_SYNC_DELAY_S !== undefined && env.LABEL_SYNC_DELAY_S !== "" ? Number(env.LABEL_SYNC_DELAY_S) : 60) * 1000;
@@ -81,6 +85,7 @@ type VideoRow = {
   stroke_labels_synced_at: string | null;
   rally_labels_changed_at: string | null;
   rally_labels_synced_at: string | null;
+  uploader: string; // 空 = 超级管理员传的；别人传的是他的邮箱
 };
 
 type ResultRow = { video_id: string; name: string; r2_key: string; size: number; content_type: string; created_at: string };
@@ -143,6 +148,25 @@ async function getVideo(env: Env, id: string): Promise<VideoRow> {
   return row;
 }
 
+// 超级管理员以外的人：别人（不是超级管理员）传的录像当作不存在
+async function getVideoFor(env: Env, who: Who, id: string): Promise<VideoRow> {
+  const v = await getVideo(env, id);
+  if (!who.owner && v.uploader && v.uploader !== who.email) throw new HttpError(404, "没有这个录像");
+  return v;
+}
+
+// 排队中的录像前面还有几段：处理中的，加上排在它前面的（超级管理员的录像排在别人的前面，同一档按传完的先后）
+async function queueAhead(env: Env, v: VideoRow): Promise<number> {
+  const mineFirst = v.uploader ? 0 : 1;
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM videos WHERE user_id = ? AND status = 'uploaded' AND id <> ? AND (job_status = 'processing' OR (job_status = 'queued'
+       AND ((uploader = '') > ? OR ((uploader = '') = ? AND completed_at < ?))))`,
+  )
+    .bind(USER_ID, v.id, mineFirst, mineFirst, v.completed_at ?? "")
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 async function describe(env: Env, v: VideoRow) {
   const parts = await env.DB.prepare(
     "SELECT part_number, size FROM video_parts WHERE video_id = ? ORDER BY part_number",
@@ -192,7 +216,9 @@ async function describe(env: Env, v: VideoRow) {
       updatedAt: v.job_updated_at,
       startedAt: v.job_started_at,
       progress: v.job_progress ? JSON.parse(v.job_progress) : null,
+      ...(v.status === "uploaded" && v.job_status === "queued" ? { ahead: await queueAhead(env, v) } : {}),
     },
+    uploader: v.uploader,
     options: JSON.parse(v.options),
     // 网页上起的球员名字；null = 没起过。was = 改名前显示过的名字（换掉旧 AI 报告里的名字用）
     ...playerNamesOf(v),
@@ -214,7 +240,7 @@ async function describe(env: Env, v: VideoRow) {
   };
 }
 
-async function createVideo(req: Request, env: Env): Promise<Response> {
+async function createVideo(req: Request, env: Env, uploader = ""): Promise<Response> {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const filename = typeof body?.filename === "string" ? body.filename.slice(0, 200) : "";
   const size = typeof body?.size === "number" ? body.size : NaN;
@@ -232,10 +258,10 @@ async function createVideo(req: Request, env: Env): Promise<Response> {
   const key = `originals/${USER_ID}/${id}.${ext}`;
   const upload = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType } });
   await env.DB.prepare(
-    `INSERT INTO videos (id, user_id, filename, size, content_type, part_size, r2_key, upload_id, status, meta, options, title, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?)`,
+    `INSERT INTO videos (id, user_id, filename, size, content_type, part_size, r2_key, upload_id, status, meta, options, title, uploader, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?, ?)`,
   )
-    .bind(id, USER_ID, filename, size, contentType, partSizeFor(size), key, upload.uploadId, meta, options, title, new Date().toISOString())
+    .bind(id, USER_ID, filename, size, contentType, partSizeFor(size), key, upload.uploadId, meta, options, title, uploader, new Date().toISOString())
     .run();
   return json(await describe(env, await getVideo(env, id)), 201);
 }
@@ -511,7 +537,7 @@ async function claimJob(req: Request, env: Env): Promise<Response> {
        WHERE id = (
          SELECT id FROM videos WHERE user_id = ? AND status = 'uploaded'
            AND (job_status = 'queued' OR (job_status = 'processing' AND job_lease_until < ?))
-         ORDER BY completed_at LIMIT 1)
+         ORDER BY uploader <> '', completed_at LIMIT 1)
        RETURNING *`,
     )
       .bind(node, new Date(now.getTime() + LEASE_MS).toISOString(), now.toISOString(), now.toISOString(), USER_ID, now.toISOString())
@@ -959,38 +985,41 @@ async function askModel(env: Env, m: Model, r: ReviewRequest, messages: Message[
   return { text, inputTokens: input, outputTokens: output };
 }
 
-async function recordUsage(env: Env, id: string, kind: "report" | "ask", m: Model, a: Answer): Promise<UsageRow> {
+async function recordUsage(env: Env, id: string, kind: "report" | "ask", m: Model, a: Answer, actor: string): Promise<UsageRow> {
   const p = modelPrice(m, (await aiSettings(env)).prices);
   const cost = p.in !== null && p.out !== null ? (a.inputTokens * p.in + a.outputTokens * p.out) / 1e6 : null;
   const row: UsageRow = {
     video_id: id, kind, model: m.id, input_tokens: a.inputTokens, output_tokens: a.outputTokens, cost_usd: cost, created_at: new Date().toISOString(),
   };
-  await env.DB.prepare("INSERT INTO ai_usage (user_id, video_id, kind, model, input_tokens, output_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-    .bind(USER_ID, id, kind, m.id, a.inputTokens, a.outputTokens, cost, row.created_at)
+  await env.DB.prepare("INSERT INTO ai_usage (user_id, video_id, kind, model, input_tokens, output_tokens, cost_usd, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(USER_ID, id, kind, m.id, a.inputTokens, a.outputTokens, cost, actor, row.created_at)
     .run();
   return row;
 }
 
-async function makeReview(req: Request, env: Env, id: string): Promise<Response> {
+// 别人（不是超级管理员）只能用默认模型，每月有次数
+async function makeReview(req: Request, env: Env, id: string, who: Who): Promise<Response> {
   await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as { model?: unknown } | null;
   const r = await reviewRequest(env, id);
-  const m = await pickModel(env, body?.model);
+  if (!who.owner) await requireAiQuota(env, who, "report");
+  const m = await pickModel(env, who.owner ? body?.model : undefined);
   const answer = await askModel(env, m, r, [{ role: "user", content: r.user }]);
-  await recordUsage(env, id, "report", m, answer);
+  await recordUsage(env, id, "report", m, answer, who.owner ? "" : who.email);
   const note = `> 由 ${m.label} 根据程序算出的统计数字生成，它没有看视频。数字以上面的表和卡片为准。`;
   await saveResultText(env, id, "review.md", `${answer.text}\n\n${note}\n`);
   await deleteResult(env, id, "review.qa.md"); // 追问是接着旧报告问的，报告换了就不再对得上
   return json(await describe(env, await getVideo(env, id)));
 }
 
-async function askReview(req: Request, env: Env, id: string): Promise<Response> {
+async function askReview(req: Request, env: Env, id: string, who: Who): Promise<Response> {
   await getVideo(env, id);
   const body = (await req.json().catch(() => null)) as { question?: unknown; model?: unknown } | null;
   const question = typeof body?.question === "string" ? body.question.trim().slice(0, 1000) : "";
   if (!question) throw new HttpError(400, "请写下要问的问题");
   const r = await reviewRequest(env, id);
-  const m = await pickModel(env, body?.model);
+  if (!who.owner) await requireAiQuota(env, who, "ask");
+  const m = await pickModel(env, who.owner ? body?.model : undefined);
   const report = await resultText(env, id, "review.md");
   const earlier = (await resultText(env, id, "review.qa.md")) ?? "";
   const messages: Message[] = [{ role: "user", content: r.user }];
@@ -1004,7 +1033,7 @@ async function askReview(req: Request, env: Env, id: string): Promise<Response> 
   }
   messages.push({ role: "user", content: ask(question) });
   const answer = await askModel(env, m, r, messages);
-  await recordUsage(env, id, "ask", m, answer);
+  await recordUsage(env, id, "ask", m, answer, who.owner ? "" : who.email);
   const oneLine = question.replace(/\s+/g, " ");
   await saveResultText(env, id, "review.qa.md", `${earlier}## 问：${oneLine}\n\n${answer.text.replace(/^## /gm, "### ")}\n\n`);
   return json({ answer: answer.text, video: await describe(env, await getVideo(env, id)) });
@@ -1024,18 +1053,21 @@ async function deleteResults(env: Env, id: string, keep: string[] = []): Promise
   await env.DB.prepare(`DELETE FROM results WHERE video_id = ?${notKept}`).bind(id, ...keep).run();
 }
 
-// 云端只留最近约 10 GB 的结果：从最新的一局往回数，超出的整局清掉（Mac 上还有）。最新一局总是保留。
+// 云端只留最近约 10 GB 的结果：超出时先清别人（不是超级管理员）传的、最早的，再清超级管理员最早的，
+// 整局清掉（Mac 上还有）。最新一局总是保留。
 async function enforceRetention(env: Env): Promise<void> {
   const rows = await env.DB.prepare(
-    `SELECT v.id AS id, COALESCE(SUM(r.size), 0) AS bytes FROM videos v JOIN results r ON r.video_id = v.id
+    `SELECT v.id AS id, v.uploader AS uploader, COALESCE(SUM(r.size), 0) AS bytes FROM videos v JOIN results r ON r.video_id = v.id
      WHERE v.user_id = ? GROUP BY v.id ORDER BY v.completed_at DESC`,
   )
     .bind(USER_ID)
-    .all<{ id: string; bytes: number }>();
-  let total = 0;
-  for (const [i, row] of rows.results.entries()) {
-    total += row.bytes;
-    if (i === 0 || total <= KEEP_RESULT_BYTES) continue;
+    .all<{ id: string; uploader: string; bytes: number }>();
+  let total = rows.results.reduce((t, r) => t + r.bytes, 0);
+  const older = rows.results.slice(1).reverse(); // 最早的在前，不含最新的一局
+  const order = [...older.filter((r) => r.uploader), ...older.filter((r) => !r.uploader)];
+  for (const row of order) {
+    if (total <= KEEP_RESULT_BYTES) break;
+    total -= row.bytes;
     await deleteResults(env, row.id);
     await env.DB.prepare("UPDATE videos SET job_status = 'archived', job_stage = '云端结果已清理，Mac 上还有' WHERE id = ?")
       .bind(row.id)
@@ -1392,9 +1424,13 @@ async function rallyLabelsSynced(req: Request, env: Env, id: string): Promise<Re
 // 给超级管理员以外的人看的录像：不带 AI 的 token 用量和花费
 const forViewer = <T extends { ai: unknown[] }>(v: T): T => ({ ...v, ai: [] });
 
-async function listVideos(env: Env, viewer = false): Promise<Response> {
-  const rows = await env.DB.prepare("SELECT * FROM videos WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
-    .bind(USER_ID)
+// 超级管理员：所有录像（包括别人传的）。别人：超级管理员传的、已经有结果的（只读），加上自己传的（全部）
+async function listVideos(env: Env, who: Who): Promise<Response> {
+  const viewer = !who.owner;
+  const rows = await env.DB.prepare(
+    `SELECT * FROM videos WHERE user_id = ? ${viewer ? "AND (uploader = '' OR uploader = ?)" : ""} ORDER BY created_at DESC LIMIT 100`,
+  )
+    .bind(USER_ID, ...(viewer ? [who.email || "-"] : []))
     .all<VideoRow>();
   const node = await env.DB.prepare("SELECT name, seen_at FROM nodes WHERE user_id = ? ORDER BY seen_at DESC LIMIT 1")
     .bind(USER_ID)
@@ -1402,8 +1438,9 @@ async function listVideos(env: Env, viewer = false): Promise<Response> {
   const list = await Promise.all(rows.results.map((v) => describe(env, v)));
   return json({
     // 别人只看得到已经有结果的录像（还在上传、排队、第一次处理中的不显示）
-    videos: viewer ? list.filter((v) => v.results.length > 0).map(forViewer) : list,
-    node: node && !viewer ? { name: node.name, seenAt: node.seen_at } : null,
+    videos: viewer ? list.filter((v) => (v.uploader && v.uploader === who.email) || (!v.uploader && v.results.length > 0)).map((v) => (v.uploader ? v : forViewer(v))) : list,
+    // 能用 Mac 分析的人要知道 Mac 在不在线（排队时显示），但不给名字
+    node: node && (!viewer || isAnalyst(who)) ? { name: viewer ? "" : node.name, seenAt: node.seen_at } : null,
     now: new Date().toISOString(), // 手机时钟可能不准，时间差都按服务器时间算
   });
 }
@@ -1525,17 +1562,106 @@ async function macStatus(env: Env): Promise<Response> {
 // 超级管理员以外的成员（普通用户、标注员、管理员）看分析结果：只有下面四个读接口。
 // 普通用户（viewer）只有这些；别的（上传、删除、改标题、重跑、AI 报告和追问、标胜负、分析区域、设置、Mac 状态）
 // 只有超级管理员能用。新加接口时不用管这里：没列进来的就是不能用。不归这里管的返回 null。
-async function readOnlyApi(req: Request, env: Env, path: string): Promise<Response | null> {
+// 别人（不是超级管理员）传的录像只有他自己和超级管理员看得到。
+async function readOnlyApi(req: Request, env: Env, path: string, who: Who): Promise<Response | null> {
   if (req.method === "GET") {
-    if (path === "/videos") return listVideos(env, true);
+    if (path === "/videos") return listVideos(env, who);
     let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
-    if (match) return json(forViewer(await describe(env, await getVideo(env, match[1]))));
+    if (match) return json(forViewer(await describe(env, await getVideoFor(env, who, match[1]))));
     match = path.match(/^\/videos\/([0-9a-f-]{36})\/results\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);
-    if (match) return getResult(req, env, match[1], match[2]);
+    if (match) {
+      await getVideoFor(env, who, match[1]);
+      return getResult(req, env, match[1], match[2]);
+    }
     // 手动标的回合胜负：网页拿它盖在程序的判断上，别人看到的比分才和超级管理员一样
     match = path.match(/^\/videos\/([0-9a-f-]{36})\/rally-labels$/);
-    if (match) return getRallyLabels(env, match[1]);
+    if (match) {
+      await getVideoFor(env, who, match[1]);
+      return getRallyLabels(env, match[1]);
+    }
   }
+  return null;
+}
+
+// ---------- 能用 Mac 分析的成员（超级管理员开的，不是超级管理员本人） ----------
+// 能上传自己的录像（排在超级管理员的后面），对自己传的录像能做超级管理员在结果页上能做的事：改名、删除、
+// 全部重跑 / 重跑后处理 / 改单双打 / 分析区域、起球员名字、标胜负、生成 AI 报告和追问（只用默认模型，每月有次数）。
+// 设置、Mac 状态、标注材料、别人的录像都不行。不归这里管的返回 null（接着按只读的规矩走）。
+
+const monthStart = () => {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString();
+};
+
+async function activeCount(env: Env, email: string): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM videos WHERE uploader = ? AND (status = 'uploading' OR job_status IN ('queued', 'processing'))",
+  )
+    .bind(email)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+async function requireActiveSlot(env: Env, who: Who): Promise<void> {
+  if ((await activeCount(env, who.email)) >= ANALYST_ACTIVE)
+    throw new HttpError(429, `你已经有 ${ANALYST_ACTIVE} 段录像在上传、排队或处理中，等前面的处理完再传（没传完的可以先删掉）`);
+}
+
+async function aiQuota(env: Env, who: Who) {
+  const rows = await env.DB.prepare("SELECT kind, COUNT(*) AS n FROM ai_usage WHERE actor = ? AND created_at >= ? GROUP BY kind")
+    .bind(who.email, monthStart())
+    .all<{ kind: string; n: number }>();
+  const used = (k: string) => rows.results.find((r) => r.kind === k)?.n ?? 0;
+  return {
+    reports: { used: used("report"), limit: ANALYST_REPORTS_PER_MONTH },
+    asks: { used: used("ask"), limit: ANALYST_ASKS_PER_MONTH },
+  };
+}
+
+async function requireAiQuota(env: Env, who: Who, kind: "report" | "ask"): Promise<void> {
+  const q = (await aiQuota(env, who))[kind === "report" ? "reports" : "asks"];
+  if (q.used >= q.limit) throw new HttpError(429, `这个月的${kind === "report" ? "生成 AI 报告" : "追问"}次数（${q.limit} 次）已经用完，下个月再来`);
+}
+
+// 能选的模型只有默认的那个；不给单价和总用量
+async function analystAiInfo(env: Env, who: Who): Promise<Response> {
+  const settings = await aiSettings(env);
+  const m = models(env).find((x) => x.id === settings.defaultModel);
+  return json({
+    available: Boolean(aiKey(env)),
+    models: m ? [{ id: m.id, label: m.label }] : [],
+    defaultModel: settings.defaultModel,
+    quota: await aiQuota(env, who),
+  });
+}
+
+async function analystApi(req: Request, env: Env, path: string, who: Who): Promise<Response | null> {
+  if (!isAnalyst(who)) return null;
+  const m = req.method;
+  if (path === "/videos" && m === "POST") {
+    await requireActiveSlot(env, who);
+    return createVideo(req, env, who.email);
+  }
+  if (path === "/ai" && m === "GET") return analystAiInfo(env, who);
+  const match = path.match(/^\/videos\/([0-9a-f-]{36})(\/.*)?$/);
+  if (!match) return null;
+  const id = match[1], rest = match[2] ?? "";
+  const v = await getVideoFor(env, who, id);
+  if (v.uploader !== who.email) return null;
+  if (rest === "" && m === "GET") return json(await describe(env, v));
+  if (rest === "" && m === "PATCH") return renameVideo(req, env, id);
+  if (rest === "" && m === "DELETE") return deleteVideo(env, id);
+  const part = rest.match(/^\/parts\/(\d{1,5})$/);
+  if (part && m === "PUT") return uploadPart(req, env, id, Number(part[1]));
+  if (rest === "/complete" && m === "POST") return completeVideo(env, id);
+  if (rest === "/job/retry" && m === "POST") {
+    if (!(v.job_status === "queued" || v.job_status === "processing")) await requireActiveSlot(env, who);
+    return retryJob(req, env, id);
+  }
+  if (rest === "/players" && m === "PUT") return savePlayerNames(req, env, id);
+  if (rest === "/review" && m === "POST") return makeReview(req, env, id, who);
+  if (rest === "/review/ask" && m === "POST") return askReview(req, env, id, who);
+  if (rest === "/rally-labels" && m === "PUT") return putRallyLabels(req, env, id);
   return null;
 }
 
@@ -1555,7 +1681,9 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
     // 不是超级管理员：分析结果只能看；标注员和管理员另外有标注这一边。
     // 管理员能看所有录像的标注材料和进度，标注员只能读自己领过任务的录像的
     if (who.status !== "active") throw new HttpError(403, "需要管理员批准，请等几分钟或者联系管理员");
-    const read = await readOnlyApi(req, env, path);
+    const own = await analystApi(req, env, path, who);
+    if (own) return own;
+    const read = await readOnlyApi(req, env, path, who);
     if (read) return read;
     if (isViewer(who)) throw new HttpError(403, "这个账号只能看，不能改");
     if (isAdmin(who) && path === "/labeling/videos" && m === "GET") return listLabelingVideos(env);
@@ -1566,7 +1694,7 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   }
   if (path === "/labeling/videos" && m === "GET") return listLabelingVideos(env);
   if (path === "/videos" && m === "POST") return createVideo(req, env);
-  if (path === "/videos" && m === "GET") return listVideos(env);
+  if (path === "/videos" && m === "GET") return listVideos(env, who);
   let match = path.match(/^\/videos\/([0-9a-f-]{36})$/);
   if (match && m === "GET") return json(await describe(env, await getVideo(env, match[1])));
   if (match && m === "PATCH") return renameVideo(req, env, match[1]);
@@ -1592,9 +1720,9 @@ async function api(req: Request, env: Env, path: string, url: URL): Promise<Resp
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/players$/);
   if (match && m === "PUT") return savePlayerNames(req, env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review$/);
-  if (match && m === "POST") return makeReview(req, env, match[1]);
+  if (match && m === "POST") return makeReview(req, env, match[1], who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/review\/ask$/);
-  if (match && m === "POST") return askReview(req, env, match[1]);
+  if (match && m === "POST") return askReview(req, env, match[1], who);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/original\/release$/);
   if (match && m === "POST") return releaseOriginal(env, match[1]);
   match = path.match(/^\/videos\/([0-9a-f-]{36})\/results\/([A-Za-z0-9][A-Za-z0-9._-]{0,119})$/);

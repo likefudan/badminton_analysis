@@ -17,7 +17,7 @@ const Team = (() => {
     av.style.backgroundImage = me && me.picture ? `url("${me.picture}")` : "";
     $t("navName").textContent = name;
     $t("navEmail").textContent = (me && me.email) || "";
-    $t("navRole").textContent = isOwner() ? "超级管理员" : isAdmin() ? "管理员" : isViewer() ? "普通用户" : "标注员";
+    $t("navRole").textContent = (isOwner() ? "超级管理员" : isAdmin() ? "管理员" : isViewer() ? "普通用户" : "标注员") + (isAnalyst() ? " · 能用 Mac 分析" : "");
   }
   // 点菜单外面就收起来
   document.addEventListener("click", (e) => { if (!$t("navMenu").contains(e.target)) $t("navMenu").open = false; });
@@ -338,9 +338,15 @@ const Team = (() => {
     group("成员", users.filter((u) => u.status === "active"), (u) => {
       const self = me && u.email === me.email;
       const seen = u.lastLoginAt ? ` · 上次登录 ${fmtDate(new Date(u.lastLoginAt))}` : " · 还没登录过";
-      const sub = u.owner ? "超级管理员 · " + stats(u) : u.role === "admin" ? "管理员 · " + stats(u)
-        : u.role === "viewer" ? "普通用户 · 只能看分析结果" + seen : "标注员 · 能看分析结果，能标注 · " + stats(u);
+      // 「能用 Mac 分析」和角色叠加：能上传自己的录像排进 Mac 的队列，AI 报告每月有次数
+      const analyze = u.canAnalyze && !u.owner ? `能用 Mac 分析（传了 ${u.videos} 段，本月 AI 报告 ${u.monthReports} 次、追问 ${u.monthAsks} 次） · ` : "";
+      const sub = u.owner ? "超级管理员 · " + stats(u) : u.role === "admin" ? "管理员 · " + analyze + stats(u)
+        : u.role === "viewer" ? "普通用户 · " + (analyze || "只能看分析结果") + seen : "标注员 · 能看分析结果，能标注 · " + analyze + stats(u);
+      // 只有超级管理员能开、关「用 Mac 分析」（花的是它的 Mac 和 AI 额度）
+      const analyzeBtn = isOwner() && !u.owner
+        ? [button(u.canAnalyze ? "取消 Mac 分析" : "允许用 Mac 分析", "plain", () => saveUser("/admin/users", { email: u.email, canAnalyze: !u.canAnalyze }))] : [];
       return card(u, sub, self || u.owner ? [] : [
+        ...analyzeBtn,
         button("停用", "plain", () => saveUser("/admin/users", { email: u.email, status: "disabled" })),
         ...(u.role === "viewer" ? [button("设为标注员", "plain", () => saveUser("/admin/users", { email: u.email, role: "annotator" }))] : []),
         ...(u.role === "annotator" ? [button("取消标注员", "plain", () => saveUser("/admin/users", { email: u.email, role: "viewer" }))] : []),

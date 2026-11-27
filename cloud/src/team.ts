@@ -1,6 +1,7 @@
 // 多人标注：Google 登录、成员（白名单）、领任务。
 // 角色一层包一层：viewer（普通用户，只能看分析结果，什么都不能改）< annotator（标注员，另外能领标注任务）
-// < admin（管理员，另外能管成员和审核标注）。上传、重跑、删除、AI 追问只有超级管理员能做。
+// < admin（管理员，另外能管成员和审核标注）。上传、重跑、删除、AI 追问只有超级管理员能做，
+// 另外超级管理员可以给任何成员开「能用 Mac 分析」（can_analyze），他就能上传、管自己传的录像（见 index.ts 的 analystApi）。
 // 登录后浏览器拿到一个随机的会话 cookie（库里只存它的 SHA-256）。没批准过的账号登录后是 pending，
 // 管理员在「成员」页点一下就能放行。口令（ACCESS_TOKEN）仍然有效：Mac 节点用它，管理员也可以用它登录，
 // 第一个管理员就是用 Google 登录后再输一次口令认领的。
@@ -14,6 +15,7 @@ export type Who = {
   role: "admin" | "annotator" | "viewer";
   status: "active" | "pending" | "disabled";
   via: "token" | "google";
+  canAnalyze: boolean;           // 超级管理员给的「能用 Mac 分析」：能上传自己的录像、管自己传的录像
   owner: boolean;                // 超级管理员：只有它能上传和分析录像、让 Mac 准备标注材料（用口令的也算）
   mediaOnly?: boolean;           // 口令登录留下的只读 cookie：只用来取图片和视频，不算登录
 };
@@ -40,7 +42,7 @@ const secureFlag = (req: Request) => (new URL(req.url).protocol === "https:" ? "
 // ---------- 是谁 ----------
 
 export async function identify(req: Request, env: Env): Promise<Who | null> {
-  const tokenUser: Who = { email: "", name: "管理员", picture: "", role: "admin", status: "active", via: "token", owner: true };
+  const tokenUser: Who = { email: "", name: "管理员", picture: "", role: "admin", status: "active", via: "token", canAnalyze: true, owner: true };
   const header = req.headers.get("authorization") ?? "";
   if (header.startsWith("Bearer ")) {
     const got = header.slice(7);
@@ -52,13 +54,17 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
     // 别的网站发不出带这个头的请求（没有开放跨域），所以它们没法借 cookie 来改数据
     if (req.method !== "GET" && req.headers.get("x-ba") !== "1") return null;
     const row = await env.DB.prepare(
-      `SELECT u.email, u.name, u.picture, u.role, u.status FROM sessions s JOIN users u ON u.email = s.email
+      `SELECT u.email, u.name, u.picture, u.role, u.status, u.can_analyze FROM sessions s JOIN users u ON u.email = s.email
        WHERE s.id_hash = ? AND s.expires_at > ?`,
     )
       .bind(await hashOf(sid), new Date().toISOString())
-      .first<Omit<Who, "via" | "owner">>();
-    // 没有设置 ADMIN_GOOGLE_EMAIL 时，管理员都算超级管理员
-    if (row) return { ...row, via: "google", owner: row.role === "admin" && row.status === "active" && (!superAdmin(env) || row.email === superAdmin(env)) };
+      .first<Omit<Who, "via" | "owner" | "canAnalyze"> & { can_analyze: number }>();
+    if (row) {
+      const { can_analyze, ...rest } = row;
+      // 没有设置 ADMIN_GOOGLE_EMAIL 时，管理员都算超级管理员
+      const owner = row.role === "admin" && row.status === "active" && (!superAdmin(env) || row.email === superAdmin(env));
+      return { ...rest, via: "google", owner, canAnalyze: owner || can_analyze === 1 };
+    }
   }
   // 用口令登录的网页：图片和视频靠这个只读 cookie（值由口令算出）
   const legacy = cookieOf(req, LEGACY_COOKIE);
@@ -68,8 +74,10 @@ export async function identify(req: Request, env: Env): Promise<Who | null> {
 
 export const isAdmin = (who: Who) => who.role === "admin" && who.status === "active";
 export const isViewer = (who: Who) => who.role === "viewer";
+// 超级管理员以外、开了「能用 Mac 分析」的成员
+export const isAnalyst = (who: Who) => !who.owner && who.status === "active" && who.canAnalyze && Boolean(who.email);
 
-export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture: who.picture, role: who.role, status: who.status, via: who.via, owner: who.owner });
+export const meJson = (who: Who) => ({ email: who.email, name: who.name, picture: who.picture, role: who.role, status: who.status, via: who.via, owner: who.owner, canAnalyze: who.canAnalyze });
 
 // 标注记在谁名下：用口令登录的算第一个管理员
 async function annotatorOf(env: Env, who: Who): Promise<string> {
@@ -436,17 +444,22 @@ async function listUsers(env: Env): Promise<Response> {
   if (superAdmin(env))
     await env.DB.prepare("INSERT OR IGNORE INTO users (email, role, status, created_at) VALUES (?, 'admin', 'active', ?)").bind(superAdmin(env), new Date().toISOString()).run();
   const users = await env.DB.prepare(
-    `SELECT u.email, u.name, u.picture, u.role, u.status, u.created_at, u.last_login_at,
+    `SELECT u.email, u.name, u.picture, u.role, u.status, u.can_analyze, u.created_at, u.last_login_at,
+       (SELECT COUNT(*) FROM videos v WHERE v.uploader = u.email) AS videos,
+       (SELECT COUNT(*) FROM ai_usage a WHERE a.actor = u.email AND a.kind = 'report' AND a.created_at >= ?1) AS reports,
+       (SELECT COUNT(*) FROM ai_usage a WHERE a.actor = u.email AND a.kind = 'ask' AND a.created_at >= ?1) AS asks,
        (SELECT COUNT(*) FROM labels l WHERE l.annotator = u.email) AS frames,
        (SELECT COUNT(*) FROM stroke_labels l WHERE l.annotator = u.email) AS strokes,
        (SELECT COUNT(*) FROM tasks t WHERE t.assignee = u.email AND t.status = 'claimed' AND t.active = 1) AS held,
        (SELECT COUNT(*) FROM tasks t WHERE t.assignee = u.email AND t.status IN ('submitted', 'approved')) AS finished
      FROM users u ORDER BY CASE u.status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, u.created_at`,
-  ).all<Record<string, unknown>>();
+  )
+    .bind(new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)).toISOString())
+    .all<Record<string, unknown>>();
   return json({
     users: users.results.map((u) => ({
       email: u.email, owner: u.email === superAdmin(env), name: u.name, picture: u.picture, role: u.role, status: u.status, createdAt: u.created_at, lastLoginAt: u.last_login_at,
-      frames: u.frames, strokes: u.strokes, held: u.held, finished: u.finished,
+      frames: u.frames, strokes: u.strokes, held: u.held, finished: u.finished, canAnalyze: u.can_analyze === 1, videos: u.videos, monthReports: u.reports, monthAsks: u.asks,
     })),
   });
 }
@@ -463,7 +476,10 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
   if (!EMAIL.test(email)) throw new HttpError(400, "邮箱不对");
-  const old = await env.DB.prepare("SELECT role, status FROM users WHERE email = ?").bind(email).first<{ role: string; status: string }>();
+  const old = await env.DB.prepare("SELECT role, status, can_analyze FROM users WHERE email = ?").bind(email).first<{ role: string; status: string; can_analyze: number }>();
+  // 用 Mac 分析花的是超级管理员的 Mac 和 AI 额度：只有超级管理员能开、能关
+  if (typeof body?.canAnalyze === "boolean" && !who.owner) throw new HttpError(403, "只有超级管理员能给「用 Mac 分析」");
+  const canAnalyze = typeof body?.canAnalyze === "boolean" ? (body.canAnalyze ? 1 : 0) : old?.can_analyze ?? 0;
   const role = body?.role === "admin" || body?.role === "annotator" || body?.role === "viewer" ? body.role : old?.role ?? "viewer";
   const status = remove ? "disabled" : body?.status === "active" || body?.status === "disabled" ? body.status : old && old.status !== "pending" ? old.status : "active";
   const losesAdmin = old?.role === "admin" && old.status === "active" && (role !== "admin" || status !== "active");
@@ -478,7 +494,7 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
     await env.DB.batch([env.DB.prepare("DELETE FROM users WHERE email = ?").bind(email), ...(await releaseTasksOf(env, email))]);
   } else if (old) {
     await env.DB.batch([
-      env.DB.prepare("UPDATE users SET role = ?, status = ? WHERE email = ?").bind(role, status, email),
+      env.DB.prepare("UPDATE users SET role = ?, status = ?, can_analyze = ? WHERE email = ?").bind(role, status, canAnalyze, email),
       ...(status === "disabled" ? await releaseTasksOf(env, email) : []),
       // 改成普通用户：手上的标注任务放回大厅
       ...(role === "viewer" && old.role !== "viewer" && status !== "disabled"
@@ -486,7 +502,7 @@ async function saveUser(req: Request, env: Env, who: Who, remove: boolean): Prom
         : []),
     ]);
   } else {
-    await env.DB.prepare("INSERT INTO users (email, role, status, created_at) VALUES (?, ?, ?, ?)").bind(email, role, status, new Date().toISOString()).run();
+    await env.DB.prepare("INSERT INTO users (email, role, status, can_analyze, created_at) VALUES (?, ?, ?, ?, ?)").bind(email, role, status, canAnalyze, new Date().toISOString()).run();
   }
   return listUsers(env);
 }
