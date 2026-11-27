@@ -305,6 +305,9 @@
   /* 多人标注：任务大厅、成员页、标注页上的任务条 */
   body.annotator .adminOnly { display: none !important; }
   body:not(.owner) .ownerOnly { display: none !important; }
+  /* 能用 Mac 分析的成员：能上传（canUpload）；打开自己传的录像时（body.mine）能改它（canEdit） */
+  body:not(.owner):not(.analyst) .canUpload { display: none !important; }
+  body:not(.owner):not(.mine) .canEdit { display: none !important; }
   body.owner .notOwner { display: none; }
   /* 普通用户（只能看）：没有标注这一边。改东西的入口是 ownerOnly，只有超级管理员看得到 */
   body.viewer .noViewer { display: none !important; }
@@ -396,9 +399,10 @@
     <!-- 首页：我的录像 -->
     <div class="view" id="vHome">
       <div class="top"><h1>我的录像</h1></div>
-      <a class="pick ownerOnly" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
+      <a class="pick canUpload" href="#/upload" id="goUpload" style="text-decoration:none">上传录像</a>
       <div class="chips" id="filters"></div>
       <div id="list"><div class="empty">读取中</div></div>
+      <p class="quiet canUpload notOwner" id="analystNote" style="margin-top:14px">你可以上传自己的录像，用家里的 Mac 分析。超级管理员的录像优先处理；每人同时最多 2 段在上传、排队或处理中。你传的录像只有你和超级管理员看得到。</p>
       <p class="quiet ownerOnly" id="nodeLine" style="margin-top:14px"></p>
     </div>
 
@@ -448,19 +452,19 @@
     <div class="view" id="vDetail" hidden>
       <div class="top"><a href="#/">‹ 我的录像</a><h1></h1></div>
       <section class="card" id="detail">
-        <div id="dTitleRow"><h2 id="dTitle"></h2><a id="dRename" class="ownerOnly">改标题</a></div>
+        <div id="dTitleRow"><h2 id="dTitle"></h2><a id="dRename" class="canEdit">改标题</a></div>
         <div id="dRenameBox" class="row" hidden><input type="text" id="dTitleInput" maxlength="80"><button id="dTitleSave" style="flex:none;width:auto;padding:10px 16px">保存</button></div>
         <p class="quiet" id="dMeta"></p>
         <p id="dStatus"></p>
         <div class="tabs" id="tabs">
-          <button data-tab="overview">数据概览</button><button data-tab="strokes">逐拍分析</button><button data-tab="cards">跑位分析</button><button data-tab="review">AI 报告</button><button data-tab="videos">视频</button><button data-tab="process" class="ownerOnly">处理</button>
+          <button data-tab="overview">数据概览</button><button data-tab="strokes">逐拍分析</button><button data-tab="cards">跑位分析</button><button data-tab="review">AI 报告</button><button data-tab="videos">视频</button><button data-tab="process" class="canEdit">处理</button>
         </div>
         <div id="tOverview"><div id="dPlayers"></div><div id="dStats"></div><p class="empty" id="dOverviewEmpty" hidden></p></div>
         <div id="tStrokes" hidden><div id="dStrokes"></div></div>
         <div id="tCards" hidden></div>
         <div id="tReview" hidden><div id="dReview"></div></div>
         <div id="tVideos" hidden></div>
-        <div id="tProcess" class="ownerOnly" hidden>
+        <div id="tProcess" class="canEdit" hidden>
           <p id="dError" class="bad" hidden></p>
           <div id="dProgress"></div>
           <div class="row">
@@ -523,7 +527,7 @@
       <section class="card">
         <h2>怎么加人</h2>
         <p class="quiet">让对方打开网站用 Google 登录，登录后会出现在下面的「等待批准」里，你点一下批准就能进。</p>
-        <p class="quiet">「只能看」是普通用户：能看所有录像的分析结果、播放和保存视频，但不能上传、删除、重新处理、追问 AI。「标注员」在这之上还能领标注任务。</p>
+        <p class="quiet">「只能看」是普通用户：能看所有录像的分析结果、播放和保存视频，但不能上传、删除、重新处理、追问 AI。「标注员」在这之上还能领标注任务。<span class="ownerOnly">「允许用 Mac 分析」可以加在任何人身上：他能上传自己的录像，排在你的录像后面让家里的 Mac 分析，管自己传的录像；每人同时最多 2 段在排队，AI 报告每月 10 次、追问 30 次，只用默认模型。他传的录像只有他和你看得到。</span></p>
         <p class="bad" id="mError" hidden></p>
       </section>
       <div id="mList"><div class="empty">读取中</div></div>
